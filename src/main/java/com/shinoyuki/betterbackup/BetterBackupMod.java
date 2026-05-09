@@ -2,6 +2,7 @@ package com.shinoyuki.betterbackup;
 
 import com.mojang.logging.LogUtils;
 import com.shinoyuki.betterautosave.api.SaveListenerRegistry;
+import com.shinoyuki.betterbackup.command.BetterBackupCommand;
 import com.shinoyuki.betterbackup.config.BetterBackupConfig;
 import com.shinoyuki.betterbackup.config.ConfigSpec;
 import com.shinoyuki.betterbackup.integration.BackupListenerBridge;
@@ -22,6 +23,7 @@ import net.minecraft.world.level.Level;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.storage.LevelResource;
 import net.minecraftforge.common.MinecraftForge;
+import net.minecraftforge.event.RegisterCommandsEvent;
 import net.minecraftforge.event.server.ServerStartingEvent;
 import net.minecraftforge.event.server.ServerStoppingEvent;
 import net.minecraftforge.eventbus.api.EventPriority;
@@ -91,6 +93,11 @@ public final class BetterBackupMod {
         ModLoadingContext.get().registerConfig(ModConfig.Type.COMMON, ConfigSpec.SPEC, configRelative);
 
         MinecraftForge.EVENT_BUS.register(this);
+    }
+
+    @SubscribeEvent
+    public void onRegisterCommands(RegisterCommandsEvent event) {
+        BetterBackupCommand.register(event.getDispatcher());
     }
 
     @SubscribeEvent
