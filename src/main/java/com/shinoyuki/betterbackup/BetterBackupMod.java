@@ -181,6 +181,16 @@ public final class BetterBackupMod {
             ChunkStore store = new ChunkStore(storeRoot);
             store.initialize();
 
+            // 启动时清 kill -9 留下的孤儿 .tmp (DESIGN §8 store 文件写一半断电场景).
+            // 实际 atomic put (tmp + fsync + rename) 已经防止半写文件被引用, 但
+            // 进程被强杀时 tmp 文件可能残留在磁盘, 这里启动时一次性清掉避免占空间.
+            if (BetterBackupConfig.verifyOnStartup()) {
+                int cleaned = store.cleanupOrphanTmpFiles();
+                if (cleaned > 0) {
+                    LOGGER.warn("[BetterBackup] cleaned {} orphan .tmp files from store on startup", cleaned);
+                }
+            }
+
             CurrentSnapshotState snapshotState = new CurrentSnapshotState();
             WorldPaths paths = new WorldPaths(worldRoot);
             HashFunction hashFunction = new Xxh128HashFunction();
