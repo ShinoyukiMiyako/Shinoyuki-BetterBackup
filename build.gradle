@@ -52,21 +52,23 @@ repositories {
         name = 'ParchmentMC'
         url = 'https://maven.parchmentmc.org'
     }
+    // BAS local maven (BAS 仓库 build.gradle publishing block 输出到此).
+    // 前置: 在 BAS 仓库跑 ./gradlew publish 把 jar + pom 推到此目录.
+    maven {
+        name = 'ShinoyukiBASLocal'
+        url = "file://${rootDir}/../Shinoyuki-BetterAutoSave/mcmodsrepo"
+    }
     mavenCentral()
 }
 
 dependencies {
     minecraft "net.minecraftforge:forge:${minecraft_version}-${forge_version}"
 
-    // BAS hard dependency: 编译期 link API package, 运行时通过 mods.toml 强制要求安装.
-    // 本地开发期直接 fileTree link BAS 仓库的 build/libs jar (ForgeGradle 的 fg.deobf
-    // 会从 reobf 的 production jar 转回 dev mappings).
-    // 前置: 在 BAS 仓库先跑 ./gradlew build 出 jar.
-    def basJar = file("${rootDir}/../Shinoyuki-BetterAutoSave/build/libs/shinoyuki_betterautosave-${bas_version}.jar")
-    if (!basJar.exists()) {
-        throw new GradleException("BAS jar not found at ${basJar}; run './gradlew build' in BAS repo first")
-    }
-    implementation fg.deobf(files(basJar))
+    // BAS hard dependency: 编译期 link API package (com.shinoyuki.betterautosave.api),
+    // 运行时通过 mods.toml mandatory=true 强制要求装 BAS mod jar.
+    // fg.deobf 用 maven coordinate 拉到 BAS jar (是 reobf 后的 production jar),
+    // 然后 ForgeGradle 自动 deobf 转回 dev (parchment) mappings 给本仓库编译期 link.
+    implementation fg.deobf("com.shinoyuki.betterautosave:shinoyuki_betterautosave:${bas_version}")
 
     testImplementation 'org.junit.jupiter:junit-jupiter:5.10.0'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.10.0'

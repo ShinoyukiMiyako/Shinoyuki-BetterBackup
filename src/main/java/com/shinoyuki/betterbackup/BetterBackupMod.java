@@ -1,6 +1,8 @@
 package com.shinoyuki.betterbackup;
 
 import com.mojang.logging.LogUtils;
+import com.shinoyuki.betterautosave.api.SaveListenerRegistry;
+import com.shinoyuki.betterbackup.api.BackupHelloListener;
 import com.shinoyuki.betterbackup.config.BetterBackupConfig;
 import com.shinoyuki.betterbackup.config.ConfigSpec;
 import net.minecraftforge.common.MinecraftForge;
@@ -69,7 +71,16 @@ public final class BetterBackupMod {
             return;
         }
         LOGGER.info("[BetterBackup] starting for {}", event.getServer().name());
-        BetterBackupCore.install();
+
+        // Phase 0 验证: hello-world listener 注册到 BAS 三个 channel.
+        // Phase 1 commit 12 会被替换成把事件入 BackupWorker queue.
+        BackupHelloListener helloListener = new BackupHelloListener();
+        SaveListenerRegistry.registerChunk(helloListener);
+        SaveListenerRegistry.registerEntityChunk(helloListener);
+        SaveListenerRegistry.registerSavedData(helloListener);
+
+        BetterBackupCore.install(helloListener);
+
         LOGGER.info("[BetterBackup]   |- backupDirectory: {}", BetterBackupConfig.backupDirectory());
         LOGGER.info("[BetterBackup]   |- hash: {} compress: {}",
                 BetterBackupConfig.hashAlgorithm(),
@@ -79,7 +90,7 @@ public final class BetterBackupMod {
                 BetterBackupConfig.scheduleMode(),
                 BetterBackupConfig.intervalMinutes());
         LOGGER.info("[BetterBackup]   `- config: {}/{}/common.toml", SERIES_CONFIG_DIR, MOD_ID);
-        LOGGER.info("[BetterBackup] Phase 0 lifecycle installed (worker / store will come in Phase 1)");
+        LOGGER.info("[BetterBackup] Phase 0 hello-world listener registered to BAS 3 channels (chunk/entity/savedData)");
     }
 
     /**
@@ -94,6 +105,18 @@ public final class BetterBackupMod {
             return;
         }
         LOGGER.info("[BetterBackup] server stopping (LOW priority, after BAS drain)");
+
+        BackupHelloListener helloListener = BetterBackupCore.helloListener();
+        if (helloListener != null) {
+            SaveListenerRegistry.unregisterChunk(helloListener);
+            SaveListenerRegistry.unregisterEntityChunk(helloListener);
+            SaveListenerRegistry.unregisterSavedData(helloListener);
+            LOGGER.info("[BetterBackup] hello-world final tally: chunk={} entity={} savedData={}",
+                    helloListener.chunkFireCount(),
+                    helloListener.entityFireCount(),
+                    helloListener.savedDataFireCount());
+        }
+
         BetterBackupCore.uninstall();
         LOGGER.info("[BetterBackup] uninstalled");
     }
