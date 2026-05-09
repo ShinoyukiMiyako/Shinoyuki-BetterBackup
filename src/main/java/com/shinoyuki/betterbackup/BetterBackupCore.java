@@ -1,5 +1,6 @@
 package com.shinoyuki.betterbackup;
 
+import com.shinoyuki.betterbackup.diagnostic.DiagnosticLogger;
 import com.shinoyuki.betterbackup.integration.BackupListenerBridge;
 import com.shinoyuki.betterbackup.schedule.SnapshotScheduler;
 import com.shinoyuki.betterbackup.snapshot.CurrentSnapshotState;
@@ -29,6 +30,7 @@ public final class BetterBackupCore {
     private static volatile BackupListenerBridge BRIDGE;
     private static volatile SnapshotCreator CREATOR;
     private static volatile SnapshotScheduler SCHEDULER;
+    private static volatile DiagnosticLogger DIAGNOSTIC_LOGGER;
 
     public static void install(ChunkStore store,
                                CurrentSnapshotState snapshotState,
@@ -38,7 +40,8 @@ public final class BetterBackupCore {
                                List<Thread> workerThreads,
                                BackupListenerBridge bridge,
                                SnapshotCreator creator,
-                               SnapshotScheduler scheduler) {
+                               SnapshotScheduler scheduler,
+                               DiagnosticLogger diagnosticLogger) {
         STORE = store;
         SNAPSHOT_STATE = snapshotState;
         CONTEXT = context;
@@ -48,6 +51,7 @@ public final class BetterBackupCore {
         BRIDGE = bridge;
         CREATOR = creator;
         SCHEDULER = scheduler;
+        DIAGNOSTIC_LOGGER = diagnosticLogger;
     }
 
     public static void uninstall() {
@@ -60,6 +64,7 @@ public final class BetterBackupCore {
         BRIDGE = null;
         CREATOR = null;
         SCHEDULER = null;
+        DIAGNOSTIC_LOGGER = null;
     }
 
     public static boolean isInstalled() {
@@ -100,6 +105,10 @@ public final class BetterBackupCore {
 
     public static SnapshotScheduler scheduler() {
         return SCHEDULER;
+    }
+
+    public static DiagnosticLogger diagnosticLogger() {
+        return DIAGNOSTIC_LOGGER;
     }
 
     private BetterBackupCore() {

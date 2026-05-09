@@ -5,6 +5,7 @@ import com.shinoyuki.betterautosave.api.SaveListenerRegistry;
 import com.shinoyuki.betterbackup.command.BetterBackupCommand;
 import com.shinoyuki.betterbackup.config.BetterBackupConfig;
 import com.shinoyuki.betterbackup.config.ConfigSpec;
+import com.shinoyuki.betterbackup.diagnostic.DiagnosticLogger;
 import com.shinoyuki.betterbackup.integration.BackupListenerBridge;
 import com.shinoyuki.betterbackup.io.WorldPaths;
 import com.shinoyuki.betterbackup.schedule.IntervalScheduler;
@@ -145,8 +146,11 @@ public final class BetterBackupMod {
             SnapshotScheduler scheduler = createScheduler();
             scheduler.start(creator);
 
+            DiagnosticLogger diagnosticLogger = new DiagnosticLogger();
+            MinecraftForge.EVENT_BUS.register(diagnosticLogger);
+
             BetterBackupCore.install(store, snapshotState, context, queue, workers, workerThreads,
-                    bridge, creator, scheduler);
+                    bridge, creator, scheduler, diagnosticLogger);
 
             LOGGER.info("[BetterBackup]   |- worldRoot: {}", worldRoot);
             LOGGER.info("[BetterBackup]   |- storeRoot: {}", storeRoot);
@@ -180,6 +184,11 @@ public final class BetterBackupMod {
         SnapshotScheduler scheduler = BetterBackupCore.scheduler();
         if (scheduler != null) {
             scheduler.stop();
+        }
+
+        DiagnosticLogger diagnosticLogger = BetterBackupCore.diagnosticLogger();
+        if (diagnosticLogger != null) {
+            MinecraftForge.EVENT_BUS.unregister(diagnosticLogger);
         }
 
         BackupListenerBridge bridge = BetterBackupCore.bridge();
