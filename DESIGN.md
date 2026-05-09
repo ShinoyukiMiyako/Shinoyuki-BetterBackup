@@ -55,25 +55,40 @@
 ### 2.1 整体数据流
 
 ```
-BAS 完成 chunk save (worker 线程):
-    ChunkSaveTask.assemble() -> CompoundTag tag
+BAS chunk IO 完成 (BAS worker 线程, future.whenComplete callback):
+    SaveListenerRegistry.fireChunkSaved(pos, dim, tag)
         |
-        +-> IOWorker.store(pos, tag)  [vanilla, 写 region file]
-        |
-        +-> BetterBackup.onChunkSaved(pos, dim, tag)  [BAS 新增 callback]
+        +-> BetterBackup.ChunkSaveListener.onChunkSaved(pos, dim, tag)
                 |
-                +-> BackupWorker 线程异步:
-                    1. nbtBytes = NbtIo.write(tag) [uncompressed]
-                    2. hash = sha256(nbtBytes)
-                    3. if (!store.has(hash)) store.put(hash, compress(nbtBytes))
-                    4. currentSnapshot.manifest.put((dim, x, z), hash)
+                +-> 入 BackupWorker queue (仅 ChunkPos + dimension, 不持 tag 引用)
+                        |
+                        +-> BackupWorker 线程异步 (与 BAS worker 解耦):
+                            1. 打开对应 .mca 文件 (region file)
+                            2. 读 chunk slot raw 压缩字节 (vanilla zlib)
+                            3. hash = xxh128(rawBytes)
+                            4. if (!store.has(hash)) store.put(hash, rawBytes)
+                            5. currentSnapshot.dirtyMap.put((dim, x, z), hash)
 ```
 
 **关键点**:
-- BAS 的 worker 线程做完 NBT 拼装 → 调 IOWorker (vanilla 写盘) **+** 调 BetterBackup callback
-- BetterBackup 自己有 worker 池, hash + 写 dedup store 是独立异步过程
-- IOWorker 跟 BetterBackup 互不阻塞
-- 主线程视角: 没变化, 跟纯 BAS 一样
+
+1. **fire 时机 (BAS v0.7+ 实际行为)**:
+   - BAS 在 `ChunkSaveTask.execute()` 的 `future.whenComplete` 内 fire, 即 **IO 完成后** (chunk 字节已写入 .mca 文件)
+   - 仅 `CLEAN_LANDED` / `REQUEUE_DIRTY` 路径 fire, `FAILED_TERMINAL` 不 fire — BetterBackup 只接收已成功落盘的 chunk, 跟 vanilla 备份语义一致
+   - REQUEUE_DIRTY 路径下同一 chunk 在 BAS worker 周期内可能多次 fire, BackupWorker 收到后用 dirtyMap 覆盖语义保留最新 hash
+
+2. **不依赖 in-memory CompoundTag**:
+   - BackupWorker 不读 listener 给的 `tag` 引用, 只用 `pos + dim` 定位 .mca 文件
+   - 完全绕开 vanilla `CompoundTag.tags`(`HashMap`) 的 iteration 顺序 / `tag.merge` / data fixer 重建 tag 引发的 NBT 字节不确定性问题
+   - 同语义内容跨 JVM 重启字节恒等 (vanilla 已经把 chunk 写到 .mca 文件了, 我们读盘的字节就是最终落盘的字节)
+
+3. **dedup 单元 = .mca 文件里的单 chunk slot 压缩字节**:
+   - vanilla 已经用 zlib 压缩了 chunk NBT, BackupWorker 不再二次压缩 (避免无效压缩)
+   - 这跟 NeoForge 的 ChronoVault 同构 — 已被验证可行的工程范式
+
+4. **主线程视角**: 多一次 listener 触发 (≤ 1us, CopyOnWriteArrayList), BAS 主线程开销不变
+
+5. **时序保证**: BAS fire 时 IOWorker 已 future.complete → vanilla `RegionFile.write` 已 sync → .mca 文件包含本次写入。BackupWorker 读到的字节即为本次落盘内容
 
 ### 2.2 Backup Store 目录结构
 
@@ -155,20 +170,67 @@ class CurrentSnapshotState {
 
 **注意**: 该结构假设 chunk 数据**只能通过 BAS 路径变化**。如果有 mod 直接写 region file 绕过 vanilla save 路径 (极罕见), BetterBackup 会漏检测。该约束写在用户文档里。
 
-### 2.5 实测预期
+### 2.5 dedup 率机制与预期
 
-按生产服 80mod / 60p / 7 天保留, 2 小时一备 (84 份):
+#### dedup 率的真正来源
 
-| 维度 | vanilla 全量方案 (FTB Backups) | BetterBackup |
+**dedup 不是来自 chunk 内字节稳定性, 而是来自跨快照的 chunk 引用复用**:
+
+- BAS 只在 chunk 实际被 save 时 fire `onChunkSaved`. 玩家不访问的 chunk → BAS 不接收 → 无新事件 → manifest 直接复制上一份的 hash entry, 跨快照引用同一个 chunk slot store 文件
+- 加载且活动的 chunk 才会有新 hash 进 store. 这部分占比由"已加载 chunk / 总世界 chunk"决定
+- 即便 chunk 内 NBT 字段因玩家活动微变 (LastUpdate / InhabitedTime / block_ticks 等), 只要它属于"未加载 chunk"集合就 100% dedup
+
+#### 按服规模分档
+
+| 服规模 | 总 chunk | 加载 chunk | 单次快照 diff | 实际 dedup 率 |
+|---|---|---|---|---|
+| 成熟大服 | 200 万 | 1-2 万 | ~1% | **~98%+** |
+| 中型服 | 50 万 | 5k-1 万 | ~2% | ~95-98% |
+| 新服 (跑图阶段) | 5 万 | 5k | ~10-30% | ~70-90% |
+| 小型私服 | 2 万 | 2k | ~10-50% | 50-90% |
+
+**结论**: 大服越成熟 dedup 率越高 (跑图过期后大量 chunk 永久不再 save). 小型私服因加载比例高 dedup 率较低, 但绝对存储成本也低 (2 万 chunk × ~3 KB × 47 份保留 ≈ 3 GB), 仍可接受.
+
+#### 实测预期 (生产服 80mod / 60p / 7 天保留, 2 小时一备 = 84 份)
+
+| 维度 | vanilla 全量方案 (FTB Backups Z) | BetterBackup |
 |---|---|---|
 | 第 1 份备份大小 | ~200 GB (整 world zip) | ~140 GB (chunk 已压缩, 全部 unique) |
-| 平均增量 (份 N>1) | ~200 GB (全量复制) | ~3-15 GB (变化 chunk 字节) |
-| 7×24=168h × 84 份总占用 | ~16.8 TB | ~250-500 GB |
+| 平均增量 (份 N>1) | ~200 GB (全量复制) | ~1-5 GB (变化 chunk 字节, 大服 ~1%) |
+| 84 份总占用 | ~16.8 TB | ~150-300 GB (节省 50-100x) |
 | 单次备份耗时 (主线程视角) | 30s-5min (主线程冻结) | 0ms (主线程无开销) |
-| 单次备份耗时 (壁钟) | 30s-5min | 1-30s (worker 处理变化 chunk) |
+| 单次备份耗时 (壁钟) | 30s-5min | 5-30s (worker 处理变化 chunk) |
 | Restore 完整世界 | 解压 zip | 按 manifest 重建 region 文件 |
 
-**dedup 率假设**: 70-80% (按全字节 hash, 没有 NBT 字段感知). 真实数据驱动, 上线后会观测调整.
+**算法选择**: 直接对 .mca 文件里 chunk slot raw 压缩字节做 hash, 不解 NBT, 不剥字段, 跨 JVM 字节恒等. 详见 §2.7.
+
+### 2.6 store 临时膨胀与增量 GC
+
+加载且活动的 chunk 在两次快照之间会被 BAS save 多次 (autosave 5min 一次, 2 小时间隔 = 24 次). 每次都进 BackupWorker → 每次都生成新 hash 写 store. 但 manifest 只引用最后一次 (dirtyMap.put 覆盖语义), 中间 23 次写入 store 后就成 unreferenced 孤儿.
+
+**膨胀估算 (大服)**: 1 万加载 chunk × 24 次 / 2h × 3 KB ≈ 700 MB / 2h 临时数据等 GC.
+
+§5.2 原本的 GC 触发点只覆盖删 manifest 后扫全库, 不覆盖这种"snapshot 间临时孤儿". 必须加第四个触发点:
+
+- **每次创建 snapshot 后立即增量 GC**: 仅扫本次 BackupWorker 处理过、但未被 manifest 引用的 hash. scope 远小于全量 GC, 秒级完成. 防止 store 在两次 snapshot 间膨胀几 GB.
+
+实施细节: BackupWorker 维护 thread-local `Set<Hash>` 记录本次窗口写入的 hash, snapshot 创建时跟 manifest.values 求差集, 直接删除. 不需要扫整个 store 目录.
+
+### 2.7 算法选择: 为什么不走 NBT 字段感知 hash
+
+候选方案对比:
+
+| 方案 | 实施 | 跨 JVM 稳定 | dedup 率 | 同行先例 |
+|---|---|---|---|---|
+| **A. .mca chunk slot raw bytes hash (本方案)** | 简单 | 是 (绕开内存对象) | 大服 ~98%+ | NeoForge ChronoVault |
+| B. NBT 字段剥离 (LastUpdate / InhabitedTime) 后 sort + serialize 再 hash | 复杂 (递归 NBT 树) | 是 | 略高几个百分点 | **没人做过** |
+| C. 直接对 NbtIo.write(in-memory tag) 字节 hash | 最简单 | **否** | 局部归零 | 不安全 |
+
+**为什么不选 B**: vanilla `CompoundTag.tags` 是 `HashMap`, NbtIo 按 iteration 顺序写入. Java 17+ HashMap 是确定性纯函数 (JEP 180 已移除 hash randomization), 但 `tag.merge` / `tag.copy` / data fixer 重建 tag 时 put 顺序变化, 同语义产生不同字节. 方案 B 用递归 sort keys 能解决, 但实施复杂度高于 A, 边际收益 (几个百分点) 不值得.
+
+**为什么不选 C**: 见上 — put 顺序敏感, mod 改 NBT 后 dedup 局部归零, 高负载场景隐患大.
+
+**方案 A 的风险点**: 已加载 chunk 因 LastUpdate 等字段每次 save 字节都变, 该 chunk 在 store 里产生很多 unique hash. 但因为这些只占总 chunk 的 1-2%, 不影响整体 dedup 率, 且增量 GC (§2.6) 会清掉 unreferenced 中间版本.
 
 ## 3. BAS 集成
 
@@ -180,71 +242,165 @@ class CurrentSnapshotState {
 [[dependencies.shinoyuki_betterbackup]]
 modId="shinoyuki_betterautosave"
 mandatory=true
-versionRange="[0.7.0,)"   # 暂定 v0.7 起 BAS 暴露 callback API
+versionRange="[0.9.0,)"   # BAS v0.7 起暴露 SaveListenerRegistry, v0.9 起补全工具化, 锁下界 0.9.0
 ordering="AFTER"
 side="SERVER"
 ```
 
 不装 BAS → BetterBackup 拒绝加载, 启动期 ERROR + crash, 不允许半残运行.
 
-### 3.2 Hook 点 (BAS 侧需要新增的扩展点)
+### 3.2 BAS Listener API (实际签名, BAS v0.7+ 已上线)
 
-BAS 当前 `ChunkSaveTask` 的工作流:
+BAS 已经在 v0.7 暴露三类独立 listener 接口, BetterBackup 直接 import 使用, 无需 BAS 侧再加扩展点.
 
-```
-ChunkSaveTask.run()
-  |- ChunkNbtAssembler.assemble(snapshot) -> CompoundTag tag
-  |- worker.store(pos, tag)  // IOWorker
-  |- onIoComplete callback   // 状态机推进
-```
-
-需要在 `worker.store(pos, tag)` 前后加一个**外部订阅点**:
+实际接口 (来自 `com.shinoyuki.betterautosave.api`):
 
 ```java
-// BAS API (新增, 暴露在 BetterAutoSaveCore)
 public interface ChunkSaveListener {
-    void onChunkSaved(ChunkPos pos, ResourceKey<Level> dim, CompoundTag tag);
-    void onEntityChunkSaved(ChunkPos pos, ResourceKey<Level> dim, CompoundTag tag);  // v0.6 entity 路径
+    void onChunkSaved(ChunkPos pos, ResourceKey<Level> dimension, CompoundTag tag);
 }
 
-public final class BetterAutoSaveCore {
-    public static void registerSaveListener(ChunkSaveListener listener);
-    public static void unregisterSaveListener(ChunkSaveListener listener);
+public interface EntityChunkSaveListener {
+    void onEntityChunkSaved(ChunkPos pos, ResourceKey<Level> dimension, CompoundTag tag);
+}
+
+public interface SavedDataSaveListener {
+    void onSavedDataWritten(String fileName, CompoundTag tag);
+}
+
+public final class SaveListenerRegistry {
+    public static void registerChunk(ChunkSaveListener listener);
+    public static void unregisterChunk(ChunkSaveListener listener);
+    public static void registerEntityChunk(EntityChunkSaveListener listener);
+    public static void unregisterEntityChunk(EntityChunkSaveListener listener);
+    public static void registerSavedData(SavedDataSaveListener listener);
+    public static void unregisterSavedData(SavedDataSaveListener listener);
 }
 ```
 
-**BAS 侧改动**: 一个 commit. 新增 `ChunkSaveListener` 接口 + `SaveListenerRegistry` (CopyOnWriteArrayList) + 在 `ChunkSaveTask.run()` / `EntitySaveTask.run()` 适当位置 fire 事件. 工作量 < 100 行, 主路径零开销 (空 listener list 时只一次 size==0 检查).
+**关键约束** (BAS 实际行为, BetterBackup 实施时必须遵守):
 
-### 3.3 通信机制选型
+- listener 在 BAS worker 线程被 fire (不是主线程), 必须线程安全
+- 仅 `CLEAN_LANDED` / `REQUEUE_DIRTY` 路径 fire (chunk 已成功落盘), `FAILED_TERMINAL` 不 fire
+- `tag` 在 fire 后 BAS 不再修改 (effectively immutable). 但本方案 §2.1 不读 tag, 直接读 .mca 磁盘字节, 该约束跟备份 dedup 无关
+- listener 异常被 Registry try-catch + log 不传播; BetterBackup 自己的 worker queue 应再加 try-catch 防降级
 
-| 方案 | 优点 | 缺点 | 决策 |
-|---|---|---|---|
-| **BAS 公开 listener API jar** | 编译期类型安全, 性能最好 | BAS 需独立 API jar 工件 (额外构建复杂度) | **首选** |
-| Forge IMC | 无编译期耦合 | 字符串 key + Object payload, 类型不安全, 每事件 boxing | 备选 |
-| Forge ServiceLoader | meta-inf/services 自动发现 | 启动期反射, 绑定时机不可控 | 否 |
-| Mixin (BetterBackup 直接 mixin BAS) | 最灵活 | 维护噩梦, mod 间 mixin 撞车 | 否 |
+### 3.3 集成方式 (BetterBackup 编译期依赖 BAS jar)
 
-**结论**: BAS 内部可以分一个 `betterautosave-api` 子模块 (gradle subproject) 暴露 listener 接口, 主 mod jar 跟 api jar 都发布. BetterBackup 编译期依赖 api jar, 运行时依赖 BAS 主 mod.
+**BetterBackup 编译期依赖 BAS jar**, 不需要独立 API jar 子模块. BAS API package (`com.shinoyuki.betterautosave.api`) 已经稳定公开, 直接 link 即可.
 
-如果太麻烦, 第一阶段先用 IMC, 第二阶段再切 API jar. IMC 实现 30 行代码可起步.
+`build.gradle`:
 
-### 3.4 SavedData / Entity 备份扩展点 (v0.7+)
+```gradle
+dependencies {
+    implementation fg.deobf("...:shinoyuki_betterautosave:0.9.0")
+}
+```
 
-- BAS v0.7 SavedData 路径接管后, 自然加 `SavedDataSaveListener.onSavedDataWritten(filename, tag)` callback
-- BetterBackup 监听该事件, 把 `mtr_train_data.dat` 等也纳入快照
+`mods.toml`:
 
-完整快照内容 (v0.7 后):
+```toml
+[[dependencies.shinoyuki_betterbackup]]
+modId = "shinoyuki_betterautosave"
+mandatory = true
+versionRange = "[0.9.0,)"
+ordering = "AFTER"
+side = "SERVER"
+```
+
+不装 BAS → BetterBackup 拒绝加载, 启动期 ERROR + crash, 不允许半残运行.
+
+(原备选 IMC / ServiceLoader 方案不再需要 — API package 公开稳定后直接 link 最简单.)
+
+### 3.4 三类 listener 在备份里的角色
+
+| listener | 触发时机 | 备份动作 |
+|---|---|---|
+| `ChunkSaveListener` | chunk 已写入 .mca 文件 | BackupWorker 读对应 .mca chunk slot raw bytes, hash, 入 store, 写 dirtyMap |
+| `EntityChunkSaveListener` | entity .2dm 已写入 entity region file | 同上 (entity region file 在 `entities/` 子目录) |
+| `SavedDataSaveListener` | .dat 文件已写盘 (含 `mtr_train_data.dat` 等) | BackupWorker 直接读 .dat 文件字节 (单文件不分 slot) hash 入 store |
+
+完整快照 manifest 结构:
 
 ```
 SnapshotManifest {
-    chunks: { (dim, x, z) -> hash },          // BAS chunk 路径
-    entityChunks: { (dim, x, z) -> hash },    // BAS v0.6 entity 路径
-    savedData: { filename -> hash },          // BAS v0.7 SavedData 路径
-    levelDat: hash,                           // 单独处理 (vanilla 自己写)
+    chunks:       { (dim, x, z) -> hash },     // BAS ChunkSaveListener
+    entityChunks: { (dim, x, z) -> hash },     // BAS EntityChunkSaveListener
+    savedData:    { fileName -> hash },        // BAS SavedDataSaveListener
+    levelDat:     hash,                        // 独立处理, 见 §3.5
 }
 ```
 
-`level.dat` 由 vanilla autosave 写, 不在 BAS 路径上. MVP 阶段 BetterBackup 在备份触发时主动读 `level.dat` + hash + 入 store, 一次性 IO 不昂贵.
+### 3.5 level.dat 处理 (BAS 不接管)
+
+`level.dat` 由 vanilla `MinecraftServer.saveEverything → ServerLevel.save → LevelStorageAccess.saveDataTag` 写盘, **BAS 不接管该路径**, 没有对应 listener.
+
+MVP 处理方案 (零 mixin):
+
+- `ServerStoppingEvent` (`EventPriority.LOW`) handler 完成后, vanilla 已经写完 level.dat. BetterBackup 在 `ServerStoppedEvent` 时直接读 `<world>/level.dat` 文件字节 hash 入 store
+- 定时备份 (server 运行中) 触发时同样直接读盘 — vanilla 上次 autosave 已写 level.dat, 读到的是最新 (有几秒延迟可接受, level.dat 内容变化频率本身低)
+- 单文件几十 KB, 一次性 IO 不昂贵
+
+**v0.2+ 可选**: BetterBackup 自己加 mixin 拦 `LevelStorageAccess.saveDataTag` HEAD 在写盘瞬间捕获 tag, 实现"任意时间点都有最新 level.dat 备份". MVP 不做.
+
+### 3.6 BetterBackup 自身 lifecycle (跟 BAS 关服顺序对齐)
+
+BAS `BetterAutoSaveMod.onServerStopping` 实际顺序:
+
+```
+1. exporter.stop()         (Prometheus)
+2. enterShutdownMode()     (BAS scheduler 不再接管新 save)
+3. drainPending()          (等 BAS worker queue 清空)
+4. joinWorkers()           (等 BAS chunk/entity/savedData worker 线程退出)
+```
+
+BetterBackup 必须保证 **BAS 在第 3-4 步 fire 的最后一批 listener 事件能被消费**, 否则数据丢:
+
+- BetterBackup `ServerStoppingEvent` handler 用 `EventPriority.LOW` (BAS 默认 NORMAL), 让 BAS 先跑完 onServerStopping
+- BAS 关服期间 fire 的 listener 事件 → BetterBackup queue 接收 (BetterBackup worker 此时仍活着)
+- BAS joinWorkers 完成后 BetterBackup `ServerStoppingEvent(LOW)` handler 才执行: drain 自己 queue → 创建 final snapshot → join 自己 worker
+- `ServerStoppedEvent` 时 vanilla saveEverything 已完成 (含 level.dat), BetterBackup 收尾复制 level.dat
+
+时序:
+
+```
+T0: ServerStoppingEvent fire (NORMAL) → BAS handler 开始
+T1: BAS exporter.stop / enterShutdownMode / drainPending / joinWorkers
+    (这期间 BAS 可能 fire 最后一批 chunk listener, BetterBackup queue 接收)
+T2: BAS handler 返回
+T3: ServerStoppingEvent fire (LOW) → BetterBackup handler 开始
+T4: BetterBackup drainOwnQueue + createFinalSnapshot + joinOwnWorker
+T5: BetterBackup handler 返回
+T6: ServerStoppedEvent (vanilla saveEverything 完成, level.dat 已写)
+T7: BetterBackup ServerStoppedEvent 收尾 (复制 level.dat 到 store)
+```
+
+### 3.7 metrics (BetterBackup 自己开 Prometheus 端口)
+
+BAS v0.9 `PrometheusExporter` 不开放第三方注册 (`PrometheusFormatter` 是 private static, 无 plugin API). BetterBackup **自己开端口** (默认 9451 避开 BAS 9450).
+
+暴露 metrics (跟 BAS 同风格, 用 `bbb_` 前缀避免命名冲突):
+
+- `bbb_chunks_dedup_total` (counter): 命中已有 hash 的 chunk 数
+- `bbb_chunks_unique_total` (counter): 写入 store 新 hash 的 chunk 数
+- `bbb_store_bytes` (gauge): store 当前总字节
+- `bbb_store_unique_count` (gauge): store unique hash 数
+- `bbb_snapshot_count` (gauge): 当前保留的 snapshot 数
+- `bbb_backup_worker_queue_depth` (gauge)
+- `bbb_backup_io_seconds` (histogram): 单 chunk read+hash+store 耗时
+- `bbb_gc_seconds` (histogram): 增量 / 全量 GC 耗时
+- `bbb_dedup_ratio_recent` (gauge): 最近一次 snapshot 的 dedup 命中率
+
+实现复用 BAS 同款思路 (JDK HttpServer + 自己写 exposition formatter). 配置:
+
+```toml
+[prometheus]
+enabled = false
+bindAddress = "0.0.0.0"
+port = 9451
+```
+
+未来系列 mod 都有 metrics 后再考虑做统一 dashboard, 跟 BAS ROADMAP 中 "WebUI 推迟到系列上线后" 对齐.
 
 ## 4. 恢复 (Restore) 设计
 
@@ -254,16 +410,30 @@ SnapshotManifest {
 /betterbackup restore <snapshot-id> [--dry-run]
 ```
 
+服务端运行中下达命令时不立即执行, 写一个 `.pending-restore` flag 文件, 提示玩家手动停服, 下次启动时自动跑 restore.
+
 流程:
+
+**A. 命令阶段 (server 运行中)**:
 1. 加载 manifest
 2. 校验 dedup store 完整性 (每个 referenced hash 都在 store 内)
-3. **要求服务端处于 STOPPED 状态** (启动时检测有 pending restore, 否则拒绝执行 — 不允许在线恢复)
-4. 删除 / 移动现有 `world/region/` `world/entities/` 目录到 `world.bak-<timestamp>/`
-5. 按 manifest 遍历: 每个 (dim, x, z) → hash, 从 store 读 NBT bytes, 写入对应 region file 的正确 chunk slot
-6. 写 `level.dat` 等其他文件
-7. 启动服务端
+3. 写 `<world>/.shinoyuki-pending-restore` flag 文件, 内容为 snapshot-id + 校验结果
+4. 命令返回 "restore prepared, please stop server now"
 
-**关键**: region file 是 32×32 chunks 的二进制布局, 需要正确实现 region file 写器. 复用 vanilla `RegionFile` 类是首选 (mixin 不行因为是 restore 阶段, 这时 mod 没加载). 单独写一个独立的 `RegionFileWriter` 工具类 (~200 行).
+**B. 启动阶段 (server 重启后)**:
+5. `BetterBackupMod.onServerAboutToStart` 检测到 `.shinoyuki-pending-restore` flag
+6. 此时 vanilla 还没开始 chunk loading, mod 已加载可用 vanilla classes
+7. 删除 / 移动现有 `world/region/` `world/entities/` `world/data/` `world/level.dat` 到 `world.bak-<timestamp>/`
+8. 按 manifest 遍历每个 (dim, x, z) → hash:
+   - 从 store 读 raw chunk bytes (vanilla zlib 压缩格式)
+   - 用 vanilla `RegionFile.getChunkOutputStream(ChunkPos)` 写入对应 .mca slot
+9. 同样恢复 entityChunks / savedData / level.dat
+10. 删除 `.shinoyuki-pending-restore` flag
+11. 服务端继续正常启动流程
+
+**RegionFile 复用策略**: vanilla `net.minecraft.world.level.chunk.storage.RegionFile` 已经是 self-contained 的工具类 — `getChunkOutputStream(ChunkPos)` 是 public, ctor 只要 `Path` (不需要 MinecraftServer 实例). BetterBackup mod 加载状态下能直接 link vanilla RegionFile, 不需要重新实现 `RegionFileWriter`. 节省 ~400 行代码 + 跟 vanilla format 自动同步.
+
+**关于"mod 没加载"的疑虑**: restore 阶段 mod 已加载 (`onServerAboutToStart` 在 mod 加载后), 不需要 standalone 工具. 这跟原草案的"mixin 不行因为 mod 没加载"前提不同 — 我们走 mod 加载后的 lifecycle 钩子, 不走外部工具.
 
 ### 4.2 单 chunk / 单维度恢复 (调试用)
 
@@ -321,6 +491,7 @@ manifest 删除后, 它引用的 chunk hash 可能仍被其他 manifest 引用, 
 - 手动 `/betterbackup gc`
 - 自动: 每次删除 manifest 后异步触发 (worker 线程, 不阻塞 BAS)
 - 启动时: 如果 store 大小 > 配置阈值 (例如 500GB), 自动 GC
+- **每次创建 snapshot 后立即增量 GC** (新增, 见 §2.6): 仅扫本次 BackupWorker 写入但未被 manifest 引用的 hash. scope 远小于全量 GC, 秒级完成. 防止 store 在两次 snapshot 间膨胀 (大服可达几 GB / 2h)
 
 **GC 安全性**:
 - GC 期间持有 `store.lock`
@@ -363,12 +534,19 @@ MVP 仅做定时 + 手动. autosave 触发 + 阈值触发是 v0.2.
 ```toml
 [general]
 enabled = true                                # 总开关
-backupDirectory = "world/.shinoyuki-backup"   # 备份 store 路径
+# 默认外置 (跟 world/ 同级), 避免 rsync world/ 时把 store 也带走形成套娃.
+# 路径相对 server root.
+backupDirectory = "backup-store"
 
 [storage]
-hashAlgorithm = "sha256"                      # MVP 仅 sha256, blake3 v0.2+
-compressionAlgorithm = "zstd"                 # zstd / zlib
-compressionLevel = 6                          # zstd 1-22, zlib 1-9
+# 默认 xxh128 (跟 PrimeBackup 一致, 比 sha256 快 5-10x).
+# 实际 hash 单元是 .mca 文件里的 chunk slot raw bytes, 不解 NBT.
+# sha256 留作可选 (verify / 完整性敏感场景).
+hashAlgorithm = "xxh128"                      # xxh128 | sha256 | blake3
+# .mca chunk slot 已经是 vanilla zlib 压缩, 不再二次压缩 (避免无效压缩).
+# 此项保留给 SavedData / level.dat 等未压缩文件.
+compressionAlgorithm = "none"                 # none | zstd
+compressionLevel = 0                          # zstd 1-22 (compressionAlgorithm=zstd 时生效)
 maxStoreSizeGB = 500                          # 超过自动触发 GC
 
 [schedule]
@@ -383,29 +561,40 @@ weekly = 4
 monthly = 12
 
 [workers]
-backupWorkerThreads = 1                       # 备份 worker 池大小, 默认 1 足够 (IO 密集不是 CPU 密集)
+# CPU 密集 (hash + 可选压缩), 不是 IO 密集.
+# 大服 autosave 周期内 BAS 可能一次性派发几千 chunk, 单线程会成 bottleneck.
+# 默认按 CPU 核心数推算, 1 给小机, 2-4 给大服.
+backupWorkerThreads = 2                       # 备份 worker 池大小
 
 [safety]
 verifyOnStartup = true                        # 启动时扫 store 一致性
 verifyOnSnapshot = false                      # 每次备份后校验所有 hash (慢, 默认关)
 panicOnHashMismatch = false                   # hash 不一致时是否 crash
+
+[prometheus]
+enabled = false                               # 默认 opt-in
+bindAddress = "0.0.0.0"                       # 公网服请用防火墙挡端口或改 127.0.0.1
+port = 9451                                   # 避开 BAS v0.9 的 9450
 ```
 
 ## 8. 关键风险 + 缓解
 
 | 风险 | 概率 | 影响 | 缓解 |
 |---|---|---|---|
-| sha256 hash 碰撞 | 10^-77 量级 | 数据错乱 | 不缓解, 概率比硬盘 bit flip 还低 |
+| xxh128 hash 碰撞 | 10^-19 量级 | 数据错乱 | 不缓解, 概率比硬盘 bit flip 仍低数个数量级. 完整性敏感场景可切 sha256 |
 | dedup store 文件被外部修改 / 损坏 | 中 | 该 hash 引用的 chunk 恢复时崩 | startup 校验扫文件大小 + 抽样 hash, mismatch 时 quarantine 并 ERROR |
 | manifest 写一半断电 | 低 | 该快照不可用, 但 store 没污染 | manifest 写临时文件 + atomic rename, 写一半的临时文件 startup 时清理 |
+| store 文件写一半断电 | 低 | 部分 hash 文件半写, 启动 verify 失败 | store 文件先写 `<hash>.tmp` + fsync + atomic rename `<hash>`, 启动时清理孤立 .tmp |
 | GC 跟 dedup write race | 中 | 新备份引用刚被 GC 删的 hash | GC 阶段持 store-wide write lock, 或用引用计数防漏删 |
 | 用户在恢复中途中断 | 中 | world 目录半残 | restore 写到 `world.tmp/`, 完成后才 atomic move |
-| BAS 升级后 listener API 改了 | 高 (单独 mod 风险) | BetterBackup 不兼容 | 严格 semver, listener API 进 betterautosave-api 子模块, 跟 mod jar 分离, 升级窗口长 |
+| BAS 升级后 listener API 改了 | 中 | BetterBackup 不兼容 | BAS API package 已稳定公开 (v0.7+), 严格 semver, mods.toml 用 versionRange 锁定下界 |
 | 备份过程异常导致 worker 死 | 低 | 后续备份不工作 | worker 异常 → degraded mode (类似 BAS), DiagnosticLogger 报警, 不 crash 服务端 |
-| chunk 字节包含易变字段 (LastUpdate / InhabitedTime) 导致 dedup 率低 | 高 | dedup 率从理论 95% 跌到 70-80% | 接受。MVP 不做 NBT 字段感知, v0.2+ 再考虑 |
+| .mca chunk slot 字节因 BAS 重写而变 (LastUpdate / InhabitedTime 字段) | 高 | 已加载 chunk 在 store 里产生很多 unique hash, 中间版本 unreferenced | 接受 — 已加载 chunk 仅占 ~1% (大服), 整体 dedup 率 98%+ 不受影响. 增量 GC (§2.6) 清掉中间版本 |
+| chunk 内存 NBT put 顺序变化 (mod 改 NBT / data fixer / tag.merge) | 高 | 如果对内存 NBT hash 会让 dedup 局部归零 | **方案 A 已规避**: 不读内存 NBT, 直接读 .mca 磁盘字节, 跨 JVM 字节恒等 |
 | 服主同时跑 FTB Backups 等老 mod | 中 | 双备份冲突 (磁盘空间 / 锁竞争) | 在 README 警告, 不主动检测 |
 | store 路径在 NFS / SMB 远程文件系统 | 中 | 性能差 + 锁语义不一致 | 启动时检测 store 路径 mount type, NFS/SMB 时 WARN |
 | kill -9 时正在备份 | 中 | manifest 半写 / store 漏文件 | manifest atomic rename 已防一半, store 文件 fsync 后才写 manifest, 引用尚未 fsync 的 hash 自动重写 |
+| BackupWorker 跨 mod 读 .mca 文件跟 vanilla IOWorker 写竞争 | 中 | 读到 partial 写或撞 lock | BackupWorker 用 read-only FileChannel 打开 .mca, 跨进程在 OS 层级 vanilla 写 sector atomic; 实施时验证 |
 
 ## 9. MVP 范围
 
@@ -523,8 +712,10 @@ BetterBackup 仓库 (3-4 commits):
 
 ## 附录 C: 待决问题 (开发期间需要拍板)
 
-1. **BAS API jar 还是 IMC**: §3.3, 推荐前者, 但 MVP 阶段 IMC 也可
+1. ~~**BAS API jar 还是 IMC**~~: 已决, BAS v0.7+ API package 公开稳定, 直接 link (§3.3)
 2. **manifest 格式 NBT 还是自定义二进制**: §2.3, 倾向 NBT (简单), 性能不够再换
-3. **store 默认放 world/ 目录还是独立目录**: 默认 `world/.shinoyuki-backup/`, 但允许配置外置 (避免 world 目录被整体备份时把 store 也带进去)
+3. ~~**store 默认放 world/ 目录还是独立目录**~~: 已决, 默认外置 `backup-store/` 跟 `world/` 同级 (§7)
 4. **vanilla autosave 时机协调**: 是否在 vanilla autosave 周期内主动触发 snapshot, 保证一致性? MVP 阶段不协调, 接受 partial-snapshot 风险 (个别 chunk 在 snapshot 启动到完成期间又变化, 该 chunk 用新 hash, 跟其他 chunk 时间点不一致). v0.2 考虑加锁保证 atomicity
 5. **客户端兼容**: BetterBackup 是 server-only mod, 客户端不需要装. mods.toml 声明 `side="SERVER"`. 但需要测试客户端连服时 mods sync 不报 missing
+6. **BackupWorker 读 .mca 跟 vanilla IOWorker 写的并发**: §8 已列为风险, 实施 MVP Phase 1 时优先验证. 如果 vanilla `RegionFile` 内部 lock 保证 sector atomic write, BackupWorker read-only FileChannel 可安全读; 否则需要短暂等待 IOWorker 完成 (BAS fire 时已经完成, 但同 .mca 文件其他 chunk 仍可能在写)
+7. **Entity region file 与 SavedData 文件路径**: vanilla 1.20.1 entity 是 `entities/r.x.z.mca`, SavedData 是 `data/<name>.dat` 或 `DIM-1/data/<name>.dat`. BackupWorker 需要从 listener 给的 dimension/fileName 推路径, 实施 MVP Phase 1 整理路径映射表
