@@ -1,39 +1,87 @@
 package com.shinoyuki.betterbackup;
 
-import com.shinoyuki.betterbackup.api.BackupHelloListener;
+import com.shinoyuki.betterbackup.integration.BackupListenerBridge;
+import com.shinoyuki.betterbackup.snapshot.CurrentSnapshotState;
+import com.shinoyuki.betterbackup.store.ChunkStore;
+import com.shinoyuki.betterbackup.worker.BackupContext;
+import com.shinoyuki.betterbackup.worker.BackupTask;
+import com.shinoyuki.betterbackup.worker.BackupWorker;
+
+import java.util.List;
+import java.util.concurrent.BlockingQueue;
 
 /**
  * BetterBackup 静态注册中心 (跟 BAS BetterAutoSaveCore 同款模式).
  *
- * <p>Phase 0 持 INSTALLED 标志 + hello listener 引用 (用于关服 unregister).
- * 后续 Phase 会逐步加:
- * <ul>
- *   <li>Phase 1: ChunkStore / BackupWorker / SnapshotManifest 引用</li>
- *   <li>Phase 2: SnapshotScheduler 引用</li>
- *   <li>Phase 5: PrometheusExporter / BetterBackupMetrics 引用</li>
- * </ul>
+ * <p>install / uninstall 仅在 BetterBackupMod 的 ServerStarting / ServerStopping
+ * 钩子中调用. isInstalled() 给命令 / listener 守卫使用.
  */
 public final class BetterBackupCore {
 
-    private static volatile boolean INSTALLED;
-    private static volatile BackupHelloListener HELLO_LISTENER;
+    private static volatile ChunkStore STORE;
+    private static volatile CurrentSnapshotState SNAPSHOT_STATE;
+    private static volatile BackupContext CONTEXT;
+    private static volatile BlockingQueue<BackupTask> QUEUE;
+    private static volatile List<BackupWorker> WORKERS;
+    private static volatile List<Thread> WORKER_THREADS;
+    private static volatile BackupListenerBridge BRIDGE;
 
-    public static void install(BackupHelloListener helloListener) {
-        HELLO_LISTENER = helloListener;
-        INSTALLED = true;
+    public static void install(ChunkStore store,
+                               CurrentSnapshotState snapshotState,
+                               BackupContext context,
+                               BlockingQueue<BackupTask> queue,
+                               List<BackupWorker> workers,
+                               List<Thread> workerThreads,
+                               BackupListenerBridge bridge) {
+        STORE = store;
+        SNAPSHOT_STATE = snapshotState;
+        CONTEXT = context;
+        QUEUE = queue;
+        WORKERS = workers;
+        WORKER_THREADS = workerThreads;
+        BRIDGE = bridge;
     }
 
     public static void uninstall() {
-        INSTALLED = false;
-        HELLO_LISTENER = null;
+        STORE = null;
+        SNAPSHOT_STATE = null;
+        CONTEXT = null;
+        QUEUE = null;
+        WORKERS = null;
+        WORKER_THREADS = null;
+        BRIDGE = null;
     }
 
     public static boolean isInstalled() {
-        return INSTALLED;
+        return STORE != null;
     }
 
-    public static BackupHelloListener helloListener() {
-        return HELLO_LISTENER;
+    public static ChunkStore store() {
+        return STORE;
+    }
+
+    public static CurrentSnapshotState snapshotState() {
+        return SNAPSHOT_STATE;
+    }
+
+    public static BackupContext context() {
+        return CONTEXT;
+    }
+
+    public static BlockingQueue<BackupTask> queue() {
+        return QUEUE;
+    }
+
+    public static List<BackupWorker> workers() {
+        return WORKERS;
+    }
+
+    public static List<Thread> workerThreads() {
+        return WORKER_THREADS;
+    }
+
+    public static BackupListenerBridge bridge() {
+        return BRIDGE;
     }
 
     private BetterBackupCore() {
