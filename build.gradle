@@ -126,6 +126,13 @@ jar {
     finalizedBy 'reobfJar'
 }
 
+// ForgeGradle 6 的 jarJar 任务默认 disabled, 必须显式 enable. 否则 OpenHFT
+// zero-allocation-hashing 不会嵌入最终 mod jar, 用户装 mod 时 runtime
+// ClassNotFoundException. enable 后 jarJar 产出 fat jar 名为
+// shinoyuki_betterbackup-0.1.0-all.jar, 真正给用户装的是这个.
+jarJar.enable()
+tasks.build.dependsOn('jarJar')
+
 publishing {
     publications {
         register('mavenJava', MavenPublication) {
