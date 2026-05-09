@@ -1,11 +1,177 @@
 # Shinoyuki-BetterBackup
 
-Minecraft 1.20.1 Forge 服务端增量备份 mod。基于内容寻址 (content-addressed) 跨快照 dedup，实测大型生产服 84 份备份占用从 vanilla 全量方案的 16.8 TB 降到 150-300 GB。跟 [Shinoyuki-BetterAutoSave](https://github.com/xiaoxiao-cvs/Shinoyuki-BetterAutoSave) (BAS) 异步化管线深度集成，主线程零阻塞。
+Minecraft 1.20.1 Forge 服务端**增量备份** mod。第二次备份起只处理变化的 chunk，84 份备份占用从 vanilla 方案的 16.8 TB 降到约 150-300 GB（98% 节省）。备份在后台 worker 线程跑，主线程零开销。跟 [Shinoyuki-BetterAutoSave](https://github.com/xiaoxiao-cvs/Shinoyuki-BetterAutoSave) (BAS) 深度集成。
 
-> 项目开发中，详细设计与实施路线见 [DESIGN.md](DESIGN.md).
+## 目录
+
+- [它解决什么问题](#它解决什么问题)
+- [跟现有备份 mod 的区别](#跟现有备份-mod-的区别)
+- [安装](#安装)
+- [配置](#配置)
+- [运行时命令](#运行时命令)
+- [恢复流程](#恢复流程)
+- [性能预期](#性能预期)
+- [数据安全](#数据安全)
+- [已知限制](#已知限制)
+- [构建](#构建)
+- [致谢](#致谢)
+
+## 它解决什么问题
+
+现在主流 1.20.1 备份 mod（FTB Backups Z / AromaBackup 等）的两个痛点：
+
+1. **占用爆炸**：每次备份都把 world 整个 zip 一份，84 份 = 84 × world 大小。500 MB 世界一夜膨胀到 4 GB，200 GB 世界一年累积超过 16 TB
+2. **主线程冻结**：备份开始时 server 卡住几十秒到几分钟，玩家被踢
+
+BetterBackup 的解法：
+- **只备份变化的 chunk**：vanilla 一次备份要复制全世界，BetterBackup 只处理 BAS 刚保存过的 chunk（其他 chunk 跨快照引用同一份字节，不重复存）
+- **整套在 worker 线程**：BAS 的 chunk save 完成后通知 BetterBackup，备份操作在后台 worker 跑，主线程感知不到
+
+## 跟现有备份 mod 的区别
+
+| | FTB Backups Z | fastback (git) | BetterBackup |
+|---|---|---|---|
+| 算法 | 整 zip 全量 | git object 文件级 | **chunk 级内容寻址** |
+| 大世界 (>5 GB) | 占用爆炸 | git GC 翻车 5+ 分钟 | OK |
+| 主线程冻结 | 30s - 5min | 数秒 | **0ms** |
+| 跟存档 mod 集成 | 无 | 无 | **BAS listener** |
+| 84 份占用 (200 GB 世界) | ~16.8 TB | 不可控 | **~150-300 GB** |
+
+[ChronoVault](https://github.com/Catt1eyaa/ChronoVault)（NeoForge 1.21.1）已经在 NeoForge 上验证过 chunk slot 内容寻址的思路，BetterBackup 把这个范式带到 Forge 1.20.1 并跟 BAS 集成做增量。详见 [致谢](#致谢)。
+
+## 安装
+
+依赖：
+- Minecraft 1.20.1
+- Minecraft Forge 47.3.22+
+- Java 17 (Eclipse Temurin)
+- **必装**：[Shinoyuki-BetterAutoSave](https://github.com/xiaoxiao-cvs/Shinoyuki-BetterAutoSave) v0.9.0+（BetterBackup 通过 BAS Listener API 接收 chunk save 事件）
+
+把 `shinoyuki_betterbackup-0.1.0-all.jar`（带 `-all` 后缀的，包内嵌了哈希库）放进 `mods/`，启动后配置文件生成在 `config/Shinoyuki-Optimize/shinoyuki_betterbackup/common.toml`。
+
+> 不要装不带 `-all` 后缀的 jar，那个缺哈希库会启动报 `ClassNotFoundException`。
+
+## 配置
+
+`config/Shinoyuki-Optimize/shinoyuki_betterbackup/common.toml`：
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| general.enabled | true | 总开关。改 false 后 mod 仍加载但不再备份 |
+| general.backupDirectory | "backup-store" | 备份目录，相对 server root（跟 world/ 同级）。绝对路径也支持 |
+| storage.hashAlgorithm | XXH128 | 哈希算法。XXH128 比 SHA256 快 5-10 倍，碰撞概率仍低于硬盘位翻转。完整性敏感场景可切 SHA256 |
+| storage.compressionAlgorithm | NONE | chunk 字节已经被 vanilla zlib 压缩过，再压一次是浪费 CPU |
+| storage.maxStoreSizeGB | 500 | 超过此阈值启动时自动跑全量 GC |
+| schedule.mode | INTERVAL | 备份模式：INTERVAL（定时）/ MANUAL（仅命令） |
+| schedule.intervalMinutes | 120 | INTERVAL 模式下的备份间隔 |
+| retention.hourly | 24 | 保留最近 24 份每小时备份 |
+| retention.daily | 7 | 每日 |
+| retention.weekly | 4 | 每周 |
+| retention.monthly | 12 | 每月 |
+| workers.backupWorkerThreads | 2 | 备份 worker 线程数。CPU 密集（哈希计算），大服可调到 4 |
+| safety.verifyOnStartup | true | 启动时清理孤儿 .tmp 文件（kill -9 后残留） |
+| prometheus.enabled | false | 开启 Prometheus 监控 HTTP 接口 |
+| prometheus.bindAddress | "0.0.0.0" | 监控接口绑定地址。公网服请用防火墙挡 9451 端口或改 127.0.0.1 |
+| prometheus.port | 9451 | 监控接口端口（避开 BAS 的 9450） |
+
+## 运行时命令
+
+权限 OP level 2。
+
+| 命令 | 作用 |
+|---|---|
+| `/betterbackup status` | 看运行状态、队列深度、dirty 计数 |
+| `/betterbackup snapshot create [name]` | 立即创建一份备份（异步），name 可选 |
+| `/betterbackup snapshot list` | 列出最近 20 份备份 |
+| `/betterbackup snapshot info <id>` | 看某份备份的详细信息（chunk 数 / 维度 / level.dat 状态等） |
+| `/betterbackup snapshot delete <id>` | 删除一份备份的引用（不立即清磁盘，跑 gc 才清） |
+| `/betterbackup restore <id>` | 准备恢复（写 flag 文件 + 提示停服）。**重启后自动恢复** |
+| `/betterbackup gc` | 全量 GC：扫所有 hash 文件，删没被任何备份引用的孤儿 |
+
+**自动 GC**：每次 snapshot 创建后会自动跑增量 GC，清掉本周期内 worker 写入但 manifest 没引用的中间版本 hash。store 大小稳态 ≈ 当前所有 manifest 引用的 unique hash × 平均字节，**不会随时间线性增长**。
+
+## 恢复流程
+
+恢复是**离线模式**：命令不立即执行，写一个 flag 文件提示玩家手动停服，重启时自动跑恢复。这样安全（vanilla 还没 load world 时直接覆盖文件不会冲突）。
+
+```
+玩家在游戏里:
+  /betterbackup restore 2026-05-09T23-32-57Z
+  → "Restore prepared. STOP THE SERVER NOW..."
+
+玩家停服 → 重启
+
+启动日志:
+  [BetterBackup] pending restore detected: 2026-05-09T23-32-57Z - rebuilding world before vanilla load
+  [BetterBackup] restore complete: chunks=20036 entity=1403 savedData=4 levelDat=true backupDir=.../world.bak-1715293567000
+  [BetterAutoSave] pipeline starting ...
+  [其他 mod 正常启动]
+```
+
+恢复时**会保留你当前 world**：把 `region/`, `entities/`, `data/`, `level.dat` 等移到 `<worldRoot>.bak-<timestamp>/`，按备份重建。如果恢复出问题可以从 `.bak` 目录手动复原。
+
+恢复失败（备份 store 数据缺失等）log ERROR 但**不阻止服务端启动**，flag 不删，玩家修复后重启会再跑一次。
+
+## 性能预期
+
+实战参考（按 60 玩家中型服 + 200 万 chunk + 7 天保留 + 2 小时一备 = 84 份）：
+
+| 维度 | FTB Backups Z | BetterBackup |
+|---|---|---|
+| 第一次备份 | ~200 GB | ~140 GB |
+| 单次增量 | ~200 GB（全量） | ~1-5 GB（实测 ~1%） |
+| 84 份总占用 | ~16.8 TB | ~150-300 GB |
+| 单次备份耗时（主线程） | 30s - 5min（卡服） | 0ms |
+| 单次备份耗时（壁钟） | 30s - 5min | 5-30s（worker） |
+
+dedup 率取决于"已加载 chunk / 总世界"比例：
+- 成熟大服（200 万 chunk，1-2 万加载）：**~98%+**
+- 中型服（50 万，5k-1 万加载）：~95-98%
+- 新服（5 万，5k 加载）：~70-90%
+- 小型私服（2 万，2k 加载）：50-90%
+
+## 数据安全
+
+- **不动 world/**：备份期间整套是只读读取 `.mca` 文件 + 写入 `backup-store/`
+- **没 restore 不会动 world**：restore 命令需要写 flag + 玩家手动停服才会执行
+- **关服自动备份**：服务端正常停止时会跑一次 final snapshot，确保关服前所有变化都进备份
+- **kill -9 容错**：所有写入用 `tmp + fsync + atomic rename`，进程被强杀不会留半写文件污染 store；启动时自动清理 `.tmp` 残留
+- **损坏 manifest 不会误删 store**：全量 GC 遇到读不出的 manifest 直接 abort，不会把它引用的 hash 当孤儿删掉
+
+## 已知限制
+
+- **必须装 BAS**：BetterBackup 通过 BAS 的 Listener API 接收 chunk save 事件。卸载 BAS 后 BetterBackup 启动失败
+- **跟其他备份 mod 共存浪费空间**：理论上能并行跑，但 backup-store 跟 zip 备份会同时占用，建议二选一
+- **MVP 阶段 SavedData 假设在 overworld**：BAS Listener 不带 dimension 信息（API 限制），目前 SavedData 备份只看 `world/data/`。多维度自定义 SavedData 的 mod (极少见) 不完全覆盖，v0.2 跟随 BAS API 升级修复
+- **Restore 不恢复 playerdata / advancements**：仅恢复 chunk 数据 + level.dat。玩家进度数据 vanilla 跟 chunk 数据写在不同目录，独立处理（如果需要可以 rsync `world/playerdata/`）
+- **store 路径在 NFS / SMB 上未测**：理论上能跑但锁语义不一致，性能差，建议本地磁盘
+
+## 构建
+
+```bash
+# 1. BAS 仓库先 publish (出 mod jar 到本地 maven)
+cd Shinoyuki-BetterAutoSave
+./gradlew publish
+
+# 2. BetterBackup 仓库 build
+cd Shinoyuki-BetterBackup
+./gradlew build
+
+# 产物在 build/libs/:
+#   shinoyuki_betterbackup-0.1.0-all.jar    <- 给用户装这个
+#   shinoyuki_betterbackup-0.1.0.jar         <- 缺哈希库, 别用
+```
+
+测试：`./gradlew test`（跑 ChunkStore / Hash / RetentionPolicy / StoreGc / SnapshotManifest / RegionFile round-trip 共 70+ 个单元测试）。
+
+dev server 测试（不需要装 client）：`./gradlew runServer`，进 server console 跑 `/op <你的名字>` 然后用 client 连 localhost。
 
 ## 致谢
 
-BetterBackup 的核心 dedup 算法 — 直接对 region file (`.mca`) 里的 chunk slot raw 字节做 hash，不经过内存 NBT — 借鉴自 [ChronoVault](https://github.com/Catt1eyaa/ChronoVault) (NeoForge 1.21.1)。
+BetterBackup 的核心 dedup 算法 — 直接对 region file (`.mca`) 里的 chunk slot raw 字节做哈希，不经过内存 NBT — 借鉴自 [ChronoVault](https://github.com/Catt1eyaa/ChronoVault) (NeoForge 1.21.1)。
 
 这个思路工程上漂亮地绕开了 vanilla `CompoundTag` 序列化的字节不稳定问题（`HashMap` iteration 顺序 / `tag.merge` / data fixer 重建 tag 都会让同语义内容产生不同字节），跨 JVM 字节恒等保证 dedup 率稳定。ChronoVault 在 NeoForge 1.21.1 上验证了可行性，BetterBackup 把这个范式带到 Forge 1.20.1，并跟 BAS 的 listener API 集成做增量备份（只处理 BAS 刚 save 的 chunk，不主动扫整个世界）。
+
+## 许可
+
+见 LICENSE 文件。
