@@ -1,7 +1,9 @@
 package com.shinoyuki.betterbackup;
 
 import com.shinoyuki.betterbackup.integration.BackupListenerBridge;
+import com.shinoyuki.betterbackup.schedule.SnapshotScheduler;
 import com.shinoyuki.betterbackup.snapshot.CurrentSnapshotState;
+import com.shinoyuki.betterbackup.snapshot.SnapshotCreator;
 import com.shinoyuki.betterbackup.store.ChunkStore;
 import com.shinoyuki.betterbackup.worker.BackupContext;
 import com.shinoyuki.betterbackup.worker.BackupTask;
@@ -25,6 +27,8 @@ public final class BetterBackupCore {
     private static volatile List<BackupWorker> WORKERS;
     private static volatile List<Thread> WORKER_THREADS;
     private static volatile BackupListenerBridge BRIDGE;
+    private static volatile SnapshotCreator CREATOR;
+    private static volatile SnapshotScheduler SCHEDULER;
 
     public static void install(ChunkStore store,
                                CurrentSnapshotState snapshotState,
@@ -32,7 +36,9 @@ public final class BetterBackupCore {
                                BlockingQueue<BackupTask> queue,
                                List<BackupWorker> workers,
                                List<Thread> workerThreads,
-                               BackupListenerBridge bridge) {
+                               BackupListenerBridge bridge,
+                               SnapshotCreator creator,
+                               SnapshotScheduler scheduler) {
         STORE = store;
         SNAPSHOT_STATE = snapshotState;
         CONTEXT = context;
@@ -40,6 +46,8 @@ public final class BetterBackupCore {
         WORKERS = workers;
         WORKER_THREADS = workerThreads;
         BRIDGE = bridge;
+        CREATOR = creator;
+        SCHEDULER = scheduler;
     }
 
     public static void uninstall() {
@@ -50,6 +58,8 @@ public final class BetterBackupCore {
         WORKERS = null;
         WORKER_THREADS = null;
         BRIDGE = null;
+        CREATOR = null;
+        SCHEDULER = null;
     }
 
     public static boolean isInstalled() {
@@ -82,6 +92,14 @@ public final class BetterBackupCore {
 
     public static BackupListenerBridge bridge() {
         return BRIDGE;
+    }
+
+    public static SnapshotCreator creator() {
+        return CREATOR;
+    }
+
+    public static SnapshotScheduler scheduler() {
+        return SCHEDULER;
     }
 
     private BetterBackupCore() {

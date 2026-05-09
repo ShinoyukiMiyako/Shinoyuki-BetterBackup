@@ -6,13 +6,20 @@ import com.shinoyuki.betterbackup.config.BetterBackupConfig;
 import com.shinoyuki.betterbackup.config.ConfigSpec;
 import com.shinoyuki.betterbackup.integration.BackupListenerBridge;
 import com.shinoyuki.betterbackup.io.WorldPaths;
+import com.shinoyuki.betterbackup.schedule.IntervalScheduler;
+import com.shinoyuki.betterbackup.schedule.ManualScheduler;
+import com.shinoyuki.betterbackup.schedule.SnapshotScheduler;
 import com.shinoyuki.betterbackup.snapshot.CurrentSnapshotState;
+import com.shinoyuki.betterbackup.snapshot.SnapshotCreator;
 import com.shinoyuki.betterbackup.store.ChunkStore;
 import com.shinoyuki.betterbackup.store.HashFunction;
 import com.shinoyuki.betterbackup.store.Xxh128HashFunction;
 import com.shinoyuki.betterbackup.worker.BackupContext;
 import com.shinoyuki.betterbackup.worker.BackupTask;
 import com.shinoyuki.betterbackup.worker.BackupWorker;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.world.level.Level;
+import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.storage.LevelResource;
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.event.server.ServerStartingEvent;
@@ -125,7 +132,14 @@ public final class BetterBackupMod {
             SaveListenerRegistry.registerEntityChunk(bridge);
             SaveListenerRegistry.registerSavedData(bridge);
 
-            BetterBackupCore.install(store, snapshotState, context, queue, workers, workerThreads, bridge);
+            MinecraftServer server = event.getServer();
+            SnapshotCreator creator = new SnapshotCreator(store, snapshotState, paths, hashFunction,
+                    storeRoot, () -> overworldGameTime(server));
+            SnapshotScheduler scheduler = createScheduler();
+            scheduler.start(creator);
+
+            BetterBackupCore.install(store, snapshotState, context, queue, workers, workerThreads,
+                    bridge, creator, scheduler);
 
             LOGGER.info("[BetterBackup]   |- worldRoot: {}", worldRoot);
             LOGGER.info("[BetterBackup]   |- storeRoot: {}", storeRoot);
@@ -137,7 +151,7 @@ public final class BetterBackupMod {
                     BetterBackupConfig.scheduleMode(),
                     BetterBackupConfig.intervalMinutes());
             LOGGER.info("[BetterBackup]   `- config: {}/{}/common.toml", SERIES_CONFIG_DIR, MOD_ID);
-            LOGGER.info("[BetterBackup] pipeline installed (BAS Listener -> BackupWorker queue)");
+            LOGGER.info("[BetterBackup] pipeline installed (BAS Listener -> BackupWorker queue + scheduler)");
         } catch (IOException e) {
             LOGGER.error("[BetterBackup] startup failed, mod degraded (no backups will be created)", e);
         }
@@ -154,6 +168,12 @@ public final class BetterBackupMod {
             return;
         }
         LOGGER.info("[BetterBackup] server stopping (LOW priority, after BAS drain)");
+
+        // 先停 scheduler 防关服期间触发新的定时 snapshot.
+        SnapshotScheduler scheduler = BetterBackupCore.scheduler();
+        if (scheduler != null) {
+            scheduler.stop();
+        }
 
         BackupListenerBridge bridge = BetterBackupCore.bridge();
         if (bridge != null) {
@@ -195,8 +215,33 @@ public final class BetterBackupMod {
                     leftover);
         }
 
+        // 关服 final snapshot: 最后一次抓取本周期内 BAS fire 过的 chunk.
+        // SnapshotCreator.create 用 synchronized 串行, 跟 scheduler 已停后无 race.
+        SnapshotCreator creator = BetterBackupCore.creator();
+        if (creator != null) {
+            try {
+                creator.create("shutdown");
+            } catch (Throwable t) {
+                LOGGER.error("[BetterBackup] final shutdown snapshot failed", t);
+            }
+        }
+
         BetterBackupCore.uninstall();
         LOGGER.info("[BetterBackup] uninstalled");
+    }
+
+    private static SnapshotScheduler createScheduler() {
+        return switch (BetterBackupConfig.scheduleMode()) {
+            case INTERVAL -> new IntervalScheduler(BetterBackupConfig.intervalMinutes());
+            case MANUAL, AFTER_AUTOSAVE -> new ManualScheduler();
+            // AFTER_AUTOSAVE 推到 v0.2 (需要 BAS 加 autosave-end 事件钩子), MVP fallback to manual.
+        };
+    }
+
+    /** overworld 当前 game time. 给 SnapshotManifest.worldGameTime 用 (诊断元数据). */
+    private static long overworldGameTime(MinecraftServer server) {
+        ServerLevel overworld = server.getLevel(Level.OVERWORLD);
+        return overworld != null ? overworld.getGameTime() : 0L;
     }
 
     /** backupDirectory: 绝对路径直接用, 相对路径 resolve to FMLPaths.GAMEDIR (server root). */
