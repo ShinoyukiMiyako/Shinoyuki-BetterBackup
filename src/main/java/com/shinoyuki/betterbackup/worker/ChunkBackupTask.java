@@ -25,19 +25,33 @@ public record ChunkBackupTask(String dimensionId, long packedPos) implements Bac
 
     @Override
     public void execute(BackupContext ctx) throws IOException {
+        ctx.metrics().recordChunkReceived();
         int chunkX = ChunkPos.getX(packedPos);
         int chunkZ = ChunkPos.getZ(packedPos);
         Path regionDir = ctx.paths().regionDir(dimensionId);
-        byte[] rawBytes = RegionFileSlotReader.readChunk(regionDir, chunkX, chunkZ);
+        byte[] rawBytes;
+        try {
+            rawBytes = RegionFileSlotReader.readChunk(regionDir, chunkX, chunkZ);
+        } catch (IOException e) {
+            ctx.metrics().recordChunkFailed();
+            throw e;
+        }
         if (rawBytes == null) {
             // BAS fire 后 chunk slot 应该已经写入 .mca, 没读到说明 BAS 跟 vanilla
             // IOWorker 之间有时序差或 chunk 后来被删. 不报 ERROR, log WARN 跳过.
             LOGGER.warn("[BetterBackup] chunk slot empty after BAS fire: pos=({},{}) dim={}",
                     chunkX, chunkZ, dimensionId);
+            ctx.metrics().recordChunkFailed();
             return;
         }
         Hash hash = ctx.hashFunction().hash(rawBytes);
-        ctx.store().put(hash, rawBytes);
+        boolean wrote = ctx.store().put(hash, rawBytes);
+        if (wrote) {
+            ctx.writtenThisWindow().add(hash);
+            ctx.metrics().recordChunkUnique();
+        } else {
+            ctx.metrics().recordChunkDeduped();
+        }
         ctx.state().putChunk(dimensionId, packedPos, hash);
     }
 }

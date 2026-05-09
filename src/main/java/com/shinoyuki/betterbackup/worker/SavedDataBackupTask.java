@@ -29,6 +29,7 @@ public record SavedDataBackupTask(String fileName) implements BackupTask {
 
     @Override
     public void execute(BackupContext ctx) throws IOException {
+        ctx.metrics().recordSavedDataReceived();
         // BAS SavedDataSaveListener 只给 fileName, 没 dim 信息. MVP 假设 overworld
         // (vanilla 大多数 SavedData 如 raids / scoreboard 都在 overworld data/).
         // mod 可能在其他 dim 注册 SavedData (例如 nether-only mod), 那种 case 要
@@ -36,11 +37,24 @@ public record SavedDataBackupTask(String fileName) implements BackupTask {
         Path datFile = ctx.paths().dataDir("minecraft:overworld").resolve(fileName + ".dat");
         if (!Files.exists(datFile)) {
             LOGGER.warn("[BetterBackup] savedData file not found after BAS fire: {}", datFile);
+            ctx.metrics().recordSavedDataFailed();
             return;
         }
-        byte[] rawBytes = Files.readAllBytes(datFile);
+        byte[] rawBytes;
+        try {
+            rawBytes = Files.readAllBytes(datFile);
+        } catch (IOException e) {
+            ctx.metrics().recordSavedDataFailed();
+            throw e;
+        }
         Hash hash = ctx.hashFunction().hash(rawBytes);
-        ctx.store().put(hash, rawBytes);
+        boolean wrote = ctx.store().put(hash, rawBytes);
+        if (wrote) {
+            ctx.writtenThisWindow().add(hash);
+            ctx.metrics().recordSavedDataUnique();
+        } else {
+            ctx.metrics().recordSavedDataDeduped();
+        }
         ctx.state().putSavedData(fileName, hash);
     }
 }

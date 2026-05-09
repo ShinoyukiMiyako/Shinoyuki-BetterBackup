@@ -5,7 +5,9 @@ import com.shinoyuki.betterautosave.api.SaveListenerRegistry;
 import com.shinoyuki.betterbackup.command.BetterBackupCommand;
 import com.shinoyuki.betterbackup.config.BetterBackupConfig;
 import com.shinoyuki.betterbackup.config.ConfigSpec;
+import com.shinoyuki.betterbackup.diagnostic.BetterBackupMetrics;
 import com.shinoyuki.betterbackup.diagnostic.DiagnosticLogger;
+import com.shinoyuki.betterbackup.diagnostic.PrometheusExporter;
 import com.shinoyuki.betterbackup.integration.BackupListenerBridge;
 import com.shinoyuki.betterbackup.io.WorldPaths;
 import com.shinoyuki.betterbackup.restore.PendingRestoreFlag;
@@ -16,6 +18,7 @@ import com.shinoyuki.betterbackup.schedule.SnapshotScheduler;
 import com.shinoyuki.betterbackup.snapshot.CurrentSnapshotState;
 import com.shinoyuki.betterbackup.snapshot.SnapshotCreator;
 import com.shinoyuki.betterbackup.store.ChunkStore;
+import com.shinoyuki.betterbackup.store.Hash;
 import com.shinoyuki.betterbackup.store.HashFunction;
 import com.shinoyuki.betterbackup.store.Xxh128HashFunction;
 import com.shinoyuki.betterbackup.worker.BackupContext;
@@ -47,7 +50,9 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
 
 /**
@@ -179,7 +184,10 @@ public final class BetterBackupMod {
             CurrentSnapshotState snapshotState = new CurrentSnapshotState();
             WorldPaths paths = new WorldPaths(worldRoot);
             HashFunction hashFunction = new Xxh128HashFunction();
-            BackupContext context = new BackupContext(store, snapshotState, paths, hashFunction);
+            BetterBackupMetrics metrics = new BetterBackupMetrics();
+            Set<Hash> writtenThisWindow = ConcurrentHashMap.newKeySet();
+            BackupContext context = new BackupContext(store, snapshotState, paths, hashFunction,
+                    writtenThisWindow, metrics);
 
             BlockingQueue<BackupTask> queue = new LinkedBlockingQueue<>();
             int threadCount = BetterBackupConfig.backupWorkerThreads();
@@ -202,7 +210,7 @@ public final class BetterBackupMod {
 
             MinecraftServer server = event.getServer();
             SnapshotCreator creator = new SnapshotCreator(store, snapshotState, paths, hashFunction,
-                    storeRoot, () -> overworldGameTime(server));
+                    storeRoot, () -> overworldGameTime(server), writtenThisWindow, metrics);
             SnapshotScheduler scheduler = createScheduler();
             scheduler.start(creator);
 
@@ -210,7 +218,20 @@ public final class BetterBackupMod {
             MinecraftForge.EVENT_BUS.register(diagnosticLogger);
 
             BetterBackupCore.install(store, snapshotState, context, queue, workers, workerThreads,
-                    bridge, creator, scheduler, diagnosticLogger);
+                    bridge, creator, scheduler, diagnosticLogger, metrics);
+
+            if (BetterBackupConfig.prometheusEnabled()) {
+                String bind = BetterBackupConfig.prometheusBindAddress();
+                int port = BetterBackupConfig.prometheusPort();
+                PrometheusExporter exporter = new PrometheusExporter(metrics, bind, port);
+                try {
+                    exporter.start();
+                    BetterBackupCore.setExporter(exporter);
+                } catch (IOException e) {
+                    LOGGER.error("[BetterBackup] Prometheus exporter failed to start at {}:{}; disabled this run",
+                            bind, port, e);
+                }
+            }
 
             LOGGER.info("[BetterBackup]   |- worldRoot: {}", worldRoot);
             LOGGER.info("[BetterBackup]   |- storeRoot: {}", storeRoot);
@@ -240,7 +261,11 @@ public final class BetterBackupMod {
         }
         LOGGER.info("[BetterBackup] server stopping (LOW priority, after BAS drain)");
 
-        // 先停 scheduler 防关服期间触发新的定时 snapshot.
+        // 先停 exporter (避免抓取期间读半 drain 状态), 再停 scheduler 防新定时.
+        PrometheusExporter exporter = BetterBackupCore.exporter();
+        if (exporter != null) {
+            exporter.stop();
+        }
         SnapshotScheduler scheduler = BetterBackupCore.scheduler();
         if (scheduler != null) {
             scheduler.stop();

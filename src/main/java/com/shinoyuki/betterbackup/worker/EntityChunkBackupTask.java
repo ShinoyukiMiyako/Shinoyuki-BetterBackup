@@ -27,17 +27,31 @@ public record EntityChunkBackupTask(String dimensionId, long packedPos) implemen
 
     @Override
     public void execute(BackupContext ctx) throws IOException {
+        ctx.metrics().recordEntityReceived();
         int chunkX = ChunkPos.getX(packedPos);
         int chunkZ = ChunkPos.getZ(packedPos);
         Path entitiesDir = ctx.paths().entitiesDir(dimensionId);
-        byte[] rawBytes = RegionFileSlotReader.readChunk(entitiesDir, chunkX, chunkZ);
+        byte[] rawBytes;
+        try {
+            rawBytes = RegionFileSlotReader.readChunk(entitiesDir, chunkX, chunkZ);
+        } catch (IOException e) {
+            ctx.metrics().recordEntityFailed();
+            throw e;
+        }
         if (rawBytes == null) {
             LOGGER.warn("[BetterBackup] entity slot empty after BAS fire: pos=({},{}) dim={}",
                     chunkX, chunkZ, dimensionId);
+            ctx.metrics().recordEntityFailed();
             return;
         }
         Hash hash = ctx.hashFunction().hash(rawBytes);
-        ctx.store().put(hash, rawBytes);
+        boolean wrote = ctx.store().put(hash, rawBytes);
+        if (wrote) {
+            ctx.writtenThisWindow().add(hash);
+            ctx.metrics().recordEntityUnique();
+        } else {
+            ctx.metrics().recordEntityDeduped();
+        }
         ctx.state().putEntityChunk(dimensionId, packedPos, hash);
     }
 }

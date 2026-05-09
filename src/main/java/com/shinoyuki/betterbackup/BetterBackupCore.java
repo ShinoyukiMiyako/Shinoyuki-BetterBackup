@@ -1,6 +1,8 @@
 package com.shinoyuki.betterbackup;
 
+import com.shinoyuki.betterbackup.diagnostic.BetterBackupMetrics;
 import com.shinoyuki.betterbackup.diagnostic.DiagnosticLogger;
+import com.shinoyuki.betterbackup.diagnostic.PrometheusExporter;
 import com.shinoyuki.betterbackup.integration.BackupListenerBridge;
 import com.shinoyuki.betterbackup.schedule.SnapshotScheduler;
 import com.shinoyuki.betterbackup.snapshot.CurrentSnapshotState;
@@ -31,6 +33,8 @@ public final class BetterBackupCore {
     private static volatile SnapshotCreator CREATOR;
     private static volatile SnapshotScheduler SCHEDULER;
     private static volatile DiagnosticLogger DIAGNOSTIC_LOGGER;
+    private static volatile BetterBackupMetrics METRICS;
+    private static volatile PrometheusExporter EXPORTER;
 
     public static void install(ChunkStore store,
                                CurrentSnapshotState snapshotState,
@@ -41,7 +45,8 @@ public final class BetterBackupCore {
                                BackupListenerBridge bridge,
                                SnapshotCreator creator,
                                SnapshotScheduler scheduler,
-                               DiagnosticLogger diagnosticLogger) {
+                               DiagnosticLogger diagnosticLogger,
+                               BetterBackupMetrics metrics) {
         STORE = store;
         SNAPSHOT_STATE = snapshotState;
         CONTEXT = context;
@@ -52,6 +57,7 @@ public final class BetterBackupCore {
         CREATOR = creator;
         SCHEDULER = scheduler;
         DIAGNOSTIC_LOGGER = diagnosticLogger;
+        METRICS = metrics;
     }
 
     public static void uninstall() {
@@ -65,6 +71,12 @@ public final class BetterBackupCore {
         CREATOR = null;
         SCHEDULER = null;
         DIAGNOSTIC_LOGGER = null;
+        METRICS = null;
+        EXPORTER = null;
+    }
+
+    public static void setExporter(PrometheusExporter exporter) {
+        EXPORTER = exporter;
     }
 
     public static boolean isInstalled() {
@@ -109,6 +121,14 @@ public final class BetterBackupCore {
 
     public static DiagnosticLogger diagnosticLogger() {
         return DIAGNOSTIC_LOGGER;
+    }
+
+    public static BetterBackupMetrics metrics() {
+        return METRICS;
+    }
+
+    public static PrometheusExporter exporter() {
+        return EXPORTER;
     }
 
     private BetterBackupCore() {

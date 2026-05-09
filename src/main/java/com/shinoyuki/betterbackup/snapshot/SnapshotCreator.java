@@ -1,6 +1,8 @@
 package com.shinoyuki.betterbackup.snapshot;
 
 import com.shinoyuki.betterbackup.BetterBackupMod;
+import com.shinoyuki.betterbackup.diagnostic.BetterBackupMetrics;
+import com.shinoyuki.betterbackup.gc.StoreGc;
 import com.shinoyuki.betterbackup.io.WorldPaths;
 import com.shinoyuki.betterbackup.schedule.SnapshotTrigger;
 import com.shinoyuki.betterbackup.store.ChunkStore;
@@ -16,8 +18,10 @@ import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.LongSupplier;
 import java.util.stream.Stream;
 
@@ -52,19 +56,27 @@ public final class SnapshotCreator implements SnapshotTrigger {
     private final HashFunction hashFunction;
     private final Path snapshotsDir;
     private final LongSupplier gameTimeSupplier;
+    private final Set<Hash> writtenThisWindow;
+    private final BetterBackupMetrics metrics;
+    private final StoreGc gc;
 
     public SnapshotCreator(ChunkStore store,
                            CurrentSnapshotState state,
                            WorldPaths paths,
                            HashFunction hashFunction,
                            Path storeRoot,
-                           LongSupplier gameTimeSupplier) {
+                           LongSupplier gameTimeSupplier,
+                           Set<Hash> writtenThisWindow,
+                           BetterBackupMetrics metrics) {
         this.store = store;
         this.state = state;
         this.paths = paths;
         this.hashFunction = hashFunction;
         this.snapshotsDir = storeRoot.resolve("snapshots");
         this.gameTimeSupplier = gameTimeSupplier;
+        this.writtenThisWindow = writtenThisWindow;
+        this.metrics = metrics;
+        this.gc = new StoreGc(store, this.snapshotsDir);
     }
 
     public Path snapshotsDir() {
@@ -77,6 +89,7 @@ public final class SnapshotCreator implements SnapshotTrigger {
             Files.createDirectories(snapshotsDir);
         } catch (IOException e) {
             LOGGER.error("[BetterBackup] failed to create snapshots dir {}", snapshotsDir, e);
+            metrics.recordSnapshotFailed();
             return;
         }
 
@@ -89,15 +102,53 @@ public final class SnapshotCreator implements SnapshotTrigger {
         Path target = snapshotsDir.resolve(newManifest.snapshotId() + ".manifest");
         try {
             newManifest.writeTo(target);
+            metrics.recordSnapshotCreated();
+            int chunkCount = newManifest.chunks().values().stream().mapToInt(Map::size).sum();
+            int entityCount = newManifest.entityChunks().values().stream().mapToInt(Map::size).sum();
             LOGGER.info(
                     "[BetterBackup] snapshot created: {} ({}) chunks={} entity={} savedData={} levelDat={}",
                     newManifest.snapshotId(), reason,
-                    newManifest.chunks().values().stream().mapToInt(Map::size).sum(),
-                    newManifest.entityChunks().values().stream().mapToInt(Map::size).sum(),
+                    chunkCount, entityCount,
                     newManifest.savedData().size(),
                     newManifest.levelDat() != null);
+
+            runIncrementalGc(newManifest);
         } catch (IOException e) {
             LOGGER.error("[BetterBackup] snapshot write failed: {}", target, e);
+            metrics.recordSnapshotFailed();
+        }
+    }
+
+    /**
+     * snapshot 写盘成功后立即清"本周期 BackupWorker 写入但 manifest 未引用的中间版本 hash"
+     * (DESIGN §2.6). 不接通会让 store 单调增长 (大服 ~24 GB/天).
+     *
+     * <p>scope = writtenThisWindow - referenced(manifest), 远小于全量 GC, 秒级完成.
+     * 失败 log error 不抛 — snapshot 已经写盘, GC 是 polish, 下次 snapshot 会再清.
+     */
+    private void runIncrementalGc(SnapshotManifest manifest) {
+        Set<Hash> referenced = new HashSet<>();
+        manifest.chunks().values().forEach(m -> referenced.addAll(m.values()));
+        manifest.entityChunks().values().forEach(m -> referenced.addAll(m.values()));
+        referenced.addAll(manifest.savedData().values());
+        if (manifest.levelDat() != null) {
+            referenced.add(manifest.levelDat());
+        }
+
+        Set<Hash> windowSnapshot = new HashSet<>(writtenThisWindow);
+        writtenThisWindow.clear();
+
+        try {
+            StoreGc.GcResult result = gc.gcIncremental(windowSnapshot, referenced);
+            if (result.deleted() > 0) {
+                LOGGER.info("[BetterBackup] incremental gc: deleted={} freed={}KiB",
+                        result.deleted(), result.bytesFreed() / 1024);
+                metrics.recordGcRun();
+                metrics.recordGcDeleted(result.deleted());
+                metrics.recordGcBytesFreed(result.bytesFreed());
+            }
+        } catch (IOException e) {
+            LOGGER.error("[BetterBackup] incremental gc failed (snapshot already written, store may grow until next snapshot)", e);
         }
     }
 
