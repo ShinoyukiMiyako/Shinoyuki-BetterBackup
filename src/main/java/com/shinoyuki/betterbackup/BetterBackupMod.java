@@ -8,6 +8,8 @@ import com.shinoyuki.betterbackup.config.ConfigSpec;
 import com.shinoyuki.betterbackup.diagnostic.DiagnosticLogger;
 import com.shinoyuki.betterbackup.integration.BackupListenerBridge;
 import com.shinoyuki.betterbackup.io.WorldPaths;
+import com.shinoyuki.betterbackup.restore.PendingRestoreFlag;
+import com.shinoyuki.betterbackup.restore.RestoreFlow;
 import com.shinoyuki.betterbackup.schedule.IntervalScheduler;
 import com.shinoyuki.betterbackup.schedule.ManualScheduler;
 import com.shinoyuki.betterbackup.schedule.SnapshotScheduler;
@@ -25,6 +27,7 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.storage.LevelResource;
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.event.RegisterCommandsEvent;
+import net.minecraftforge.event.server.ServerAboutToStartEvent;
 import net.minecraftforge.event.server.ServerStartingEvent;
 import net.minecraftforge.event.server.ServerStoppingEvent;
 import net.minecraftforge.eventbus.api.EventPriority;
@@ -43,6 +46,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 
@@ -99,6 +103,62 @@ public final class BetterBackupMod {
     @SubscribeEvent
     public void onRegisterCommands(RegisterCommandsEvent event) {
         BetterBackupCommand.register(event.getDispatcher());
+    }
+
+    /**
+     * 离线 restore 触发点: 在 vanilla loadLevel 之前 fire. 检测 .pending-restore
+     * flag, 有的话临时 new ChunkStore + WorldPaths 跑 RestoreFlow 重建 region/
+     * entities/ data/ + level.dat. 跑完删 flag, vanilla 接着正常 init world.
+     *
+     * <p>失败 → log ERROR 不 throw, 不 abort vanilla 启动 (server 起来用户能进
+     * 游戏看 log 排查). flag 不删, 用户修复后重启会再跑一次.
+     *
+     * <p>EventPriority.HIGHEST: 别的 mod 也 hook ServerAboutToStartEvent 时,
+     * BetterBackup 必须先跑保证 region 文件已重建.
+     */
+    @SubscribeEvent(priority = EventPriority.HIGHEST)
+    public void onServerAboutToStart(ServerAboutToStartEvent event) {
+        if (!BetterBackupConfig.enabled()) {
+            return;
+        }
+        Path worldRoot = event.getServer().getWorldPath(LevelResource.ROOT);
+
+        Optional<String> pendingId;
+        try {
+            pendingId = PendingRestoreFlag.read(worldRoot);
+        } catch (IOException e) {
+            LOGGER.error("[BetterBackup] failed to read pending restore flag", e);
+            return;
+        }
+        if (pendingId.isEmpty()) {
+            return;
+        }
+        String snapshotId = pendingId.get();
+        LOGGER.warn("[BetterBackup] pending restore detected: {} - rebuilding world before vanilla load",
+                snapshotId);
+
+        Path storeRoot = resolveStoreRoot(BetterBackupConfig.backupDirectory());
+        ChunkStore store = new ChunkStore(storeRoot);
+        try {
+            store.initialize();
+        } catch (IOException e) {
+            LOGGER.error("[BetterBackup] cannot initialize store for restore at {}", storeRoot, e);
+            return;
+        }
+        Path snapshotsDir = storeRoot.resolve("snapshots");
+        WorldPaths paths = new WorldPaths(worldRoot);
+        RestoreFlow flow = new RestoreFlow(store, paths, snapshotsDir);
+        try {
+            RestoreFlow.RestoreResult result = flow.restore(snapshotId);
+            PendingRestoreFlag.clear(worldRoot);
+            LOGGER.info("[BetterBackup] restore complete: chunks={} entity={} savedData={} levelDat={} backupDir={}",
+                    result.chunkSlotsRestored(), result.entitySlotsRestored(),
+                    result.savedDataFilesRestored(), result.levelDatRestored(),
+                    result.worldBackupDir());
+        } catch (IOException e) {
+            LOGGER.error("[BetterBackup] restore FAILED for snapshot {}, flag retained for retry, server will start with current world state",
+                    snapshotId, e);
+        }
     }
 
     @SubscribeEvent
