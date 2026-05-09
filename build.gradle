@@ -70,6 +70,12 @@ dependencies {
     // 然后 ForgeGradle 自动 deobf 转回 dev (parchment) mappings 给本仓库编译期 link.
     implementation fg.deobf("com.shinoyuki.betterautosave:shinoyuki_betterautosave:${bas_version}")
 
+    // xxh128 hash (DESIGN §7 默认): OpenHFT zero-allocation-hashing 是纯 Java
+    // 实现, 无 native 依赖, mod-friendly. 通过 jarJar 嵌入最终 mod jar 让用户
+    // 装 mod 时不需要单独装这个库.
+    implementation 'net.openhft:zero-allocation-hashing:0.16'
+    jarJar(group: 'net.openhft', name: 'zero-allocation-hashing', version: '[0.16,0.17)')
+
     testImplementation 'org.junit.jupiter:junit-jupiter:5.10.0'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.10.0'
 }
