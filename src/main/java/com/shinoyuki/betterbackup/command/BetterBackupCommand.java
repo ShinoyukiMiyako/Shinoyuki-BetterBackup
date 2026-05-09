@@ -6,6 +6,8 @@ import com.mojang.brigadier.context.CommandContext;
 import com.shinoyuki.betterbackup.BetterBackupCore;
 import com.shinoyuki.betterbackup.BetterBackupMod;
 import com.shinoyuki.betterbackup.config.BetterBackupConfig;
+import com.shinoyuki.betterbackup.gc.StoreGc;
+import com.shinoyuki.betterbackup.restore.PendingRestoreFlag;
 import com.shinoyuki.betterbackup.snapshot.CurrentSnapshotState;
 import com.shinoyuki.betterbackup.snapshot.SnapshotCreator;
 import com.shinoyuki.betterbackup.snapshot.SnapshotManifest;
@@ -14,6 +16,7 @@ import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.world.level.storage.LevelResource;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -42,7 +45,16 @@ public final class BetterBackupCommand {
                                 .then(Commands.literal("info")
                                         .then(Commands.argument("id", StringArgumentType.word())
                                                 .executes(ctx -> snapshotInfo(ctx,
+                                                        StringArgumentType.getString(ctx, "id")))))
+                                .then(Commands.literal("delete")
+                                        .then(Commands.argument("id", StringArgumentType.word())
+                                                .executes(ctx -> snapshotDelete(ctx,
                                                         StringArgumentType.getString(ctx, "id"))))))
+                        .then(Commands.literal("restore")
+                                .then(Commands.argument("id", StringArgumentType.word())
+                                        .executes(ctx -> restore(ctx,
+                                                StringArgumentType.getString(ctx, "id")))))
+                        .then(Commands.literal("gc").executes(BetterBackupCommand::gc))
         );
     }
 
@@ -198,6 +210,112 @@ public final class BetterBackupCommand {
                     .append(" chunks\n");
         }
         ctx.getSource().sendSuccess(() -> Component.literal(out.toString()), false);
+        return 1;
+    }
+
+    /**
+     * 删 manifest 文件 (release reference). 不立即触发 GC, 用户跑 /betterbackup gc
+     * 才真正清磁盘. 这样 delete 是 instant 的, GC 是用户主动决策的批操作.
+     */
+    private static int snapshotDelete(CommandContext<CommandSourceStack> ctx, String id) {
+        if (!BetterBackupCore.isInstalled()) {
+            ctx.getSource().sendFailure(Component.literal("BetterBackup is not installed"));
+            return 0;
+        }
+        SnapshotCreator creator = BetterBackupCore.creator();
+        if (creator == null) {
+            ctx.getSource().sendFailure(Component.literal("BetterBackup creator not initialized"));
+            return 0;
+        }
+        Path manifestFile = creator.snapshotsDir().resolve(id + ".manifest");
+        if (!Files.exists(manifestFile)) {
+            ctx.getSource().sendFailure(Component.literal("Snapshot not found: " + id));
+            return 0;
+        }
+        try {
+            Files.delete(manifestFile);
+        } catch (IOException e) {
+            ctx.getSource().sendFailure(Component.literal("Failed to delete manifest: " + e.getMessage()));
+            return 0;
+        }
+        ctx.getSource().sendSuccess(() -> Component.literal(
+                "Snapshot " + id + " deleted (run /betterbackup gc to reclaim disk)"), true);
+        return 1;
+    }
+
+    /**
+     * 写 PendingRestoreFlag 提示玩家手动停服, 重启时 BetterBackupMod
+     * onServerAboutToStart 会检测 flag 跑 RestoreFlow.
+     */
+    private static int restore(CommandContext<CommandSourceStack> ctx, String id) {
+        if (!BetterBackupCore.isInstalled()) {
+            ctx.getSource().sendFailure(Component.literal("BetterBackup is not installed"));
+            return 0;
+        }
+        SnapshotCreator creator = BetterBackupCore.creator();
+        if (creator == null) {
+            ctx.getSource().sendFailure(Component.literal("BetterBackup creator not initialized"));
+            return 0;
+        }
+        Path manifestFile = creator.snapshotsDir().resolve(id + ".manifest");
+        if (!Files.exists(manifestFile)) {
+            ctx.getSource().sendFailure(Component.literal("Snapshot not found: " + id));
+            return 0;
+        }
+        Path worldRoot = ctx.getSource().getServer().getWorldPath(LevelResource.ROOT);
+        try {
+            PendingRestoreFlag.write(worldRoot, id);
+        } catch (IOException e) {
+            ctx.getSource().sendFailure(Component.literal("Failed to write restore flag: " + e.getMessage()));
+            return 0;
+        }
+        String snapshotId = id;
+        ctx.getSource().sendSuccess(() -> Component.literal(
+                "Restore prepared for " + snapshotId
+                        + ". STOP THE SERVER NOW (saving normally is fine, do NOT delete world/)."
+                        + " On next startup BetterBackup will auto-restore before vanilla load."
+                        + " A backup of current world subdirs will be at <worldRoot>.bak-<timestamp>/."), true);
+        return 1;
+    }
+
+    /**
+     * 异步全量 GC. 命令立即返回, 派 daemon 线程跑 StoreGc.gcAll() (大型 store
+     * 可能 walk 几十万文件, 不能阻塞主线程命令执行).
+     */
+    private static int gc(CommandContext<CommandSourceStack> ctx) {
+        if (!BetterBackupCore.isInstalled()) {
+            ctx.getSource().sendFailure(Component.literal("BetterBackup is not installed"));
+            return 0;
+        }
+        SnapshotCreator creator = BetterBackupCore.creator();
+        ChunkStore store = BetterBackupCore.store();
+        if (creator == null || store == null) {
+            ctx.getSource().sendFailure(Component.literal("BetterBackup not fully initialized"));
+            return 0;
+        }
+        CommandSourceStack source = ctx.getSource();
+        MinecraftServer server = source.getServer();
+        StoreGc gc = new StoreGc(store, creator.snapshotsDir());
+
+        Thread worker = new Thread(() -> {
+            long t0 = System.currentTimeMillis();
+            try {
+                StoreGc.GcResult r = gc.gcAll();
+                long elapsed = System.currentTimeMillis() - t0;
+                server.execute(() -> source.sendSuccess(() -> Component.literal(
+                        "GC done in " + elapsed + "ms: scanned=" + r.scanned()
+                                + " retained=" + r.retained() + " deleted=" + r.deleted()
+                                + " freed=" + (r.bytesFreed() / 1024) + " KiB"), true));
+            } catch (IOException e) {
+                BetterBackupMod.LOGGER.error("[BetterBackup] gc command failed", e);
+                server.execute(() -> source.sendFailure(
+                        Component.literal("GC failed: " + e.getMessage())));
+            }
+        }, "BetterBackup-Cmd-Gc");
+        worker.setDaemon(true);
+        worker.start();
+
+        ctx.getSource().sendSuccess(() -> Component.literal("GC started (async)"), false);
         return 1;
     }
 
