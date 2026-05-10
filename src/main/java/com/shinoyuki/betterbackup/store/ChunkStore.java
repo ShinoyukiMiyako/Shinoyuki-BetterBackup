@@ -7,9 +7,11 @@ import java.io.IOException;
 import java.nio.channels.FileChannel;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.util.UUID;
 
 /**
  * Content-addressed dedup store. 文件名 = hash hex 全长, 二级分桶 ({@code chunks/<2>/<6>/<full>})
@@ -79,7 +81,12 @@ public final class ChunkStore {
             return false;
         }
         Files.createDirectories(target.getParent());
-        Path tmp = target.resolveSibling(target.getFileName() + ".tmp");
+        // tmp 文件名带 UUID 让多线程并发 put 同一 hash 时各自用独立 tmp, 避免 race:
+        // 之前共享 <hash>.tmp 时 A 写 + rename 完后 B 还在用同一路径, B 的 fsync /
+        // move 会找不到文件 (NoSuchFileException). UUID 隔离后 A/B 互不干扰,
+        // 第一个成功 rename 进 target, 第二个被 FileAlreadyExistsException 接住
+        // 删自己的 tmp.
+        Path tmp = target.resolveSibling(target.getFileName() + "." + UUID.randomUUID() + ".tmp");
         Files.write(tmp, data, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING,
                 StandardOpenOption.WRITE);
         // fsync: 确保字节落盘后再 rename, kill -9 重启时不会出现 rename 完但内容半空的文件.
@@ -90,9 +97,13 @@ public final class ChunkStore {
             Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE);
             return true;
         } catch (FileAlreadyExistsException raceWin) {
-            // 别的线程同时 put 同 hash, 它先 rename. 删 tmp 即可.
+            // 别的线程同时 put 同 hash, 它先 rename. 删自己的 tmp 即可.
             Files.deleteIfExists(tmp);
             return false;
+        } catch (NoSuchFileException e) {
+            // 极端 race: 没用 UUID 隔离时会撞 (此版本已修). 防御性兜底, 不应发生.
+            Files.deleteIfExists(tmp);
+            throw e;
         }
     }
 

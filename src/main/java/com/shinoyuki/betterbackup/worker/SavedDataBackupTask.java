@@ -30,13 +30,15 @@ public record SavedDataBackupTask(String fileName) implements BackupTask {
     @Override
     public void execute(BackupContext ctx) throws IOException {
         ctx.metrics().recordSavedDataReceived();
-        // BAS SavedDataSaveListener 只给 fileName, 没 dim 信息. MVP 假设 overworld
-        // (vanilla 大多数 SavedData 如 raids / scoreboard 都在 overworld data/).
-        // mod 可能在其他 dim 注册 SavedData (例如 nether-only mod), 那种 case 要
-        // BAS 升级 listener 接口加 dim 字段, 在 v0.2+ 处理.
-        Path datFile = ctx.paths().dataDir("minecraft:overworld").resolve(fileName + ".dat");
-        if (!Files.exists(datFile)) {
-            LOGGER.warn("[BetterBackup] savedData file not found after BAS fire: {}", datFile);
+        // BAS SavedDataSaveListener 不带 dim 信息, 但 vanilla 1.20+ 多 dim SavedData
+        // 命名带后缀 (raids / raids_nether / raids_end), 实际文件落在各自 dim 的
+        // data/ 目录. 按"最常见放在 overworld → nether → end"顺序试 3 个 vanilla
+        // dim 路径. 找到第一个 match 就用. modded dim 注册自定义 SavedData 推到
+        // v0.2 跟随 BAS API 升级 (那时 listener 应该带 dim 字段).
+        Path datFile = findSavedDataFile(ctx);
+        if (datFile == null) {
+            LOGGER.warn("[BetterBackup] savedData file not found after BAS fire (tried overworld/nether/end): {}.dat",
+                    fileName);
             ctx.metrics().recordSavedDataFailed();
             return;
         }
@@ -56,5 +58,22 @@ public record SavedDataBackupTask(String fileName) implements BackupTask {
             ctx.metrics().recordSavedDataDeduped();
         }
         ctx.state().putSavedData(fileName, hash);
+    }
+
+    private Path findSavedDataFile(BackupContext ctx) {
+        String dotName = fileName + ".dat";
+        Path overworld = ctx.paths().dataDir("minecraft:overworld").resolve(dotName);
+        if (Files.exists(overworld)) {
+            return overworld;
+        }
+        Path nether = ctx.paths().dataDir("minecraft:the_nether").resolve(dotName);
+        if (Files.exists(nether)) {
+            return nether;
+        }
+        Path end = ctx.paths().dataDir("minecraft:the_end").resolve(dotName);
+        if (Files.exists(end)) {
+            return end;
+        }
+        return null;
     }
 }
