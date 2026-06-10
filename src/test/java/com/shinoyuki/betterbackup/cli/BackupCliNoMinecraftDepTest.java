@@ -29,6 +29,14 @@ import static org.junit.jupiter.api.Assertions.fail;
  *
  * <p>判定标准: 把 {@link OfflineRestore} 改回 import net.minecraft.world.level.ChunkPos
  * 并用它, 本测试的 restore 分支必挂 (loader 拒绝加载 ChunkPos)。
+ *
+ * <p><b>本测试防不了打包缺口 (历史教训)</b>: 它跑在 Gradle 测试 classpath 内, slf4j 与
+ * openhft 都在该 classpath 上, 且自定义 loader 把这两类基础设施委托给父 loader (见
+ * {@code McForbiddenClassLoader} 委托分支)。因此当 CLI 可达类在类初始化期硬依赖 slf4j、或
+ * openhft 仅以 jarJar 嵌套形式存在 (对 {@code java -jar} 的应用类加载器不可见) 时, 这些缺口
+ * 在本测试里全是假阴性 -- 生产服一 {@code java -jar} 即 NoClassDefFoundError。真正复现裸 JRE
+ * 运行环境、覆盖打包缺口的是进程级的 {@code BackupCliAllJarProcessTest}。本测试的职责被刻意
+ * 收窄为单一不变量: CLI 可达图零 {@code net.minecraft*} / {@code net.minecraftforge*} 依赖。
  */
 class BackupCliNoMinecraftDepTest {
 
