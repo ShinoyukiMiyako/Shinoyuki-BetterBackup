@@ -96,10 +96,14 @@ class BackupCliAllJarProcessTest {
         ProcessResult r = runCli("fsck", "--store", fx.storeRoot.toString(), "--rebuild-index");
         assertEquals(0, r.exitCode(),
                 "fsck of a complete store must exit 0 on jar-only classpath; output=\n" + r.combined());
-        // 3 个 store 对象 (chunk + playerdata + level.dat) 全部重 hash 通过
-        assertTrue(r.combined().contains("scanned=3 ok=3 hashMismatch=0 corrupt=0"),
-                "fsck must rehash all 3 objects clean (proves openhft xxh128 ran in subprocess); output=\n"
-                        + r.combined());
+        // 3 个 store 对象全部重 hash 通过, 且按类正确划分: 1 个 chunk payload (chunks 段) +
+        // 2 个 opaque 文件 (playerdata poi 风格 .mca 首字节 0x00, level.dat gzip 首字节 0x1f)。
+        // playerdata/level.dat 是真实 opaque 形态 (非伪装成 zlib chunk), 子进程仍 0 误报, 正是本次
+        // 发版阻断 bug 的进程级回归: 退回全量压缩校验, 0x00 / 0x1f 首字节会被误报 CORRUPT, 退出码非 0。
+        assertTrue(r.combined().contains(
+                        "scanned=3 ok=3 chunkObjects=1 fileObjects=2 orphans=0 hashMismatch=0 corrupt=0"),
+                "fsck must classify 1 chunk + 2 opaque files clean (proves classification + openhft in subprocess);"
+                        + " output=\n" + r.combined());
         assertTrue(r.combined().contains("OK       " + fx.snapshotId),
                 "fsck rebuild-index must list the snapshot OK; output=\n" + r.combined());
     }
@@ -176,13 +180,12 @@ class BackupCliAllJarProcessTest {
             w.writeChunk(chunkX & 31, chunkZ & 31, chunkObject);
         }
         byte[] snapshotChunkBytes = RegionFileSlotReader.readChunk(sourceRegionDir, chunkX, chunkZ);
-        // playerdata / level.dat 同样存成合法 zlib chunk-payload 形态: fsck 的 verifyStore 对 store
-        // 里"每个"对象都做 zlib/gzip inflate 完整性校验 (compression-type byte 前缀), 随便塞裸字节
-        // 会被判 CORRUPT。本测试只关心打包可达性 (openhft 能否在裸 JRE 加载), 故让全部对象走得通
-        // 校验, 不混入 fsck 语义之外的噪声。
-        byte[] playerBytes = ChunkPayloadFixtures.zlibPayload(
-                "inventory: 64 cobblestone".getBytes(StandardCharsets.UTF_8));
-        byte[] levelDat = ChunkPayloadFixtures.zlibPayload(randomBytes(1536, 19));
+        // playerdata / level.dat 用真实 opaque 整文件形态 (非伪装 zlib chunk): fsck 按 manifest
+        // 分类后, files / levelDat 段引用的对象只重 hash 不跑压缩校验, 故首字节可以是任意值。
+        // playerBytes 走 poi 风格 .mca (首字节 0x00, 生产 1481/1620 误报形态), levelDat 走真实
+        // gzip NBT (首字节 0x1f)。这两个首字节正是旧实现误判 "invalid compression type" 的来源。
+        byte[] playerBytes = poiWholeFileBytes(2048, 11);
+        byte[] levelDat = gzipBytes(randomBytes(1536, 19));
 
         Hash chunkHash = hashFn.hash(snapshotChunkBytes);
         store.put(chunkHash, snapshotChunkBytes);
@@ -237,6 +240,25 @@ class BackupCliAllJarProcessTest {
         byte[] b = new byte[n];
         new Random(seed).nextBytes(b);
         return b;
+    }
+
+    /**
+     * poi 风格 .mca 整文件: 前 4KiB 是 vanilla region 位置表, poi 稀疏时全 0x00, 整文件首字节
+     * 即 0x00。这是 fsck 全量压缩校验时被误判 "invalid compression type 0" 的形态。
+     */
+    private static byte[] poiWholeFileBytes(int tailRandom, long seed) {
+        byte[] out = new byte[4096 + tailRandom];
+        System.arraycopy(randomBytes(tailRandom, seed), 0, out, 4096, tailRandom);
+        return out; // out[0..4095] 默认 0x00, 即 out[0] == 0x00
+    }
+
+    /** 真实 gzip 字节 (魔数 0x1f 0x8b): 复现 level.dat / SavedData 的整文件 gzip NBT 形态。 */
+    private static byte[] gzipBytes(byte[] plaintext) throws IOException {
+        java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+        try (java.util.zip.GZIPOutputStream gz = new java.util.zip.GZIPOutputStream(bos)) {
+            gz.write(plaintext);
+        }
+        return bos.toByteArray();
     }
 
     private record Fixture(Path storeRoot, String snapshotId, Hash chunkHash) {

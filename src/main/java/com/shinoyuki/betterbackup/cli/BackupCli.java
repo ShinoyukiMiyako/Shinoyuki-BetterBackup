@@ -213,6 +213,9 @@ public final class BackupCli {
 
         StoreFsck.VerifyResult verify = fsck.verifyStore();
         out.println("fsck store: scanned=" + verify.scanned() + " ok=" + verify.ok()
+                + " chunkObjects=" + verify.chunkObjects()
+                + " fileObjects=" + verify.fileObjects()
+                + " orphans=" + verify.orphans().size()
                 + " hashMismatch=" + verify.hashMismatch().size()
                 + " corrupt=" + verify.corrupt().size());
         for (String s : verify.hashMismatch()) {
@@ -220,6 +223,10 @@ public final class BackupCli {
         }
         for (String s : verify.corrupt()) {
             out.println("  CORRUPT " + s);
+        }
+        // orphan 单独归类: 是 GC 未回收的残留对象 (manifest 不再引用), 不是损坏, 不拉非 0 退出码。
+        for (String s : verify.orphans()) {
+            out.println("  ORPHAN " + s);
         }
 
         int failures = verify.clean() ? 0 : 1;
