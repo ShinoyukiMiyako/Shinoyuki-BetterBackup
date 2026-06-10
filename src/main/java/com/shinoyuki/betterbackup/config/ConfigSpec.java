@@ -124,8 +124,10 @@ public final class ConfigSpec {
         BUILDER.comment("Retention policy: how many of each rolling category to keep").push("retention");
 
         RETENTION_HOURLY = BUILDER
-                .comment("Hourly snapshots to retain (most recent N).")
-                .defineInRange("hourly", 24, 0, 168);
+                .comment("Hourly snapshots to retain (most recent N).",
+                         "336 = full hourly coverage for 14 days; manifest overhead grows ~30MB per retained",
+                         "snapshot on 1M+ chunk worlds until manifest delta encoding lands (v0.2).")
+                .defineInRange("hourly", 24, 0, 2000);
 
         RETENTION_DAILY = BUILDER
                 .comment("Daily snapshots to retain (the 00:00 snapshot of each day).")
