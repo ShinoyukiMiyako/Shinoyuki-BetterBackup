@@ -63,6 +63,7 @@ public final class BaselineScanner {
     private final Set<Hash> writtenThisWindow;
     private final BaselineProgress progress;
     private final RateLimiter rateLimiter;
+    private volatile boolean stopRequested;
 
     /**
      * 扫描遍历完所有 pass 后的收尾回调. 不再由 scanner 直接写 complete 标记 (那会脱离
@@ -99,6 +100,14 @@ public final class BaselineScanner {
      * 窗口). 返回本次实际入库 (写盘) 的 chunk 数 / 被 dirty 路径跳过的 chunk 数, 以及回调
      * 跑完后 baseline 是否已 complete (供日志与测试断言).
      */
+    /**
+     * 请求停止扫描 (关服路径调用). 扫描在下一个 chunk slot 边界退出: 不调收尾回调、
+     * 不标记被中断的半扫 region; 已 scanned 的 region 进度已持久化, 下次启动续传.
+     */
+    public void requestStop() {
+        stopRequested = true;
+    }
+
     public Result scan() throws IOException {
         progress.load();
         if (progress.isComplete()) {
@@ -124,6 +133,14 @@ public final class BaselineScanner {
                 break;
             }
             LOGGER.warn("[BetterBackup] baseline pass {} left regions incomplete (torn reads), retrying", pass);
+        }
+
+        if (stopRequested) {
+            // 关服中断: 不调收尾回调 (关服快照由 onServerStopping 自己创建, 这里再触发
+            // 一次会与之竞争), 已 scanned 的 region 进度已持久化, 下次启动续传.
+            LOGGER.info("[BetterBackup] baseline scan stopped before completion: stored={} so far, "
+                    + "progress persisted, resumes next start", stored);
+            return new Result(stored, deduped, skipped, false);
         }
 
         // 扫描收尾: 请求一次快照晋升最后一批 scanned region 并写 complete 标记.
@@ -163,6 +180,12 @@ public final class BaselineScanner {
                     stored += rr.stored();
                     deduped += rr.deduped();
                     skipped += rr.skipped();
+                    // 停服中断: 本 region 可能只扫了一半, 绝不能进下面的标记分支 -- lastPass
+                    // 会把半扫 region 标 scanned, 晋升 committed 后缺的 slot 永不重扫 (撕裂读
+                    // 场景有"活跃路径兜底"的理由, 停服中断的是任意未加载 chunk, 没有兜底).
+                    if (stopRequested) {
+                        return new PassResult(stored, deduped, skipped, false, !tornSeen);
+                    }
                     if (rr.clean() || lastPass) {
                         // 扫完记 scanned (待提交), 不立即标完成. 登记 (state.putChunk) 已在
                         // scanRegionFile 内完成, 等下次快照 drain 进 manifest 后才晋升 committed.
@@ -192,6 +215,9 @@ public final class BaselineScanner {
         boolean clean = true;
 
         for (int slot = 0; slot < SLOTS_PER_REGION; slot++) {
+            if (stopRequested) {
+                return new RegionResult(stored, deduped, skipped, false);
+            }
             int localX = slot & (REGION_SIZE - 1);
             int localZ = (slot >> REGION_SHIFT) & (REGION_SIZE - 1);
             int chunkX = (rc.rx() << REGION_SHIFT) + localX;

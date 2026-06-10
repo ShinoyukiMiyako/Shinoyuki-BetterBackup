@@ -99,6 +99,12 @@ public final class BetterBackupMod {
     /** 关服 worker join 总超时 (毫秒). 写死 30s, 后续可考虑接入 BetterBackupConfig. */
     private static final long SHUTDOWN_JOIN_TIMEOUT_MS = 30_000L;
 
+    // baseline 扫描线程的关服停止句柄. 不进 BetterBackupCore: 扫描是一次性启动期任务,
+    // 不是常驻组件, install 签名不为它扩列. volatile 因 startBaselineScan (server 线程)
+    // 与 onServerStopping (server 线程) 之间隔着 daemon 线程的生命周期.
+    private static volatile BaselineScanner activeBaselineScanner;
+    private static volatile Thread activeBaselineThread;
+
     public BetterBackupMod() {
         IEventBus modBus = FMLJavaModLoadingContext.get().getModEventBus();
         modBus.addListener(BetterBackupConfig::onLoad);
@@ -332,6 +338,13 @@ public final class BetterBackupMod {
             scheduler.stop();
         }
 
+        // 尽早请求停止 baseline 扫描, 让它在 worker drain 期间并行收尾; join 在关服快照
+        // 之前 (见下), 防止扫描线程在快照 drain 之后继续标 scanned 半扫 region.
+        BaselineScanner baselineScanner = activeBaselineScanner;
+        if (baselineScanner != null) {
+            baselineScanner.requestStop();
+        }
+
         DiagnosticLogger diagnosticLogger = BetterBackupCore.diagnosticLogger();
         if (diagnosticLogger != null) {
             MinecraftForge.EVENT_BUS.unregister(diagnosticLogger);
@@ -382,6 +395,26 @@ public final class BetterBackupMod {
                     leftover);
         }
 
+        // baseline 线程必须在关服快照前停稳: 它对 progress/state 的写入与快照的
+        // drain + 晋升语义竞争. requestStop 已在前面发出, 这里只等退出.
+        Thread baselineThread = activeBaselineThread;
+        if (baselineThread != null && baselineThread.isAlive()) {
+            try {
+                baselineThread.join(SHUTDOWN_JOIN_TIMEOUT_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                LOGGER.warn("[BetterBackup] interrupted joining baseline scan thread");
+            }
+            if (baselineThread.isAlive()) {
+                LOGGER.warn("[BetterBackup] baseline scan thread did not stop within {}ms",
+                        SHUTDOWN_JOIN_TIMEOUT_MS);
+            } else {
+                LOGGER.info("[BetterBackup] baseline scan stopped for shutdown");
+            }
+        }
+        activeBaselineScanner = null;
+        activeBaselineThread = null;
+
         // 关服 final snapshot: 最后一次抓取本周期内 BAS fire 过的 chunk.
         // SnapshotCreator.create 用 synchronized 串行, 跟 scheduler 已停后无 race.
         SnapshotCreator creator = BetterBackupCore.creator();
@@ -410,9 +443,10 @@ public final class BetterBackupMod {
      * 这正是消灭"标完成但登记丢"崩溃窗口的关键: 标完成与登记进 manifest 现在同源于一次
      * 成功的快照写盘.
      *
-     * <p>daemon=true: 关服时若扫描还没跑完直接随 JVM 退出, 进度已按 region 持久化,
-     * 下次启动续传 (scanned-未提交的 region 重扫). 扫描异常只 log, 不影响活跃 dirty 路径
-     * 备份继续工作.
+     * <p>关服路径: onServerStopping 在关服快照前 requestStop + join, 扫描在 slot 边界
+     * 干净退出 (被中断的半扫 region 不标 scanned). daemon=true 仅是兜底: join 超时或
+     * 异常路径下随 JVM 退出, 进度已按 region 持久化, 下次启动续传 (scanned-未提交的
+     * region 重扫). 扫描异常只 log, 不影响活跃 dirty 路径备份继续工作.
      */
     private static void startBaselineScan(ChunkStore store,
                                           CurrentSnapshotState state,
@@ -444,6 +478,8 @@ public final class BetterBackupMod {
             }
         }, "BetterBackup-Baseline-Scan");
         thread.setDaemon(true);
+        activeBaselineScanner = scanner;
+        activeBaselineThread = thread;
         thread.start();
         LOGGER.info("[BetterBackup] baseline full scan started (rate={} chunk/s)", rate);
     }

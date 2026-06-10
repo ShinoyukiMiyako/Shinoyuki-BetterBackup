@@ -192,6 +192,59 @@ class BaselineScannerTest {
     }
 
     @Test
+    void requestStop_halts_at_slot_boundary_without_marking_partial_region(@TempDir Path base) throws IOException {
+        // 关服路径: 扫描中段被 requestStop, 必须 (a) 不调收尾回调 (防与关服快照竞争),
+        // (b) 半扫 region 不标 scanned (否则晋升 committed 后缺的 slot 永不重扫),
+        // (c) 登记停在 slot 边界, (d) 下次启动续传把两个 region 完整扫回.
+        Path storeRoot = base.resolve("store");
+        Path worldRoot = base.resolve("world");
+        writeRegion(worldRoot, "region", 0, 0, Map.of(
+                0, "a".getBytes(), 1, "b".getBytes(), 2, "c".getBytes(), 3, "d".getBytes()));
+        writeRegion(worldRoot, "region", 1, 0, Map.of(0, "e".getBytes()));
+
+        CurrentSnapshotState state = new CurrentSnapshotState();
+        Set<Hash> written = ConcurrentHashMap.newKeySet();
+        BaselineProgress progress = new BaselineProgress(storeRoot);
+        ChunkStore store = new ChunkStore(storeRoot);
+        store.initialize();
+        WorldPaths paths = new WorldPaths(worldRoot);
+
+        java.util.concurrent.atomic.AtomicBoolean finishCalled = new java.util.concurrent.atomic.AtomicBoolean();
+        java.util.concurrent.atomic.AtomicInteger acquires = new java.util.concurrent.atomic.AtomicInteger();
+        java.util.concurrent.atomic.AtomicReference<BaselineScanner> self = new java.util.concurrent.atomic.AtomicReference<>();
+        // 限速钩子在第 2 个 chunk 处理中发停止请求, 模拟关服打断扫描中段
+        BaselineScanner.RateLimiter stopper = () -> {
+            if (acquires.incrementAndGet() == 2) {
+                self.get().requestStop();
+            }
+        };
+        BaselineScanner scanner = new BaselineScanner(store, state, paths, new Xxh128HashFunction(),
+                written, progress, stopper, () -> finishCalled.set(true));
+        self.set(scanner);
+
+        BaselineScanner.Result result = scanner.scan();
+
+        assertFalse(result.complete(), "stopped scan must not report complete");
+        assertFalse(finishCalled.get(), "stopped scan must not fire the baseline-complete callback");
+        assertEquals(2, state.chunkCount(),
+                "registration must halt at the slot boundary right after the stop request");
+        assertTrue(progress.snapshotScannedKeys().isEmpty(),
+                "interrupted region must not be marked scanned");
+        assertEquals(0, progress.committedRegionCount());
+
+        // 续传 (模拟下次启动): 全新 state + 重新加载 progress, 两个 region 必须完整扫回
+        CurrentSnapshotState resumedState = new CurrentSnapshotState();
+        BaselineProgress reloaded = new BaselineProgress(storeRoot);
+        BaselineScanner resumed = newScanner(storeRoot, worldRoot, resumedState,
+                ConcurrentHashMap.newKeySet(), reloaded, NO_FINISH);
+        BaselineScanner.Result resumeResult = resumed.scan();
+
+        assertEquals(3, resumeResult.stored(), "resume stores the 3 chunks missed by the stopped run");
+        assertEquals(2, resumeResult.deduped(), "the 2 chunks ingested before the stop dedup");
+        assertEquals(5, resumedState.chunkCount(), "all 5 chunks registered after resume");
+    }
+
+    @Test
     void already_dirty_chunk_is_skipped_by_baseline(@TempDir Path base) throws IOException {
         Path storeRoot = base.resolve("store");
         Path worldRoot = base.resolve("world");
