@@ -9,6 +9,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 /**
  * 写 vanilla .mca region file 里 chunk slot 的 raw 压缩字节, 跟 {@link RegionFileSlotReader} 反向配对.
@@ -39,6 +41,10 @@ public final class RegionFileSlotWriter implements Closeable {
     private final Path mcaFile;
     private final int[] locations;
     private final ByteArrayOutputStream chunkData;
+    // external chunk 的 .mcc 写入推迟到 close(): mcc 文件路径 -> 外置内容. 用
+    // LinkedHashMap 保证写盘顺序确定, 便于诊断. 在 .mca atomic rename 成功后再落 .mcc,
+    // 跟 vanilla commit 顺序一致 (先 location table 指向 stub, 再保证外置文件存在).
+    private final Map<Path, byte[]> pendingExternal;
     private int nextFreeSector;
     private boolean closed;
 
@@ -46,6 +52,7 @@ public final class RegionFileSlotWriter implements Closeable {
         this.mcaFile = mcaFile;
         this.locations = new int[LOCATION_ENTRY_COUNT];
         this.chunkData = new ByteArrayOutputStream(SECTOR_BYTES * 16);
+        this.pendingExternal = new LinkedHashMap<>();
         this.nextFreeSector = HEADER_SECTOR_COUNT;
         this.closed = false;
     }
@@ -64,6 +71,11 @@ public final class RegionFileSlotWriter implements Closeable {
      * 跟 {@link RegionFileSlotReader#readSlot} 返回值严格一致, 不含 4 byte length header
      * (length header 是 region file 内部 layout, 由本方法自己写入).
      *
+     * <p><b>external (.mcc) 还原</b>: rawSlotBytes 首字节高位 0x80 置位时 (见
+     * {@link ChunkPayloadCodec}), 该 chunk 原本是超大 chunk, 数据外置在 .mcc 文件.
+     * 本方法把 1 byte stub ("(compType|0x80)") 写入 slot, 把剩余字节作为 .mcc 内容
+     * 在 close() 时落盘, 还原 vanilla 的 stub + 外置文件两段布局, round-trip 字节级一致.
+     *
      * @param localX        0-31, region 内 local x (= chunkX &amp; 31)
      * @param localZ        0-31, region 内 local z (= chunkZ &amp; 31)
      * @param rawSlotBytes  非空, sectorCount &lt;= 255 (vanilla format 限制单 chunk 不超过 1 MiB)
@@ -81,7 +93,23 @@ public final class RegionFileSlotWriter implements Closeable {
             throw new IllegalArgumentException("rawSlotBytes empty for slot " + localX + "," + localZ);
         }
 
-        int payloadLen = rawSlotBytes.length;
+        byte[] inSlotPayload = rawSlotBytes;
+        if (ChunkPayloadCodec.isExternal(rawSlotBytes[0])) {
+            // external store 对象 = "(compType|0x80) byte + .mcc 内容". slot 内只放
+            // 1 byte stub, 剩余字节排队写到外置文件. 退化为 1-byte external store 对象
+            // (.mcc 空) 不合法: vanilla 永远把至少一段压缩数据写进 .mcc.
+            if (rawSlotBytes.length < 2) {
+                throw new IllegalArgumentException("external chunk store object too short ("
+                        + rawSlotBytes.length + " bytes) for slot " + localX + "," + localZ);
+            }
+            Path mccFile = RegionFileSlotReader.mccPathFor(mcaFile, localX, localZ);
+            byte[] external = new byte[rawSlotBytes.length - 1];
+            System.arraycopy(rawSlotBytes, 1, external, 0, external.length);
+            pendingExternal.put(mccFile, external);
+            inSlotPayload = new byte[]{rawSlotBytes[0]};
+        }
+
+        int payloadLen = inSlotPayload.length;
         int totalSlotBytes = LENGTH_HEADER_BYTES + payloadLen;
         // ceil(totalSlotBytes / SECTOR_BYTES), 不用浮点避免精度坑
         int sectorCount = (totalSlotBytes + SECTOR_BYTES - 1) / SECTOR_BYTES;
@@ -98,7 +126,7 @@ public final class RegionFileSlotWriter implements Closeable {
         ByteBuffer lenBuf = ByteBuffer.allocate(LENGTH_HEADER_BYTES);
         lenBuf.putInt(payloadLen);
         chunkData.write(lenBuf.array(), 0, LENGTH_HEADER_BYTES);
-        chunkData.write(rawSlotBytes, 0, payloadLen);
+        chunkData.write(inSlotPayload, 0, payloadLen);
         int paddedSlotBytes = sectorCount * SECTOR_BYTES;
         int paddingBytes = paddedSlotBytes - totalSlotBytes;
         for (int i = 0; i < paddingBytes; i++) {
@@ -157,6 +185,28 @@ public final class RegionFileSlotWriter implements Closeable {
         }
 
         Files.move(tmp, mcaFile, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+
+        // external chunk 的 .mcc 落盘排在 .mca rename 之后: slot 内的 stub 已指向外置
+        // 文件, 此时必须保证 .mcc 存在 reader 才读得到. 每个 .mcc 走 tmp + fsync +
+        // atomic rename, 跟 .mca 同 crash 安全模型.
+        for (Map.Entry<Path, byte[]> entry : pendingExternal.entrySet()) {
+            writeExternalAtomic(entry.getKey(), entry.getValue());
+        }
+    }
+
+    private static void writeExternalAtomic(Path mccFile, byte[] content) throws IOException {
+        Path tmp = mccFile.resolveSibling(mccFile.getFileName() + ".tmp");
+        try (FileChannel ch = FileChannel.open(tmp,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.TRUNCATE_EXISTING,
+                StandardOpenOption.WRITE)) {
+            writeFully(ch, ByteBuffer.wrap(content));
+            ch.force(true);
+        } catch (IOException | RuntimeException e) {
+            Files.deleteIfExists(tmp);
+            throw e;
+        }
+        Files.move(tmp, mccFile, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
     }
 
     private static void writeFully(FileChannel ch, ByteBuffer buf) throws IOException {
