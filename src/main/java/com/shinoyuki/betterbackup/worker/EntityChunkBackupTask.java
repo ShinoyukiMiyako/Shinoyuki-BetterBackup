@@ -55,13 +55,14 @@ public record EntityChunkBackupTask(String dimensionId, long packedPos, int retr
         }
         Hash hash = ctx.hashFunction().hash(rawBytes);
         boolean wrote = ctx.store().put(hash, rawBytes);
+        // 先登记 state 再 add writtenThisWindow (GC 并发安全, 见 ChunkBackupTask 同址注释).
+        ctx.state().putEntityChunk(dimensionId, packedPos, hash);
         if (wrote) {
             ctx.writtenThisWindow().add(hash);
             ctx.metrics().recordEntityUnique();
         } else {
             ctx.metrics().recordEntityDeduped();
         }
-        ctx.state().putEntityChunk(dimensionId, packedPos, hash);
     }
 
     /**

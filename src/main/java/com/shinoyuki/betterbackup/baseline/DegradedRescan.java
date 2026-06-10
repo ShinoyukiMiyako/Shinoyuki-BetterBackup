@@ -153,16 +153,17 @@ public final class DegradedRescan {
 
             Hash hash = hashFunction.hash(rawBytes);
             boolean wrote = store.put(hash, rawBytes);
+            // 先登记 state 再 add writtenThisWindow (GC 并发安全, 见 BaselineScanner 同址注释).
+            if (entityChannel) {
+                state.putEntityChunk(dim, packedPos, hash);
+            } else {
+                state.putChunk(dim, packedPos, hash);
+            }
             if (wrote) {
                 writtenThisWindow.add(hash);
                 recovered++;
             } else {
                 deduped++;
-            }
-            if (entityChannel) {
-                state.putEntityChunk(dim, packedPos, hash);
-            } else {
-                state.putChunk(dim, packedPos, hash);
             }
         }
         return new RegionResult(recovered, deduped, skipped);

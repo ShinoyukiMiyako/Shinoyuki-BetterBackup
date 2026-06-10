@@ -66,13 +66,17 @@ public record ChunkBackupTask(String dimensionId, long packedPos, int retryAttem
         }
         Hash hash = ctx.hashFunction().hash(rawBytes);
         boolean wrote = ctx.store().put(hash, rawBytes);
+        // 先登记 state 再 add writtenThisWindow: 保证增量 GC 在 drain 后读到的
+        // writtenThisWindow 快照里任一 hash 的 state 登记都已先行落入, 必被 GC 的
+        // pending 排除集捕获, 不会误删等下份 manifest 引用的 chunk 字节
+        // (见 SnapshotCreator.runIncrementalGc 并发安全说明).
+        ctx.state().putChunk(dimensionId, packedPos, hash);
         if (wrote) {
             ctx.writtenThisWindow().add(hash);
             ctx.metrics().recordChunkUnique();
         } else {
             ctx.metrics().recordChunkDeduped();
         }
-        ctx.state().putChunk(dimensionId, packedPos, hash);
     }
 
     /**

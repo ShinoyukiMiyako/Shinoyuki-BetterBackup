@@ -64,6 +64,7 @@ import java.util.stream.Stream;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Phase 1 commit 12: 真正接通 BAS Listener → BackupWorker 管线.
@@ -217,10 +218,15 @@ public final class BetterBackupMod {
             BetterBackupMetrics metrics = new BetterBackupMetrics();
             Set<Hash> writtenThisWindow = ConcurrentHashMap.newKeySet();
 
-            // baseline 进度先于 creator 创建: creator 需要 baselineCompleteSupplier 给每份
-            // manifest 盖 baselineComplete 戳, scanner 跑完才置位. load() 读已记录进度供续传.
+            // baseline 进度先于 creator 创建: creator 在每份 manifest 写盘成功后晋升
+            // scanned->committed 并据 baselineProgress.isComplete() 盖 baselineComplete 戳.
+            // load() 读已记录进度供续传. 旧格式行按 scanned 读入 (向后兼容, 重扫后自动晋升).
             BaselineProgress baselineProgress = new BaselineProgress(storeRoot);
             baselineProgress.load();
+            // baseline 扫描收尾标志: scanner 跑完所有 pass 后置 true, 然后请求一次
+            // "baseline-complete" 快照. SnapshotCreator 仅在 scanFinished=true 且全部 region
+            // committed 时才写 complete 标记, 防止扫描半途误开 restore 门禁.
+            AtomicBoolean baselineScanFinished = new AtomicBoolean(false);
             // queue 先于 context 创建: context 持有同一个 queue 引用, chunk/entity task
             // 命中撕裂读时把自己重 offer 回这个 queue 延后重试 (BackupContext.retryQueue).
             BlockingQueue<BackupTask> queue = new LinkedBlockingQueue<>();
@@ -248,7 +254,7 @@ public final class BetterBackupMod {
             MinecraftServer server = event.getServer();
             SnapshotCreator creator = new SnapshotCreator(store, snapshotState, paths, hashFunction,
                     storeRoot, () -> overworldGameTime(server), writtenThisWindow, metrics,
-                    baselineProgress::isComplete);
+                    baselineProgress, baselineScanFinished::get);
             SnapshotScheduler scheduler = createScheduler();
             scheduler.start(creator);
 
@@ -266,7 +272,8 @@ public final class BetterBackupMod {
             BetterBackupCore.install(store, snapshotState, context, queue, workers, workerThreads,
                     bridge, creator, scheduler, diagnosticLogger, metrics, baselineProgress);
 
-            startBaselineScan(store, snapshotState, paths, hashFunction, writtenThisWindow, baselineProgress);
+            startBaselineScan(store, snapshotState, paths, hashFunction, writtenThisWindow, baselineProgress,
+                    creator, baselineScanFinished);
 
             // 上一次运行经历过 BAS 降级时, 补采降级窗口内变更的 chunk. 在 baseline 之后跑:
             // 二者都把 chunk 登记进 CurrentSnapshotState 等下次快照 drain, 互不冲突 (state
@@ -392,26 +399,43 @@ public final class BetterBackupMod {
 
     /**
      * 启动 baseline 全量扫描后台线程. 扫描限速 (默认 50 chunk/s) 跑时间可能很长, 必须
-     * 在独立线程跑, 不阻塞 server 启动. 扫描把每个 chunk 登记进 CurrentSnapshotState,
-     * 由下一次定时 / 关服快照统一 drain 进 manifest, 跑完置 baselineProgress.complete,
-     * 此后快照 baselineComplete=true, restore 门禁放行.
+     * 在独立线程跑, 不阻塞 server 启动. 扫描把每个 chunk 登记进 CurrentSnapshotState 并
+     * 把所在 region 记为 scanned (待提交); 由下一次定时 / 关服快照统一 drain 进 manifest
+     * 并晋升 committed.
+     *
+     * <p>扫描遍历完所有 pass 后调收尾回调: 先置 baselineScanFinished, 再
+     * {@code creator.create("baseline-complete")} 请求一次快照把最后一批 scanned region
+     * 晋升 committed; 当全部 region committed 时 SnapshotCreator 写 complete 标记, 此后
+     * 快照 baselineComplete=true, restore 门禁放行. 不再由 scanner 直接写 complete 标记 ——
+     * 这正是消灭"标完成但登记丢"崩溃窗口的关键: 标完成与登记进 manifest 现在同源于一次
+     * 成功的快照写盘.
      *
      * <p>daemon=true: 关服时若扫描还没跑完直接随 JVM 退出, 进度已按 region 持久化,
-     * 下次启动续传. 扫描异常只 log, 不影响活跃 dirty 路径备份继续工作.
+     * 下次启动续传 (scanned-未提交的 region 重扫). 扫描异常只 log, 不影响活跃 dirty 路径
+     * 备份继续工作.
      */
     private static void startBaselineScan(ChunkStore store,
                                           CurrentSnapshotState state,
                                           WorldPaths paths,
                                           HashFunction hashFunction,
                                           Set<Hash> writtenThisWindow,
-                                          BaselineProgress baselineProgress) {
+                                          BaselineProgress baselineProgress,
+                                          SnapshotCreator creator,
+                                          AtomicBoolean baselineScanFinished) {
         if (baselineProgress.isComplete()) {
             LOGGER.info("[BetterBackup] baseline already complete, full scan skipped");
             return;
         }
         int rate = BetterBackupConfig.baselineScanChunksPerSecond();
+        // 收尾回调: 置 scanFinished 后请求一次快照. 快照写盘成功 -> SnapshotCreator 晋升
+        // 最后一批 scanned region 并 (全部 committed 时) 写 complete 标记. 顺序要点: 必须
+        // 先 set(true) 再 create, 否则 create 内读到的 scanFinished 还是 false 不写标记.
+        Runnable onScanFinished = () -> {
+            baselineScanFinished.set(true);
+            creator.create("baseline-complete");
+        };
         BaselineScanner scanner = new BaselineScanner(store, state, paths, hashFunction,
-                writtenThisWindow, baselineProgress, new ThrottlingRateLimiter(rate));
+                writtenThisWindow, baselineProgress, new ThrottlingRateLimiter(rate), onScanFinished);
         Thread thread = new Thread(() -> {
             try {
                 scanner.scan();

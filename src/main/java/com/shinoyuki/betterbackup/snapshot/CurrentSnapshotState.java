@@ -3,7 +3,9 @@ package com.shinoyuki.betterbackup.snapshot;
 import com.shinoyuki.betterbackup.store.Hash;
 
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -58,6 +60,24 @@ public final class CurrentSnapshotState {
     /** 同 {@link #containsChunk} 但针对 entity chunk 通道. */
     public boolean containsEntityChunk(String dimensionId, long packedPos) {
         return dirtyEntityChunks.containsKey(new DimChunkKey(dimensionId, packedPos));
+    }
+
+    /**
+     * 当前所有 dirty 条目的 hash 值快照 (chunk + entityChunk + savedData + levelDat).
+     * 增量 GC 用它排除"已登记但尚未进本次 manifest"的 hash, 防止误删 baseline / 活跃
+     * dirty 路径在本次 drain 之后并发登记的 chunk 字节 (其登记还在等下一份 manifest 引用).
+     * 见 SnapshotCreator.runIncrementalGc 的并发安全说明. 返回独立副本.
+     */
+    public Set<Hash> pendingHashes() {
+        Set<Hash> out = new HashSet<>();
+        out.addAll(dirtyChunks.values());
+        out.addAll(dirtyEntityChunks.values());
+        out.addAll(dirtySavedData.values());
+        Hash level = dirtyLevelDat.get();
+        if (level != null) {
+            out.add(level);
+        }
+        return out;
     }
 
     public int size() {

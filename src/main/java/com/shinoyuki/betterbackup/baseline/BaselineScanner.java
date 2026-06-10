@@ -64,13 +64,23 @@ public final class BaselineScanner {
     private final BaselineProgress progress;
     private final RateLimiter rateLimiter;
 
+    /**
+     * 扫描遍历完所有 pass 后的收尾回调. 不再由 scanner 直接写 complete 标记 (那会脱离
+     * "登记已进 manifest"的事务关系), 而是请求一次快照: BetterBackupMod 把此回调 wire 成
+     * "置 scanFinished 标志 + creator.create('baseline-complete')". 快照写盘成功后由
+     * SnapshotCreator 晋升最后一批 scanned region 为 committed 并在全部 committed 时写
+     * complete 标记. 已 complete 时不调.
+     */
+    private final Runnable onScanFinished;
+
     public BaselineScanner(ChunkStore store,
                            CurrentSnapshotState state,
                            com.shinoyuki.betterbackup.io.WorldPaths paths,
                            HashFunction hashFunction,
                            Set<Hash> writtenThisWindow,
                            BaselineProgress progress,
-                           RateLimiter rateLimiter) {
+                           RateLimiter rateLimiter,
+                           Runnable onScanFinished) {
         this.store = store;
         this.state = state;
         this.paths = paths;
@@ -78,12 +88,16 @@ public final class BaselineScanner {
         this.writtenThisWindow = writtenThisWindow;
         this.progress = progress;
         this.rateLimiter = rateLimiter;
+        this.onScanFinished = onScanFinished;
     }
 
     /**
      * 跑完整次全量扫描 (含已加载进度的续传). 已 complete 则直接返回不重扫.
-     * 遍历完所有 region 后写 complete 标记. 返回本次实际入库 (写盘) 的 chunk 数与
-     * 被 dirty 路径跳过的 chunk 数, 供日志与测试断言.
+     * 遍历完所有 region 后不再直接写 complete 标记, 而是调收尾回调 {@link #onScanFinished}
+     * 请求一次快照, 由 SnapshotCreator 在快照写盘成功后晋升 scanned->committed 并在全部
+     * committed 时写 complete 标记 (登记进 manifest 与标完成之间从此有事务关系, 消灭崩溃
+     * 窗口). 返回本次实际入库 (写盘) 的 chunk 数 / 被 dirty 路径跳过的 chunk 数, 以及回调
+     * 跑完后 baseline 是否已 complete (供日志与测试断言).
      */
     public Result scan() throws IOException {
         progress.load();
@@ -112,13 +126,16 @@ public final class BaselineScanner {
             LOGGER.warn("[BetterBackup] baseline pass {} left regions incomplete (torn reads), retrying", pass);
         }
 
-        progress.markComplete();
-        LOGGER.info("[BetterBackup] baseline scan complete: stored={} deduped={} skipped(dirty)={} clean={}",
-                stored, deduped, skipped, allRegionsClean);
-        return new Result(stored, deduped, skipped, true);
+        // 扫描收尾: 请求一次快照晋升最后一批 scanned region 并写 complete 标记.
+        // 回调跑完后 progress.isComplete() 才反映真实完成状态.
+        onScanFinished.run();
+        boolean complete = progress.isComplete();
+        LOGGER.info("[BetterBackup] baseline scan swept: stored={} deduped={} skipped(dirty)={} clean={} complete={}",
+                stored, deduped, skipped, allRegionsClean, complete);
+        return new Result(stored, deduped, skipped, complete);
     }
 
-    /** 跑一轮: 遍历所有 dim 的 region/entities, 跳过已标完成的 region 文件. */
+    /** 跑一轮: 遍历所有 dim 的 region/entities, 跳过已 committed 的 region 文件. */
     private PassResult runPass(List<String> dimensions, boolean lastPass) throws IOException {
         long stored = 0;
         long deduped = 0;
@@ -136,7 +153,10 @@ public final class BaselineScanner {
                 boolean entityChannel = channel.equals(BaselineProgress.CHANNEL_ENTITIES);
                 for (Path mca : listRegionFiles(dir)) {
                     String mcaName = mca.getFileName().toString();
-                    if (progress.isRegionDone(channel, dim, mcaName)) {
+                    // 续传只跳过已 committed (登记已进 manifest) 的 region. scanned-未提交的
+                    // 必须重扫: store.put 幂等去重, 重扫只是把登记重新放进 state 等下次快照
+                    // 晋升, 代价低; 换来的是崩溃窗口里丢失的登记被重新建立, 自动治愈.
+                    if (progress.isRegionCommitted(channel, dim, mcaName)) {
                         continue;
                     }
                     RegionResult rr = scanRegionFile(dim, channel, entityChannel, mca);
@@ -144,7 +164,9 @@ public final class BaselineScanner {
                     deduped += rr.deduped();
                     skipped += rr.skipped();
                     if (rr.clean() || lastPass) {
-                        progress.markRegionDone(channel, dim, mcaName);
+                        // 扫完记 scanned (待提交), 不立即标完成. 登记 (state.putChunk) 已在
+                        // scanRegionFile 内完成, 等下次快照 drain 进 manifest 后才晋升 committed.
+                        progress.markRegionScanned(channel, dim, mcaName);
                         tornSeen |= !rr.clean();
                     } else {
                         allDone = false;
@@ -210,16 +232,20 @@ public final class BaselineScanner {
 
             Hash hash = hashFunction.hash(rawBytes);
             boolean wrote = store.put(hash, rawBytes);
+            // 顺序要点 (GC 并发安全): 先登记进 state, 再 add 进 writtenThisWindow.
+            // 增量 GC 在 drain 后读 writtenThisWindow 快照再读 state pending 集排除误删,
+            // 此 happens-before 顺序保证凡进入 GC 快照的 hash 其 state 登记必已先行落入,
+            // 必被 pending 捕获, 不会被误删 (见 SnapshotCreator.runIncrementalGc).
+            if (entityChannel) {
+                state.putEntityChunk(dim, packedPos, hash);
+            } else {
+                state.putChunk(dim, packedPos, hash);
+            }
             if (wrote) {
                 writtenThisWindow.add(hash);
                 stored++;
             } else {
                 deduped++;
-            }
-            if (entityChannel) {
-                state.putEntityChunk(dim, packedPos, hash);
-            } else {
-                state.putChunk(dim, packedPos, hash);
             }
         }
         return new RegionResult(stored, deduped, skipped, clean);

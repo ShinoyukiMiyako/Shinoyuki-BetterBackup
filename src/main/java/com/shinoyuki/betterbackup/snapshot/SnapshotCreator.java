@@ -1,6 +1,7 @@
 package com.shinoyuki.betterbackup.snapshot;
 
 import com.shinoyuki.betterbackup.BetterBackupMod;
+import com.shinoyuki.betterbackup.baseline.BaselineProgress;
 import com.shinoyuki.betterbackup.diagnostic.BetterBackupMetrics;
 import com.shinoyuki.betterbackup.gc.StoreGc;
 import com.shinoyuki.betterbackup.io.WorldPaths;
@@ -69,6 +70,20 @@ public final class SnapshotCreator implements SnapshotTrigger {
     private final PlayerDataCollector playerDataCollector;
 
     /**
+     * baseline 进度记录. 快照成功写盘后, 把"drain 之前已 scanned"的 region 晋升为
+     * committed (登记已随本份 manifest 落地), 并在扫描收尾且全部 committed 时写 complete
+     * 标记. 这是消灭"扫完登记丢 / store 孤儿被 GC 删 / restore 凭空缺块"P0 窗口的提交侧.
+     */
+    private final BaselineProgress baselineProgress;
+
+    /**
+     * baseline 扫描线程是否已遍历完所有 pass (收尾). scanner 跑完所有 pass 后置位,
+     * 然后请求一次 "baseline-complete" 快照. 只有 scanFinished=true 且全部 region 已
+     * committed 时才写 complete 标记 — 防止扫描半途误开 restore 门禁.
+     */
+    private final BooleanSupplier baselineScanFinished;
+
+    /**
      * BAS 降级单向闩锁. PipelineStateListener 收到 onDegraded 后 {@link #markDegraded()}
      * 置位, 此后本 creator 产出的每份快照都盖 incomplete 戳 (BAS 已停 fire, 活跃 dirty
      * 路径失明, 该快照可能漏采降级窗口内变更的 chunk). 跟 BAS 侧 degraded 同为单向,
@@ -84,7 +99,8 @@ public final class SnapshotCreator implements SnapshotTrigger {
                            LongSupplier gameTimeSupplier,
                            Set<Hash> writtenThisWindow,
                            BetterBackupMetrics metrics,
-                           BooleanSupplier baselineCompleteSupplier) {
+                           BaselineProgress baselineProgress,
+                           BooleanSupplier baselineScanFinished) {
         this.store = store;
         this.state = state;
         this.paths = paths;
@@ -96,7 +112,12 @@ public final class SnapshotCreator implements SnapshotTrigger {
         this.gc = new StoreGc(store, this.snapshotsDir);
         this.storeRoot = storeRoot;
         this.failureMarker = new SnapshotFailureMarker(storeRoot);
-        this.baselineCompleteSupplier = baselineCompleteSupplier;
+        this.baselineProgress = baselineProgress;
+        // manifest 的 baselineComplete 戳直接反映 complete 标记当下状态: scanner 收尾后
+        // 本 creator 写下标记, 此后产出的快照 (含定时 / 关服) 才盖 true. 早期快照盖 false,
+        // restore 门禁据此拒绝, 让服主等扫描跑完再取一份新快照恢复.
+        this.baselineCompleteSupplier = baselineProgress::isComplete;
+        this.baselineScanFinished = baselineScanFinished;
         this.playerDataCollector = new PlayerDataCollector(store, paths, hashFunction, writtenThisWindow);
     }
 
@@ -142,6 +163,12 @@ public final class SnapshotCreator implements SnapshotTrigger {
             return;
         }
 
+        // baseline 晋升时序: 必须在 drainAndClear 之前捕获当前 scanned 集合. 这些 region
+        // 的 chunk 登记此刻已在 state 里, 即将被本次 drain 纳入本份 manifest; manifest 写盘
+        // 成功后才把这个捕获集晋升为 committed. drain 之后扫描线程再扫完的 region 其登记
+        // 没进这份 manifest, 留给下一次快照晋升 (overlay 语义保证下份继承本份引用).
+        Set<String> scannedBeforeDrain = baselineProgress.snapshotScannedKeys();
+
         CurrentSnapshotState.Drained drained = state.drainAndClear();
         Hash levelDatHash = hashAndStoreLevelDat();
 
@@ -177,10 +204,35 @@ public final class SnapshotCreator implements SnapshotTrigger {
                     newManifest.baselineComplete(),
                     newManifest.incomplete());
 
+            // manifest atomic rename 已完成 (writeTo 内部 tmp + fsync + rename), 这些
+            // region 的 chunk 登记现在确实在盘上的 manifest 里. 把 drain 前捕获的 scanned
+            // 集晋升为 committed, 续传从此跳过它们. 晋升后若扫描已收尾且全部 committed,
+            // 写 complete 标记放行 restore 门禁. 晋升 / 标记持久化失败只 log 不抛: manifest
+            // 已落地数据不丢, 失败的 region 下次快照按 scanned 重扫一遍重新晋升 (幂等).
+            promoteBaselineAfterWrite(scannedBeforeDrain);
+
             runIncrementalGc(newManifest);
         } catch (IOException e) {
             LOGGER.error("[BetterBackup] snapshot write failed: {}", target, e);
             recordFailure("manifest write failed: " + e.getMessage());
+        }
+    }
+
+    /**
+     * 快照写盘成功后晋升 baseline 进度: 把 drain 前捕获的 scanned region 集晋升为
+     * committed, 再在扫描收尾且全部 committed 时写 complete 标记. 持久化失败只 log:
+     * manifest 已落地, 这些 region 的 chunk 不丢; 失败的 region 下次快照按 scanned 重扫
+     * 重新晋升 (markRegionScanned / promote 均幂等). 不抛, 不掩盖原始快照成功语义.
+     */
+    private void promoteBaselineAfterWrite(Set<String> scannedBeforeDrain) {
+        try {
+            baselineProgress.promoteScannedToCommitted(scannedBeforeDrain);
+            if (baselineProgress.markCompleteIfAllCommitted(baselineScanFinished.getAsBoolean())) {
+                LOGGER.info("[BetterBackup] baseline complete marker written: all regions committed");
+            }
+        } catch (IOException e) {
+            LOGGER.error("[BetterBackup] baseline progress promotion failed (snapshot already written, "
+                    + "regions will be rescanned and re-promoted next snapshot)", e);
         }
     }
 
@@ -210,8 +262,19 @@ public final class SnapshotCreator implements SnapshotTrigger {
      * snapshot 写盘成功后立即清"本周期 BackupWorker 写入但 manifest 未引用的中间版本 hash"
      * (DESIGN §2.6). 不接通会让 store 单调增长 (大服 ~24 GB/天).
      *
-     * <p>scope = writtenThisWindow - referenced(manifest), 远小于全量 GC, 秒级完成.
-     * 失败 log error 不抛 — snapshot 已经写盘, GC 是 polish, 下次 snapshot 会再清.
+     * <p>scope = writtenThisWindow - referenced(manifest) - pending(state), 远小于全量
+     * GC, 秒级完成. 失败 log error 不抛 — snapshot 已经写盘, GC 是 polish, 下次 snapshot
+     * 会再清.
+     *
+     * <p><b>并发安全 (修复 GC 误删 pending-baseline 写入)</b>: baseline 扫描线程与本
+     * create() 并发跑, drain 之后仍在往 writtenThisWindow.add + state.put 登记 chunk.
+     * 这些 chunk 的登记没进本份 manifest (drain 已过), 故不在 referenced 里, 却已在
+     * writtenThisWindow 里 — 若仅按 writtenThisWindow - referenced 删, 会误删它们的
+     * store 字节, 而其登记还在 state 里等下一份 manifest 引用 -> 下份 manifest 引用已删
+     * hash, 静默缺块. 修复: 额外排除"当前仍登记在 state 里的 hash" (pending). 配合各
+     * 写入点 state.put 先于 writtenThisWindow.add 的顺序 (happens-before): 凡进入
+     * windowSnapshot 的 hash, 其 state.put 必已完成, 若该登记未被本次 drain 纳入则此刻
+     * 仍在 state 里, 必被 pending 捕获排除. 由此关闭 race.
      */
     private void runIncrementalGc(SnapshotManifest manifest) {
         Set<Hash> referenced = new HashSet<>();
@@ -224,7 +287,15 @@ public final class SnapshotCreator implements SnapshotTrigger {
         }
 
         Set<Hash> windowSnapshot = new HashSet<>(writtenThisWindow);
-        writtenThisWindow.clear();
+        // pending 必须在 windowSnapshot 之后读: 写入点 state.put 先于 writtenThisWindow.add,
+        // 故 windowSnapshot 里任一 hash 的 state.put 都已先行完成, 若其登记未被本次 drain
+        // 取走则此刻一定还在 state 中, 这次读必定捕获到, 不会漏排除而误删.
+        Set<Hash> pending = state.pendingHashes();
+        // 只从 writtenThisWindow 移除本次确实纳入考量的 windowSnapshot, 保留 drain 之后
+        // 并发新增的 hash 给下一窗口; pending 留在窗口里, 下份 manifest 引用后自然不再是
+        // GC candidate (referenced 命中).
+        windowSnapshot.removeAll(pending);
+        writtenThisWindow.removeAll(windowSnapshot);
 
         try {
             StoreGc.GcResult result = gc.gcIncremental(windowSnapshot, referenced);
