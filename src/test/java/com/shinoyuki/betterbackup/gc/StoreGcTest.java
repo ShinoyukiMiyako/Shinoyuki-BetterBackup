@@ -73,7 +73,8 @@ class StoreGcTest {
                 null,
                 0L,
                 0L,
-                false);
+                false,
+                com.shinoyuki.betterbackup.snapshot.FileManifest.empty());
         Path target = snapshotsDir.resolve(id + ".manifest");
         m.writeTo(target);
         return target;

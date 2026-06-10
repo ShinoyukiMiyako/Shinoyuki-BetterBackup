@@ -50,7 +50,7 @@ class SnapshotManifestTest {
                 SnapshotManifest.SCHEMA_VERSION,
                 "test-id", 1000L, 99L,
                 chunks, new HashMap<>(), new HashMap<>(),
-                null, 0L, 0L, false);
+                null, 0L, 0L, false, FileManifest.empty());
 
         SnapshotManifest restored = SnapshotManifest.fromNbt(m.toNbt());
         assertEquals(2, restored.chunks().size());
@@ -69,7 +69,7 @@ class SnapshotManifestTest {
                 SnapshotManifest.SCHEMA_VERSION,
                 "test-id", 1000L, 99L,
                 new HashMap<>(), new HashMap<>(), savedData,
-                null, 0L, 0L, false);
+                null, 0L, 0L, false, FileManifest.empty());
 
         SnapshotManifest restored = SnapshotManifest.fromNbt(m.toNbt());
         assertEquals(2, restored.savedData().size());
@@ -83,7 +83,7 @@ class SnapshotManifestTest {
                 SnapshotManifest.SCHEMA_VERSION,
                 "test-id", 1000L, 99L,
                 new HashMap<>(), new HashMap<>(), new HashMap<>(),
-                hash(99), 0L, 0L, false);
+                hash(99), 0L, 0L, false, FileManifest.empty());
 
         SnapshotManifest restored = SnapshotManifest.fromNbt(m.toNbt());
         assertNotNull(restored.levelDat());
@@ -109,7 +109,7 @@ class SnapshotManifestTest {
                 SnapshotManifest.SCHEMA_VERSION,
                 "2026-05-10T19-00-00", 1234567890L, 42L,
                 chunks, new HashMap<>(), new HashMap<>(),
-                hash(8), 1024L, 256L, false);
+                hash(8), 1024L, 256L, false, FileManifest.empty());
 
         Path manifestFile = tempDir.resolve("snapshots").resolve("2026-05-10T19-00-00.manifest");
         m.writeTo(manifestFile);
@@ -129,13 +129,13 @@ class SnapshotManifestTest {
         SnapshotManifest done = new SnapshotManifest(
                 SnapshotManifest.SCHEMA_VERSION, "id", 1L, 2L,
                 new HashMap<>(), new HashMap<>(), new HashMap<>(),
-                null, 0L, 0L, true);
+                null, 0L, 0L, true, FileManifest.empty());
         assertEquals(true, SnapshotManifest.fromNbt(done.toNbt()).baselineComplete());
 
         SnapshotManifest notDone = new SnapshotManifest(
                 SnapshotManifest.SCHEMA_VERSION, "id", 1L, 2L,
                 new HashMap<>(), new HashMap<>(), new HashMap<>(),
-                null, 0L, 0L, false);
+                null, 0L, 0L, false, FileManifest.empty());
         assertEquals(false, SnapshotManifest.fromNbt(notDone.toNbt()).baselineComplete());
     }
 
@@ -145,7 +145,7 @@ class SnapshotManifestTest {
         SnapshotManifest m = new SnapshotManifest(
                 SnapshotManifest.SCHEMA_VERSION, "id", 1L, 2L,
                 new HashMap<>(), new HashMap<>(), new HashMap<>(),
-                null, 0L, 0L, true);
+                null, 0L, 0L, true, FileManifest.empty());
         var nbt = m.toNbt();
         nbt.remove("baselineComplete");
         assertFalse(nbt.contains("baselineComplete"), "field removed to simulate old manifest");
@@ -161,7 +161,7 @@ class SnapshotManifestTest {
                 SnapshotManifest.SCHEMA_VERSION,
                 "test", 0L, 0L,
                 new HashMap<>(), new HashMap<>(), new HashMap<>(),
-                null, 0L, 0L, false);
+                null, 0L, 0L, false, FileManifest.empty());
         var nbt = m.toNbt();
         nbt.putInt("version", 999); // 模拟未来 schema
 

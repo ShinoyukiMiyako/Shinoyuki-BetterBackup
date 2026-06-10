@@ -44,6 +44,7 @@ import java.util.Objects;
  *     totalUniqueBytes: long,
  *     deltaBytes: long,
  *     baselineComplete: byte (0/1, 缺字段按 0=false 读, 兼容旧 manifest),
+ *     files: { 相对路径: {h: byte[] hash, s: byte 1 (suspect 才写)} } (Phase D, 缺字段=空),
  * }
  * </pre>
  */
@@ -58,7 +59,8 @@ public record SnapshotManifest(
         Hash levelDat,
         long totalUniqueBytes,
         long deltaBytes,
-        boolean baselineComplete) {
+        boolean baselineComplete,
+        FileManifest files) {
 
     public static final int SCHEMA_VERSION = 1;
 
@@ -73,6 +75,7 @@ public record SnapshotManifest(
     private static final String K_TOTAL_BYTES = "totalUniqueBytes";
     private static final String K_DELTA_BYTES = "deltaBytes";
     private static final String K_BASELINE_COMPLETE = "baselineComplete";
+    private static final String K_FILES = "files";
     private static final String K_POS = "pos";
     private static final String K_HASH = "hash";
 
@@ -81,6 +84,7 @@ public record SnapshotManifest(
         Objects.requireNonNull(chunks, "chunks");
         Objects.requireNonNull(entityChunks, "entityChunks");
         Objects.requireNonNull(savedData, "savedData");
+        Objects.requireNonNull(files, "files");
         // levelDat 允许 null (snapshot 没含 level.dat 时)
     }
 
@@ -96,7 +100,8 @@ public record SnapshotManifest(
                 null,
                 0L,
                 0L,
-                false);
+                false,
+                FileManifest.empty());
     }
 
     public CompoundTag toNbt() {
@@ -114,6 +119,7 @@ public record SnapshotManifest(
         root.putLong(K_TOTAL_BYTES, totalUniqueBytes);
         root.putLong(K_DELTA_BYTES, deltaBytes);
         root.putBoolean(K_BASELINE_COMPLETE, baselineComplete);
+        root.put(K_FILES, files.toNbt());
         return root;
     }
 
@@ -138,7 +144,10 @@ public record SnapshotManifest(
                 levelDat,
                 root.getLong(K_TOTAL_BYTES),
                 root.getLong(K_DELTA_BYTES),
-                root.getBoolean(K_BASELINE_COMPLETE));
+                root.getBoolean(K_BASELINE_COMPLETE),
+                // files: 旧 manifest 无此键, getCompound 返回空 CompoundTag, 解出空 FileManifest,
+                // 等于"该快照没有玩家数据通道", restore 时不回装文件 (跟旧行为一致).
+                FileManifest.fromNbt(root.getCompound(K_FILES)));
     }
 
     /** 写到磁盘 (atomic: tmp + fsync + rename). */

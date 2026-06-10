@@ -179,6 +179,7 @@ public final class StoreGc {
         manifest.chunks().values().forEach(m -> out.addAll(m.values()));
         manifest.entityChunks().values().forEach(m -> out.addAll(m.values()));
         out.addAll(manifest.savedData().values());
+        out.addAll(manifest.files().hashes().values());
         if (manifest.levelDat() != null) {
             out.add(manifest.levelDat());
         }

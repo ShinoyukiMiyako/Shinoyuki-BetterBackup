@@ -76,7 +76,8 @@ class RestoreFlowExternalChunkTest {
                         null,
                         externalObject.length + inlineObject.length,
                         0L,
-                        true);
+                        true,
+                        com.shinoyuki.betterbackup.snapshot.FileManifest.empty());
         manifest.writeTo(snapshotsDir.resolve("snap-ext.manifest"));
 
         WorldPaths paths = new WorldPaths(worldRoot);

@@ -65,6 +65,7 @@ public final class SnapshotCreator implements SnapshotTrigger {
     private final Path storeRoot;
     private final SnapshotFailureMarker failureMarker;
     private final BooleanSupplier baselineCompleteSupplier;
+    private final PlayerDataCollector playerDataCollector;
 
     public SnapshotCreator(ChunkStore store,
                            CurrentSnapshotState state,
@@ -87,6 +88,7 @@ public final class SnapshotCreator implements SnapshotTrigger {
         this.storeRoot = storeRoot;
         this.failureMarker = new SnapshotFailureMarker(storeRoot);
         this.baselineCompleteSupplier = baselineCompleteSupplier;
+        this.playerDataCollector = new PlayerDataCollector(store, paths, hashFunction, writtenThisWindow);
     }
 
     public Path snapshotsDir() {
@@ -121,8 +123,19 @@ public final class SnapshotCreator implements SnapshotTrigger {
         CurrentSnapshotState.Drained drained = state.drainAndClear();
         Hash levelDatHash = hashAndStoreLevelDat();
 
+        // 玩家数据通道与 chunk 同代采集: 失败则整份快照不写盘 (跟磁盘预检同样的"留给下次"语义),
+        // 保证 manifest 里 files 段与 chunk 段始终来自同一时刻, 不出现半套快照.
+        FileManifest files;
+        try {
+            files = playerDataCollector.collect();
+        } catch (IOException e) {
+            LOGGER.error("[BetterBackup] snapshot aborted: player data collection failed", e);
+            recordFailure("player data collection failed: " + e.getMessage());
+            return;
+        }
+
         Optional<SnapshotManifest> previous = findLatestManifest();
-        SnapshotManifest newManifest = build(previous.orElse(null), drained, levelDatHash);
+        SnapshotManifest newManifest = build(previous.orElse(null), drained, levelDatHash, files);
 
         Path target = snapshotsDir.resolve(newManifest.snapshotId() + ".manifest");
         try {
@@ -132,10 +145,12 @@ public final class SnapshotCreator implements SnapshotTrigger {
             int chunkCount = newManifest.chunks().values().stream().mapToInt(Map::size).sum();
             int entityCount = newManifest.entityChunks().values().stream().mapToInt(Map::size).sum();
             LOGGER.info(
-                    "[BetterBackup] snapshot created: {} ({}) chunks={} entity={} savedData={} levelDat={} baselineComplete={}",
+                    "[BetterBackup] snapshot created: {} ({}) chunks={} entity={} savedData={} files={} suspect={} levelDat={} baselineComplete={}",
                     newManifest.snapshotId(), reason,
                     chunkCount, entityCount,
                     newManifest.savedData().size(),
+                    newManifest.files().hashes().size(),
+                    newManifest.files().suspect().size(),
                     newManifest.levelDat() != null,
                     newManifest.baselineComplete());
 
@@ -180,6 +195,7 @@ public final class SnapshotCreator implements SnapshotTrigger {
         manifest.chunks().values().forEach(m -> referenced.addAll(m.values()));
         manifest.entityChunks().values().forEach(m -> referenced.addAll(m.values()));
         referenced.addAll(manifest.savedData().values());
+        referenced.addAll(manifest.files().hashes().values());
         if (manifest.levelDat() != null) {
             referenced.add(manifest.levelDat());
         }
@@ -203,7 +219,8 @@ public final class SnapshotCreator implements SnapshotTrigger {
 
     private SnapshotManifest build(SnapshotManifest previous,
                                    CurrentSnapshotState.Drained drained,
-                                   Hash levelDatHash) {
+                                   Hash levelDatHash,
+                                   FileManifest files) {
         Map<String, Map<Long, Hash>> chunks = deepCopyDimMap(previous != null ? previous.chunks() : Map.of());
         Map<String, Map<Long, Hash>> entityChunks =
                 deepCopyDimMap(previous != null ? previous.entityChunks() : Map.of());
@@ -237,7 +254,8 @@ public final class SnapshotCreator implements SnapshotTrigger {
                 level,
                 0L,  // totalUniqueBytes: Phase 5 metrics commit 接入
                 0L,  // deltaBytes: 同上
-                baselineCompleteSupplier.getAsBoolean());
+                baselineCompleteSupplier.getAsBoolean(),
+                files);
     }
 
     private Optional<SnapshotManifest> findLatestManifest() {
