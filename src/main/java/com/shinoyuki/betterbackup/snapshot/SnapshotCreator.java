@@ -24,6 +24,7 @@ import java.util.HashSet;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BooleanSupplier;
 import java.util.function.LongSupplier;
 import java.util.stream.Stream;
@@ -73,8 +74,7 @@ public final class SnapshotCreator implements SnapshotTrigger {
      * 路径失明, 该快照可能漏采降级窗口内变更的 chunk). 跟 BAS 侧 degraded 同为单向,
      * 恢复语义 = 重启 + 下次启动重扫补采.
      */
-    private final java.util.concurrent.atomic.AtomicBoolean degraded =
-            new java.util.concurrent.atomic.AtomicBoolean(false);
+    private final AtomicBoolean degraded = new AtomicBoolean(false);
 
     public SnapshotCreator(ChunkStore store,
                            CurrentSnapshotState state,
