@@ -5,7 +5,7 @@
 | 状态 | 计划 (2026-06-10), 基于对当前 main (Phase 5 已完成) 的实现审计 |
 | 取代 | 本文件上一版 (greenfield 13 周计划, 写于未察觉开发已进行时, 见 git 历史 4e4002a) |
 | 评审基础 | 三轮评审 (BAS 代码核对 / NBT 与 dedup 技术调研 / 33 个备份方案市场调研) + 本次实现审计 |
-| 估期 | 约 5 周至 v0.1.0 发布门槛 |
+| 估期 | 约 6 周至 v0.1.0 发布门槛 |
 
 ## 一. 实现现状审计 (2026-06-10)
 
@@ -44,6 +44,8 @@ PrometheusExporter -> 用户文档。
 | 3 | 离线恢复 CLI 缺失 | 全库无 main 入口 | 服务端起不来时自定义 store 格式 = 数据绑架 (市场调研最大教训) | P0, 发布阻断 |
 | 4 | fsck / 索引重建缺失 | 无 fsck; manifest 为单点 (store 本身自描述: 文件名 = hash, 可重建) | manifest 损坏即快照不可用 (QuickBackupMulti #51 同类) | P1 |
 | 5 | BAS degraded 感知缺失 | BetterBackup 只有自身启动失败的 degraded; BAS 的 SnapshotPipeline.degraded 是内部单向闩锁且无 API 暴露 | BAS 降级 (worker 死亡) 后 listener 停 fire, BetterBackup 静默失明仍产出"成功"快照 | P1, 需 BAS 侧 API |
+| 6 | 读回撕裂读无防护 | RegionFileSlotReader 只做结构校验 (长度边界), 无 zlib 完整性校验; ChunkBackupTask 读后直接 hash 入库 | 与 vanilla IOWorker 对同一 slot 的原地重写并发时读到新旧混合字节; 垃圾被 hash 入库且 verify/fsck 都查不出 (hash 与垃圾自洽), restore 时该 chunk 损坏 -- 静默备份腐坏, 市场调研中最恶性的故障类 | P0, 发布阻断 |
+| 7 | 超大 chunk (.mcc 外置) 不支持 | io/ 全包无 0x80 compression type 与 .mcc 处理 | 重模组服 (目标用户) 超大 chunk 是常态; 备份只存 slot stub, restore 后外置文件缺失, 该 chunk 数据丢失重生成 | P0, 发布阻断 |
 
 ### 1.3 待核实项 (Phase A 审计完成)
 
@@ -52,44 +54,52 @@ PrometheusExporter -> 用户文档。
 永不删最新 / 先写后删) 在 StoreGc 的落实程度; 快照失败可见性 (incomplete 标记是否
 对 status 可见); store 套娃防护 (store 在 world 内时的检测)。
 
-## 二. 剩余工作计划 (约 5 周)
+## 二. 剩余工作计划 (约 6 周)
 
 ### Phase A: 审计补全 (0.5 周)
 
 1. chore(audit): 核对 §1.3 四项, 产出差距清单, 小缺口随手修 (单独 commit)
 
-### Phase B: baseline 全量扫描 (1.5 周)
+### Phase B: 读回路径加固 (1 周)
 
-2. feat(baseline): 限速遍历全维度 region/entities mca (默认 50 chunk/s 可配),
+2. feat(io): readSlot 读后 zlib inflate 完整性校验 (撕裂读防御), 失败重 mark dirty
+   延后重试; 读前后 header entry 比对, 防两步读之间 chunk 搬迁的竞态
+3. feat(io): .mcc 超大 chunk 支持 -- reader 识别 compression type 0x80 位并读外置
+   c.<x>.<z>.mcc 文件; RegionFileSlotWriter / RestoreFlow 回写 stub + .mcc
+4. test(io): 注入新旧混合字节的撕裂读必须被拒并重试 + .mcc round-trip 字节比对
+
+### Phase C: baseline 全量扫描 (1.5 周)
+
+5. feat(baseline): 限速遍历全维度 region/entities mca (默认 50 chunk/s 可配),
    逐 slot 读 raw bytes 入 store, 进度按 region 文件粒度持久化, 断点续传
-3. feat(baseline): manifest 增加 baselineComplete 标志; 未完成时 restore 命令拒绝
+6. feat(baseline): manifest 增加 baselineComplete 标志; 未完成时 restore 命令拒绝
    并提示进度; status 展示扫描进度
-4. test(baseline): 断点续传 + 与活跃 dirty 路径并发时跳过已入队 chunk
+7. test(baseline): 断点续传 + 与活跃 dirty 路径并发时跳过已入队 chunk
 
-### Phase C: 玩家数据通道 (1 周)
+### Phase D: 玩家数据通道 (1 周)
 
-5. feat(files): playerdata/ stats/ advancements/ poi/ 在 snapshot 创建时与 chunk
+8. feat(files): playerdata/ stats/ advancements/ poi/ 在 snapshot 创建时与 chunk
    同代采集 (整文件 hash 入同一 store), manifest 增加 files 段; 撕裂读重试 3 次,
    仍不一致标 suspect
-6. feat(restore): RestoreFlow 回装 files 段, 与 region 同一原子边界
-7. test(files): 同快照一致性 round-trip (FTB2 #95 回归防护) + suspect 标记路径
+9. feat(restore): RestoreFlow 回装 files 段, 与 region 同一原子边界
+10. test(files): 同快照一致性 round-trip (FTB2 #95 回归防护) + suspect 标记路径
 
-### Phase D: 离线 CLI + fsck (1.5 周)
+### Phase E: 离线 CLI + fsck (1.5 周)
 
-8. feat(cli): java -jar 双模式入口, list/info/verify/restore 四命令;
-   CLI 代码路径零 net.minecraft/forge import (RegionFileSlotReader/Writer 已独立, 直接复用)
-9. feat(fsck): store 扫描校验 (重 hash 对比文件名) + 从 store 重建快照索引
-10. feat(cli): 接入 fsck 子命令 (--rebuild-index)
-11. test(cli): 备份目录拷贝到干净环境, CLI restore round-trip 逐 slot 字节比对
+11. feat(cli): java -jar 双模式入口, list/info/verify/restore 四命令;
+    CLI 代码路径零 net.minecraft/forge import (RegionFileSlotReader/Writer 已独立, 直接复用)
+12. feat(fsck): store 扫描校验 (重 hash 对比文件名 + zlib 完整性) + 从 store 重建快照索引
+13. feat(cli): 接入 fsck 子命令 (--rebuild-index)
+14. test(cli): 备份目录拷贝到干净环境, CLI restore round-trip 逐 slot 字节比对
 
-### Phase E: BAS degraded 感知 (0.5 周, 跨仓库)
+### Phase F: BAS degraded 感知 (0.5 周, 跨仓库)
 
-12. BAS: feat(api): PipelineStateListener (onDegraded), triggerDegraded 时 fire
+15. BAS: feat(api): PipelineStateListener (onDegraded), triggerDegraded 时 fire
     (BAS degraded 是单向闩锁无复位路径, 不设 onRecovered, 恢复语义 = 重启)
-13. BAS: chore(release): 发布含该 API 的版本; BetterBackup bas_version 升至该版本
-14. feat(lifecycle): onDegraded -> 暂停快照 + 后续快照标 incomplete + 会话标志持久化;
+16. BAS: chore(release): 发布含该 API 的版本; BetterBackup bas_version 升至该版本
+17. feat(lifecycle): onDegraded -> 暂停快照 + 后续快照标 incomplete + 会话标志持久化;
     下次启动对 mtime 晚于上次完整快照的 region 做增量重扫 (复用 baseline 机制) 补采
-15. test(lifecycle): 降级窗口 chunk 经重扫进入下一快照; 降级期间快照带 incomplete
+18. test(lifecycle): 降级窗口 chunk 经重扫进入下一快照; 降级期间快照带 incomplete
 
 ## 三. v0.1.0 发布门槛 (Definition of Done)
 
@@ -100,6 +110,8 @@ PrometheusExporter -> 用户文档。
 5. §1.3 待核实项全部闭环 (落实或明确记为已知限制)
 6. 文档: dedup 率按服务器规模分档披露; 已知限制 (绕过 vanilla save 路径的 mod
    不被感知; 已加载 chunk 无跨 save dedup)
+7. 读回路径: 撕裂读注入测试通过 (垃圾字节不得入库), .mcc chunk 备份恢复
+   round-trip 字节一致
 
 ## 四. 明确接受的取舍 (记录在案, 不再反复)
 
