@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | 计划 (2026-06-10), 基于对当前 main (Phase 5 已完成) 的实现审计 |
+| 状态 | 已执行 (2026-06-10): Phase A-F 共 20 commits 落地, 155 测试全绿, 发布门槛 7 条代码侧全部闭环 |
 | 取代 | 本文件上一版 (greenfield 13 周计划, 写于未察觉开发已进行时, 见 git 历史 4e4002a) |
 | 评审基础 | 三轮评审 (BAS 代码核对 / NBT 与 dedup 技术调研 / 33 个备份方案市场调研) + 本次实现审计 |
 | 估期 | 约 6 周至 v0.1.0 发布门槛 |
@@ -121,6 +121,10 @@ PrometheusExporter -> 用户文档。
 3. entity chunk 无特殊处理: 同 raw-bytes 路径, 接受其 dedup 率更低
 4. 备份时机与 vanilla autosave 不协调 (partial-snapshot 风险): 沿用 DESIGN.md
    附录 C #4 的结论, v0.2 再议
+5. compression type 3 (未压缩) chunk 的撕裂读检测盲区: 无压缩校验和可验, 等长原地
+   覆写又逃过 header 比对。vanilla 1.20.1 默认写 type-2 (zlib), type-3 几乎不落盘, 接受
+6. 非主世界 poi 不入快照: 采集侧只取主世界级 poi/, 下界/末地 poi 恢复后由 vanilla
+   懒重建, 不丢玩法数据, 接受
 
 ## 五. v0.2 候选 (按用户反馈排序)
 
@@ -130,3 +134,5 @@ PrometheusExporter -> 用户文档。
    主要优化空间; 上一版计划 §2.1/2.2 的设计细节在此复用
 2. 单 chunk / 单维度恢复 (调研显示是 AromaBackup 最受欢迎特性, Textile #10 求了六年)
 3. protected 快照 + JSON 索引导出接第三方恢复 GUI
+4. 版本上推 1.20.5+/1.21+ 时的移植地雷: ChunkPayloadCodec 必须补 LZ4 (type 4) 分支,
+   否则该版本所有 LZ4 chunk 被误判撕裂读、重试耗尽后丢弃 = 静默数据丢失

@@ -45,7 +45,7 @@ BetterBackup 的解法：
 - Minecraft 1.20.1
 - Minecraft Forge 47.3.22+
 - Java 17 (Eclipse Temurin)
-- **必装**：[Shinoyuki-BetterAutoSave](https://github.com/xiaoxiao-cvs/Shinoyuki-BetterAutoSave) v0.9.0+（BetterBackup 通过 BAS Listener API 接收 chunk save 事件）
+- **必装**：[Shinoyuki-BetterAutoSave](https://github.com/xiaoxiao-cvs/Shinoyuki-BetterAutoSave) v0.10.0+（BetterBackup 通过 BAS Listener API 接收 chunk save 事件，并依赖 v0.10.0 新增的管线降级通知）
 
 把 `shinoyuki_betterbackup-0.1.0-all.jar`（带 `-all` 后缀的，包内嵌了哈希库）放进 `mods/`，启动后配置文件生成在 `config/Shinoyuki-Optimize/shinoyuki_betterbackup/common.toml`。
 
@@ -108,9 +108,25 @@ BetterBackup 的解法：
   [其他 mod 正常启动]
 ```
 
-恢复时**会保留你当前 world**：把 `region/`, `entities/`, `data/`, `level.dat` 等移到 `<worldRoot>.bak-<timestamp>/`，按备份重建。如果恢复出问题可以从 `.bak` 目录手动复原。
+恢复时**会保留你当前 world**：把 `region/`, `entities/`, `data/`, `level.dat`, `playerdata/` 等移到 `<worldRoot>.bak-<timestamp>/`，按备份重建。玩家背包/成就/统计跟世界回到**同一份快照**，不会出现回档后背包跟世界对不上的刷物品问题。如果恢复出问题可以从 `.bak` 目录手动复原。
 
 恢复失败（备份 store 数据缺失等）log ERROR 但**不阻止服务端启动**，flag 不删，玩家修复后重启会再跑一次。
+
+**首次基线扫描**：装上 mod 后第一次启动会在后台限速扫描整个现有世界（默认 50 chunk/s），把已有地图全部纳入基线。基线完成前 restore 会被拒绝（否则恢复出来的世界缺一大块），`/betterbackup status` 能看扫描进度。
+
+### 服务端起不来时：离线 CLI
+
+mod jar 可以直接当命令行工具跑（不需要 Minecraft / Forge，裸 JRE 17 即可），服务端瘫痪时照样能从备份自救：
+
+```bash
+java -jar shinoyuki_betterbackup-0.1.0-all.jar list    --store <备份目录>
+java -jar shinoyuki_betterbackup-0.1.0-all.jar info    --store <备份目录> --id <快照ID>
+java -jar shinoyuki_betterbackup-0.1.0-all.jar verify  --store <备份目录> [--id <快照ID>]
+java -jar shinoyuki_betterbackup-0.1.0-all.jar restore --store <备份目录> --id <快照ID> --world <world目录>
+java -jar shinoyuki_betterbackup-0.1.0-all.jar fsck    --store <备份目录> [--rebuild-index]
+```
+
+CLI restore 只能在服务端**已停止**时使用：先把现有 world 移到 `.bak-<时间戳>/` 再按备份重建。`fsck --rebuild-index` 用于快照索引损坏时从 store 重建。
 
 ## 性能预期
 
@@ -132,8 +148,10 @@ dedup 率取决于"已加载 chunk / 总世界"比例：
 
 ## 数据安全
 
-- **不动 world/**：备份期间整套是只读读取 `.mca` 文件 + 写入 `backup-store/`
-- **没 restore 不会动 world**：restore 命令需要写 flag + 玩家手动停服才会执行
+- **备份不动 world/**：备份期间整套是只读读取 `.mca` 文件 + 写入 `backup-store/`
+- **只有 restore 会写 world**：游戏内 restore 需要写 flag + 手动停服后重启才执行；离线 CLI restore 直接重建 world（先把现有 world 移到 `.bak`），仅限停服状态使用
+- **坏数据进不了备份**：从磁盘读 chunk 时做完整性校验，撞上正在写入的半截数据会被拦下重试，不会把垃圾字节存进备份
+- **BAS 降级不静默**：BAS 后台 worker 异常降级时自动暂停备份、把后续快照标记为不完整，重启后自动补采降级窗口内的变化
 - **关服自动备份**：服务端正常停止时会跑一次 final snapshot，确保关服前所有变化都进备份
 - **kill -9 容错**：所有写入用 `tmp + fsync + atomic rename`，进程被强杀不会留半写文件污染 store；启动时自动清理 `.tmp` 残留
 - **损坏 manifest 不会误删 store**：全量 GC 遇到读不出的 manifest 直接 abort，不会把它引用的 hash 当孤儿删掉
@@ -143,7 +161,9 @@ dedup 率取决于"已加载 chunk / 总世界"比例：
 - **必须装 BAS**：BetterBackup 通过 BAS 的 Listener API 接收 chunk save 事件。卸载 BAS 后 BetterBackup 启动失败
 - **跟其他备份 mod 共存浪费空间**：理论上能并行跑，但 backup-store 跟 zip 备份会同时占用，建议二选一
 - **MVP 阶段 SavedData 假设在 overworld**：BAS Listener 不带 dimension 信息（API 限制），目前 SavedData 备份只看 `world/data/`。多维度自定义 SavedData 的 mod (极少见) 不完全覆盖，v0.2 跟随 BAS API 升级修复
-- **Restore 不恢复 playerdata / advancements**：仅恢复 chunk 数据 + level.dat。玩家进度数据 vanilla 跟 chunk 数据写在不同目录，独立处理（如果需要可以 rsync `world/playerdata/`）
+- **已加载 chunk 没有跨备份去重**：活跃区域的 chunk 每次保存字节都会变（vanilla 会更新时间戳字段），每份快照都会存一个新版本。节省空间的大头来自未加载区域——这就是上面性能表按服务器规模分档的原因
+- **绕过 vanilla 保存路径的 mod 不被感知**：极少数直接写 region 文件的 mod，其改动不会进备份
+- **非主世界的 poi 不在备份范围**：下界/末地的 `poi/`（村民工作点位缓存）恢复后由 vanilla 自动重建，不影响玩法数据
 - **store 路径在 NFS / SMB 上未测**：理论上能跑但锁语义不一致，性能差，建议本地磁盘
 
 ## 构建
@@ -162,7 +182,7 @@ cd Shinoyuki-BetterBackup
 #   shinoyuki_betterbackup-0.1.0.jar         <- 缺哈希库, 别用
 ```
 
-测试：`./gradlew test`（跑 ChunkStore / Hash / RetentionPolicy / StoreGc / SnapshotManifest / RegionFile round-trip 共 70+ 个单元测试）。
+测试：`./gradlew test`（store / 快照 / GC / 撕裂读 / baseline / 玩家数据 / CLI / 降级补采等共 155 个单元测试）。
 
 dev server 测试（不需要装 client）：`./gradlew runServer`，进 server console 跑 `/op <你的名字>` 然后用 client 连 localhost。
 
