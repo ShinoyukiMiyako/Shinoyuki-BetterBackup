@@ -156,6 +156,45 @@ class SnapshotManifestTest {
     }
 
     @Test
+    void incomplete_round_trips_both_values() {
+        SnapshotManifest degraded = new SnapshotManifest(
+                SnapshotManifest.SCHEMA_VERSION, "id", 1L, 2L,
+                new HashMap<>(), new HashMap<>(), new HashMap<>(),
+                null, 0L, 0L, false, FileManifest.empty(), true);
+        assertEquals(true, SnapshotManifest.fromNbt(degraded.toNbt()).incomplete());
+
+        SnapshotManifest normal = new SnapshotManifest(
+                SnapshotManifest.SCHEMA_VERSION, "id", 1L, 2L,
+                new HashMap<>(), new HashMap<>(), new HashMap<>(),
+                null, 0L, 0L, false, FileManifest.empty(), false);
+        assertEquals(false, SnapshotManifest.fromNbt(normal.toNbt()).incomplete());
+    }
+
+    @Test
+    void legacy_manifest_without_incomplete_field_reads_as_false() {
+        // 旧 manifest (12 参构造, 无 incomplete 键): fromNbt 必须按 false 读 (非降级正常快照)
+        SnapshotManifest m = new SnapshotManifest(
+                SnapshotManifest.SCHEMA_VERSION, "id", 1L, 2L,
+                new HashMap<>(), new HashMap<>(), new HashMap<>(),
+                null, 0L, 0L, false, FileManifest.empty());
+        var nbt = m.toNbt();
+        nbt.remove("incomplete");
+        assertFalse(nbt.contains("incomplete"), "field removed to simulate old manifest");
+
+        assertEquals(false, SnapshotManifest.fromNbt(nbt).incomplete(),
+                "missing incomplete must default to false (old snapshot = not degraded)");
+    }
+
+    @Test
+    void twelve_arg_constructor_defaults_incomplete_to_false() {
+        SnapshotManifest m = new SnapshotManifest(
+                SnapshotManifest.SCHEMA_VERSION, "id", 1L, 2L,
+                new HashMap<>(), new HashMap<>(), new HashMap<>(),
+                null, 0L, 0L, true, FileManifest.empty());
+        assertFalse(m.incomplete(), "12-arg 兼容构造器 incomplete 默认 false");
+    }
+
+    @Test
     void unsupported_schema_version_rejected() {
         SnapshotManifest m = new SnapshotManifest(
                 SnapshotManifest.SCHEMA_VERSION,
