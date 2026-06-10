@@ -1,5 +1,6 @@
 package com.shinoyuki.betterbackup.snapshot;
 
+import com.shinoyuki.betterbackup.baseline.BaselineProgress;
 import com.shinoyuki.betterbackup.diagnostic.BetterBackupMetrics;
 import com.shinoyuki.betterbackup.io.WorldPaths;
 import com.shinoyuki.betterbackup.safety.SnapshotFailureMarker;
@@ -36,7 +37,7 @@ class SnapshotCreatorMarkerTest {
         HashFunction hashFunction = new Xxh128HashFunction();
         Set<Hash> writtenThisWindow = ConcurrentHashMap.newKeySet();
         return new SnapshotCreator(store, state, paths, hashFunction, storeRoot,
-                () -> 0L, writtenThisWindow, metrics, () -> false);
+                () -> 0L, writtenThisWindow, metrics, new BaselineProgress(storeRoot), () -> false);
     }
 
     @Test
@@ -80,7 +81,7 @@ class SnapshotCreatorMarkerTest {
         WorldPaths paths = new WorldPaths(worldRoot);
         SnapshotCreator creator = new SnapshotCreator(store, state, paths,
                 new Xxh128HashFunction(), storeRoot, () -> 0L,
-                ConcurrentHashMap.newKeySet(), metrics, () -> false);
+                ConcurrentHashMap.newKeySet(), metrics, new BaselineProgress(storeRoot), () -> false);
 
         creator.create("test");
 

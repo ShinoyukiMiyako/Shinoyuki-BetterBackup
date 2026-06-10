@@ -1,5 +1,6 @@
 package com.shinoyuki.betterbackup.integration;
 
+import com.shinoyuki.betterbackup.baseline.BaselineProgress;
 import com.shinoyuki.betterbackup.diagnostic.BetterBackupMetrics;
 import com.shinoyuki.betterbackup.io.WorldPaths;
 import com.shinoyuki.betterbackup.schedule.SnapshotScheduler;
@@ -49,7 +50,7 @@ class PipelineDegradedHandlerTest {
         WorldPaths paths = new WorldPaths(worldRoot);
         Set<Hash> written = ConcurrentHashMap.newKeySet();
         return new SnapshotCreator(store, state(), paths, new Xxh128HashFunction(), storeRoot,
-                () -> 0L, written, new BetterBackupMetrics(), () -> true);
+                () -> 0L, written, new BetterBackupMetrics(), new BaselineProgress(storeRoot), () -> false);
     }
 
     private CurrentSnapshotState state() {

@@ -29,32 +29,33 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * BaselineScanner 全量扫描测试. 不打桩 store / reader / WorldPaths, 用真实 .mca 文件
- * (RegionFileSlotWriter + 真实 zlib payload), 断言具体业务结果:
- * <ul>
- *   <li>每个磁盘上的 chunk slot 都按字节入 store, 并登记进 CurrentSnapshotState</li>
- *   <li>断点续传: 已记录完成的 region 不重复入库 (用 store.put 计数核对)</li>
- *   <li>并发跳过: 已在 CurrentSnapshotState 的 chunk (模拟活跃 dirty 路径) baseline 跳过</li>
- *   <li>撕裂读: 坏 zlib 的 slot 不入库, 该 region 多轮重扫后兜底标完成</li>
- *   <li>完成后写 complete 标记</li>
- * </ul>
+ * BaselineScanner 全量扫描 *机制* 测试 (入库 / 登记 state / 续传跳过 committed / 撕裂读 /
+ * dirty 跳过). 不打桩 store / reader / WorldPaths, 用真实 .mca 文件 + 真实 zlib payload.
  *
- * <p>判定标准: 删掉 scanRegionFile 的入库逻辑或跳过判定, 对应断言必挂.
+ * <p>这些用例只验证"扫描行为", 不验证"提交 / 写 complete 标记" (那是事务性提交语义, 由
+ * {@link BaselineCommitTest} 用 scanner + SnapshotCreator 全链路覆盖). 故 onScanFinished
+ * 注入 no-op, scan() 不触发快照 drain, 扫描后 state 仍可被本测试直接断言.
+ *
+ * <p>判定标准: 删掉 scanRegionFile 的入库逻辑或"续传只跳过 committed"判定, 对应断言必挂。
  */
 class BaselineScannerTest {
 
     private static final int SECTOR_BYTES = 4096;
     private static final int LENGTH_HEADER_BYTES = 4;
+    private static final String DIM = "minecraft:overworld";
+
+    /** no-op 收尾回调: 本测试只看扫描机制, 不让 scan() 触发快照把 state drain 掉. */
+    private static final Runnable NO_FINISH = () -> { };
 
     private BaselineScanner newScanner(Path storeRoot, Path worldRoot,
                                        CurrentSnapshotState state, Set<Hash> written,
-                                       BaselineProgress progress) throws IOException {
+                                       BaselineProgress progress, Runnable onScanFinished) throws IOException {
         ChunkStore store = new ChunkStore(storeRoot);
         store.initialize();
         WorldPaths paths = new WorldPaths(worldRoot);
         HashFunction hashFunction = new Xxh128HashFunction();
         return new BaselineScanner(store, state, paths, hashFunction, written, progress,
-                BaselineScanner.RateLimiter.NONE);
+                BaselineScanner.RateLimiter.NONE, onScanFinished);
     }
 
     /** 在 dim 的 region/ 写一个 region 文件, slot (localX,localZ) -> 明文. 返回写入的 raw payload. */
@@ -91,24 +92,25 @@ class BaselineScannerTest {
         CurrentSnapshotState state = new CurrentSnapshotState();
         Set<Hash> written = ConcurrentHashMap.newKeySet();
         BaselineProgress progress = new BaselineProgress(storeRoot);
-        BaselineScanner scanner = newScanner(storeRoot, worldRoot, state, written, progress);
+        BaselineScanner scanner = newScanner(storeRoot, worldRoot, state, written, progress, NO_FINISH);
 
         BaselineScanner.Result result = scanner.scan();
 
-        assertTrue(result.complete());
         assertEquals(3, result.stored(), "all 3 occupied slots stored");
         // 每个 chunk 都登记进 state, 且 store 里按 hash 取回的字节 == 写入的 raw payload
         ChunkStore readBack = new ChunkStore(storeRoot);
         HashFunction hf = new Xxh128HashFunction();
         assertEquals(3, state.chunkCount(), "every scanned chunk registered in CurrentSnapshotState");
         for (Map.Entry<Long, byte[]> e : expected.entrySet()) {
-            assertTrue(state.containsChunk("minecraft:overworld", e.getKey()),
+            assertTrue(state.containsChunk(DIM, e.getKey()),
                     "state must contain chunk packed=" + e.getKey());
             Hash h = hf.hash(e.getValue());
             assertTrue(readBack.has(h), "store must contain hash for chunk packed=" + e.getKey());
             assertArrayEquals(e.getValue(), readBack.get(h), "stored bytes must equal raw slot payload");
         }
-        assertTrue(progress.isComplete(), "complete marker written after full sweep");
+        // 扫完只记 scanned (待提交), 不立即 committed -- 提交要等快照 drain 进 manifest.
+        assertEquals(0, progress.committedRegionCount(), "region only scanned, not yet committed");
+        assertFalse(progress.isComplete(), "no complete marker without a committing snapshot");
     }
 
     @Test
@@ -121,7 +123,7 @@ class BaselineScannerTest {
         CurrentSnapshotState state = new CurrentSnapshotState();
         Set<Hash> written = ConcurrentHashMap.newKeySet();
         BaselineProgress progress = new BaselineProgress(storeRoot);
-        BaselineScanner scanner = newScanner(storeRoot, worldRoot, state, written, progress);
+        BaselineScanner scanner = newScanner(storeRoot, worldRoot, state, written, progress, NO_FINISH);
 
         BaselineScanner.Result result = scanner.scan();
 
@@ -131,35 +133,62 @@ class BaselineScannerTest {
     }
 
     @Test
-    void resume_does_not_rescan_completed_regions(@TempDir Path base) throws IOException {
+    void resume_rescans_scanned_but_skips_committed_regions(@TempDir Path base) throws IOException {
         Path storeRoot = base.resolve("store");
         Path worldRoot = base.resolve("world");
         // 两个 region 文件, 各两个 chunk
         writeRegion(worldRoot, "region", 0, 0, Map.of(0, "a".getBytes(), 1, "b".getBytes()));
         writeRegion(worldRoot, "region", 1, 0, Map.of(0, "c".getBytes(), 1, "d".getBytes()));
 
-        // 模拟"上次扫描已完成 r.0.0.mca 后中断": 预置进度记录该 region 完成, 但不写 complete
+        // 模拟"上次扫描已 COMMITTED r.0.0.mca 后中断": 预置 scanned 再晋升 committed.
+        // 只有 committed 的 region 续传才跳过; 若 r.0.0 只是 scanned-未提交, 它会被重扫.
         BaselineProgress pre = new BaselineProgress(storeRoot);
         pre.load();
-        pre.markRegionDone(BaselineProgress.CHANNEL_REGION, "minecraft:overworld", "r.0.0.mca");
+        pre.markRegionScanned(BaselineProgress.CHANNEL_REGION, DIM, "r.0.0.mca");
+        pre.promoteScannedToCommitted(Set.of(BaselineProgress.CHANNEL_REGION + "\t" + DIM + "\t" + "r.0.0.mca"));
 
         CurrentSnapshotState state = new CurrentSnapshotState();
         Set<Hash> written = ConcurrentHashMap.newKeySet();
         BaselineProgress progress = new BaselineProgress(storeRoot);
-        BaselineScanner scanner = newScanner(storeRoot, worldRoot, state, written, progress);
+        BaselineScanner scanner = newScanner(storeRoot, worldRoot, state, written, progress, NO_FINISH);
 
         BaselineScanner.Result result = scanner.scan();
 
-        // 续传: 只扫 r.1.0.mca 的两个 chunk, r.0.0 整文件跳过不重新读取入库.
-        // 若忽略 isRegionDone, r.0.0 的 chunk 会被重新登记进 state, chunkCount 变 4.
+        // 续传: 只扫 r.1.0.mca 的两个 chunk, r.0.0 (committed) 整文件跳过不重新读取入库.
+        // 若把跳过判定改成 isRegionScanned 或忽略 committed 区分, r.0.0 的 chunk 会被重新
+        // 登记进 state, chunkCount 变 4.
         assertEquals(2, result.stored());
         assertEquals(2, state.chunkCount(), "only the resumed region's chunks registered this run");
         // r.1.0.mca 的 chunk 是 (32,0) 与 (33,0)
-        assertTrue(state.containsChunk("minecraft:overworld", ChunkPos.asLong(32, 0)));
-        assertTrue(state.containsChunk("minecraft:overworld", ChunkPos.asLong(33, 0)));
-        assertFalse(state.containsChunk("minecraft:overworld", ChunkPos.asLong(0, 0)),
-                "already-done region's chunk must not be re-registered");
-        assertTrue(progress.isComplete());
+        assertTrue(state.containsChunk(DIM, ChunkPos.asLong(32, 0)));
+        assertTrue(state.containsChunk(DIM, ChunkPos.asLong(33, 0)));
+        assertFalse(state.containsChunk(DIM, ChunkPos.asLong(0, 0)),
+                "already-committed region's chunk must not be re-registered");
+    }
+
+    @Test
+    void scanned_but_uncommitted_region_is_rescanned_on_resume(@TempDir Path base) throws IOException {
+        // 崩溃窗口的核心治愈路径 (单元粒度): 上次只把 region 记成 scanned (未提交) 就崩了,
+        // 续传 (全新 state) 必须重扫它, 把登记重新放回 state, 否则该 region 的 chunk 永远丢.
+        Path storeRoot = base.resolve("store");
+        Path worldRoot = base.resolve("world");
+        writeRegion(worldRoot, "region", 0, 0, Map.of(0, "x".getBytes(), 1, "y".getBytes()));
+
+        BaselineProgress pre = new BaselineProgress(storeRoot);
+        pre.load();
+        pre.markRegionScanned(BaselineProgress.CHANNEL_REGION, DIM, "r.0.0.mca"); // 只 scanned, 没晋升
+
+        CurrentSnapshotState freshState = new CurrentSnapshotState();
+        Set<Hash> written = ConcurrentHashMap.newKeySet();
+        BaselineProgress progress = new BaselineProgress(storeRoot);
+        BaselineScanner scanner = newScanner(storeRoot, worldRoot, freshState, written, progress, NO_FINISH);
+
+        BaselineScanner.Result result = scanner.scan();
+
+        assertEquals(2, result.stored(), "scanned-but-uncommitted region must be rescanned, not skipped");
+        assertEquals(2, freshState.chunkCount(), "rescan re-registers the lost chunks into fresh state");
+        assertTrue(freshState.containsChunk(DIM, ChunkPos.asLong(0, 0)));
+        assertTrue(freshState.containsChunk(DIM, ChunkPos.asLong(1, 0)));
     }
 
     @Test
@@ -171,11 +200,11 @@ class BaselineScannerTest {
         CurrentSnapshotState state = new CurrentSnapshotState();
         // 活跃 dirty 路径已采过 chunk (0,0), 登记了一个跟磁盘不同的 hash (模拟更新的字节)
         Hash dirtyHash = new Hash(new byte[]{(byte) 0xAB, 1, 2, 3});
-        state.putChunk("minecraft:overworld", ChunkPos.asLong(0, 0), dirtyHash);
+        state.putChunk(DIM, ChunkPos.asLong(0, 0), dirtyHash);
 
         Set<Hash> written = ConcurrentHashMap.newKeySet();
         BaselineProgress progress = new BaselineProgress(storeRoot);
-        BaselineScanner scanner = newScanner(storeRoot, worldRoot, state, written, progress);
+        BaselineScanner scanner = newScanner(storeRoot, worldRoot, state, written, progress, NO_FINISH);
 
         BaselineScanner.Result result = scanner.scan();
 
@@ -185,12 +214,12 @@ class BaselineScannerTest {
         CurrentSnapshotState.Drained drained = state.drainAndClear();
         assertEquals(dirtyHash,
                 drained.chunks().get(new com.shinoyuki.betterbackup.snapshot.DimChunkKey(
-                        "minecraft:overworld", ChunkPos.asLong(0, 0))),
+                        DIM, ChunkPos.asLong(0, 0))),
                 "baseline must not overwrite the active dirty path's newer hash");
     }
 
     @Test
-    void torn_read_slot_not_stored_region_still_completes(@TempDir Path base) throws IOException {
+    void torn_read_slot_not_stored_region_still_reaches_scanned(@TempDir Path base) throws IOException {
         Path storeRoot = base.resolve("store");
         Path worldRoot = base.resolve("world");
         // 两个 chunk: 一个正常, 一个写完后破坏 zlib 尾部制造撕裂读. 损坏的 chunk 用较大
@@ -210,7 +239,7 @@ class BaselineScannerTest {
         CurrentSnapshotState state = new CurrentSnapshotState();
         Set<Hash> written = ConcurrentHashMap.newKeySet();
         BaselineProgress progress = new BaselineProgress(storeRoot);
-        BaselineScanner scanner = newScanner(storeRoot, worldRoot, state, written, progress);
+        BaselineScanner scanner = newScanner(storeRoot, worldRoot, state, written, progress, NO_FINISH);
 
         BaselineScanner.Result result = scanner.scan();
 
@@ -218,12 +247,13 @@ class BaselineScannerTest {
         assertEquals(1, result.stored(), "only the non-torn chunk is stored, garbage rejected");
         assertEquals(1, state.chunkCount());
         long goodPacked = ChunkPos.asLong(0, 0);
-        assertTrue(state.containsChunk("minecraft:overworld", goodPacked));
-        assertFalse(state.containsChunk("minecraft:overworld", ChunkPos.asLong(1, 0)),
+        assertTrue(state.containsChunk(DIM, goodPacked));
+        assertFalse(state.containsChunk(DIM, ChunkPos.asLong(1, 0)),
                 "corrupted chunk must not be registered");
-        // 多轮重扫后兜底: 仍标 complete (撕裂 chunk 留给活跃 dirty 路径), 不永久阻塞 baseline
-        assertTrue(result.complete(), "scan must finish even with a persistently torn slot");
-        assertTrue(progress.isComplete());
+        // 多轮重扫后兜底: 持续撕裂的 region 仍在最后一轮被记为 scanned (留给活跃 dirty 路径),
+        // 不永久阻塞 baseline; 但它只是 scanned-待提交, 不会越过提交直接 committed.
+        assertEquals(1, progress.completedRegionCount(), "persistently torn region still reaches scanned");
+        assertEquals(0, progress.committedRegionCount());
     }
 
     @Test
@@ -234,12 +264,13 @@ class BaselineScannerTest {
 
         BaselineProgress pre = new BaselineProgress(storeRoot);
         pre.load();
-        pre.markComplete();
+        // 无 region 时 markCompleteIfAllCommitted(true) 写下标记 (空集全 committed 成立)
+        assertTrue(pre.markCompleteIfAllCommitted(true));
 
         CurrentSnapshotState state = new CurrentSnapshotState();
         Set<Hash> written = ConcurrentHashMap.newKeySet();
         BaselineProgress progress = new BaselineProgress(storeRoot);
-        BaselineScanner scanner = newScanner(storeRoot, worldRoot, state, written, progress);
+        BaselineScanner scanner = newScanner(storeRoot, worldRoot, state, written, progress, NO_FINISH);
 
         BaselineScanner.Result result = scanner.scan();
 
