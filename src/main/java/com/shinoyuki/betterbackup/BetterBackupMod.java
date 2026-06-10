@@ -12,6 +12,7 @@ import com.shinoyuki.betterbackup.integration.BackupListenerBridge;
 import com.shinoyuki.betterbackup.io.WorldPaths;
 import com.shinoyuki.betterbackup.restore.PendingRestoreFlag;
 import com.shinoyuki.betterbackup.restore.RestoreFlow;
+import com.shinoyuki.betterbackup.safety.StoreLocationCheck;
 import com.shinoyuki.betterbackup.schedule.IntervalScheduler;
 import com.shinoyuki.betterbackup.schedule.ManualScheduler;
 import com.shinoyuki.betterbackup.schedule.SnapshotScheduler;
@@ -177,6 +178,16 @@ public final class BetterBackupMod {
         try {
             Path worldRoot = event.getServer().getWorldPath(LevelResource.ROOT);
             Path storeRoot = resolveStoreRoot(BetterBackupConfig.backupDirectory());
+
+            // store 套娃防护: store 在 world 内会被备份递归吞掉, 且 restore 时
+            // moveCurrentWorldToBackup 会连 store 一起搬走自毁备份. 命中告警不 abort,
+            // 决策权留给服主, 但必须让其在日志里可见.
+            if (StoreLocationCheck.isNestedInWorld(storeRoot, worldRoot)) {
+                LOGGER.error("[BetterBackup] backupDirectory ({}) is INSIDE the world directory ({}). "
+                                + "This is unsafe: backups will recursively include the store, and a restore "
+                                + "will move the store away with the old world. Move backupDirectory outside world/.",
+                        storeRoot, worldRoot);
+            }
 
             ChunkStore store = new ChunkStore(storeRoot);
             store.initialize();
