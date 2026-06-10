@@ -136,3 +136,6 @@ PrometheusExporter -> 用户文档。
 3. protected 快照 + JSON 索引导出接第三方恢复 GUI
 4. 版本上推 1.20.5+/1.21+ 时的移植地雷: ChunkPayloadCodec 必须补 LZ4 (type 4) 分支,
    否则该版本所有 LZ4 chunk 被误判撕裂读、重试耗尽后丢弃 = 静默数据丢失
+5. CLI gc 子命令: 对 rsync 出去的归档副本做离线保留修剪。生产需求来源: NAS 长尾归档
+   模式 (rsync 不带 --delete, 本地短窗口 + NAS 深历史) 目前没有任何手段修剪 NAS 侧,
+   只能无限增长
