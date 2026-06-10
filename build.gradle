@@ -120,7 +120,10 @@ jar {
             'Implementation-Title'    : project.name,
             'Implementation-Version'  : project.jar.archiveVersion,
             'Implementation-Vendor'   : mod_authors,
-            'Implementation-Timestamp': new Date().format("yyyy-MM-dd'T'HH:mm:ssZ")
+            'Implementation-Timestamp': new Date().format("yyyy-MM-dd'T'HH:mm:ssZ"),
+            // 双模式入口: FML 按 mods.toml 加载 mod 时忽略 Main-Class, 但 `java -jar`
+            // 会用它跑离线 CLI (PLAN Phase E). 两条路径互不干扰.
+            'Main-Class'              : 'com.shinoyuki.betterbackup.cli.BackupCli'
         ])
     }
     finalizedBy 'reobfJar'

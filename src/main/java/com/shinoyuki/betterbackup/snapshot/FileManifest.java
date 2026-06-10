@@ -1,8 +1,7 @@
 package com.shinoyuki.betterbackup.snapshot;
 
+import com.shinoyuki.betterbackup.nbt.NbtCompound;
 import com.shinoyuki.betterbackup.store.Hash;
-import net.minecraft.nbt.ByteArrayTag;
-import net.minecraft.nbt.CompoundTag;
 
 import java.util.HashMap;
 import java.util.HashSet;
@@ -26,7 +25,7 @@ import java.util.Set;
  * 条目仍入库其最后一次读到的字节, 但在此标 suspect=true。restore 回装该条目时 WARN 提示
  * 字节可能不一致 -- 不静默存疑似坏数据, 也不丢失该文件 (有总比没有强, 由用户知情决定)。
  *
- * <p><b>NBT 表示</b>: CompoundTag, key=相对路径, value=CompoundTag{ h: byte[] hash,
+ * <p><b>NBT 表示</b>: compound, key=相对路径, value=compound{ h: byte[] hash,
  * s: byte 1 (suspect 时才写, 缺省=非 suspect) }, 兼容旧 manifest (无 files 段时为空)。
  */
 public record FileManifest(Map<String, Hash> hashes, Set<String> suspect) {
@@ -47,11 +46,11 @@ public record FileManifest(Map<String, Hash> hashes, Set<String> suspect) {
         return hashes.isEmpty();
     }
 
-    public CompoundTag toNbt() {
-        CompoundTag tag = new CompoundTag();
+    public NbtCompound toNbt() {
+        NbtCompound tag = new NbtCompound();
         for (Map.Entry<String, Hash> entry : hashes.entrySet()) {
-            CompoundTag fileTag = new CompoundTag();
-            fileTag.put(K_HASH, new ByteArrayTag(entry.getValue().bytes()));
+            NbtCompound fileTag = new NbtCompound();
+            fileTag.putByteArray(K_HASH, entry.getValue().bytes());
             if (suspect.contains(entry.getKey())) {
                 fileTag.putByte(K_SUSPECT, (byte) 1);
             }
@@ -60,11 +59,11 @@ public record FileManifest(Map<String, Hash> hashes, Set<String> suspect) {
         return tag;
     }
 
-    public static FileManifest fromNbt(CompoundTag tag) {
+    public static FileManifest fromNbt(NbtCompound tag) {
         Map<String, Hash> hashes = new LinkedHashMap<>();
         Set<String> suspect = new HashSet<>();
-        for (String relativePath : tag.getAllKeys()) {
-            CompoundTag fileTag = tag.getCompound(relativePath);
+        for (String relativePath : tag.keySet()) {
+            NbtCompound fileTag = tag.getCompound(relativePath);
             hashes.put(relativePath, new Hash(fileTag.getByteArray(K_HASH)));
             if (fileTag.getByte(K_SUSPECT) == (byte) 1) {
                 suspect.add(relativePath);

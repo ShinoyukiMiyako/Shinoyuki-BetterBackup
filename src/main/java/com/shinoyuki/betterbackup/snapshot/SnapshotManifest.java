@@ -1,13 +1,15 @@
 package com.shinoyuki.betterbackup.snapshot;
 
+import com.shinoyuki.betterbackup.nbt.NbtCompound;
+import com.shinoyuki.betterbackup.nbt.NbtList;
+import com.shinoyuki.betterbackup.nbt.NbtReader;
+import com.shinoyuki.betterbackup.nbt.NbtType;
+import com.shinoyuki.betterbackup.nbt.NbtWriter;
 import com.shinoyuki.betterbackup.store.Hash;
-import net.minecraft.nbt.ByteArrayTag;
-import net.minecraft.nbt.CompoundTag;
-import net.minecraft.nbt.ListTag;
-import net.minecraft.nbt.NbtIo;
-import net.minecraft.nbt.Tag;
 
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -22,9 +24,10 @@ import java.util.Objects;
  * 单 snapshot 的清单. 内容是各类备份单元 ({@code (dim, x, z) -> Hash} 等) 到 store
  * 内 hash 的引用映射. 不存任何字节数据本身, 数据在 ChunkStore 里按 hash 寻址.
  *
- * <p><b>序列化格式</b>: vanilla {@link NbtIo#writeCompressed} (gzip + NBT). 复用
- * Minecraft 已有工具链, 不引入新依赖. 大服 100k chunk × 16 byte hash ≈ 1.6 MB raw,
- * gzip 压缩约 1 MB.
+ * <p><b>序列化格式</b>: gzip + NBT, 由独立最小编解码 {@link NbtWriter}/{@link NbtReader}
+ * 写读, 与 vanilla {@code NbtIo.writeCompressed} 输出字节互读 (PLAN Phase E 硬约束:
+ * 离线 CLI 代码路径零 net.minecraft import, 故不能用 NbtIo). 大服 100k chunk ×
+ * 16 byte hash ≈ 1.6 MB raw, gzip 压缩约 1 MB.
  *
  * <p><b>原子写</b>: 写到 {@code <id>.manifest.tmp} → fsync → rename 到
  * {@code <id>.manifest}. 跟 ChunkStore put 同模式, 保证 kill -9 不会留半写文件
@@ -104,8 +107,8 @@ public record SnapshotManifest(
                 FileManifest.empty());
     }
 
-    public CompoundTag toNbt() {
-        CompoundTag root = new CompoundTag();
+    public NbtCompound toNbt() {
+        NbtCompound root = new NbtCompound();
         root.putInt(K_VERSION, version);
         root.putString(K_SNAPSHOT_ID, snapshotId);
         root.putLong(K_CREATED_AT, createdAtMillis);
@@ -114,7 +117,7 @@ public record SnapshotManifest(
         root.put(K_ENTITY_CHUNKS, dimMapToNbt(entityChunks));
         root.put(K_SAVED_DATA, savedDataToNbt(savedData));
         if (levelDat != null) {
-            root.put(K_LEVEL_DAT, new ByteArrayTag(levelDat.bytes()));
+            root.putByteArray(K_LEVEL_DAT, levelDat.bytes());
         }
         root.putLong(K_TOTAL_BYTES, totalUniqueBytes);
         root.putLong(K_DELTA_BYTES, deltaBytes);
@@ -123,15 +126,15 @@ public record SnapshotManifest(
         return root;
     }
 
-    public static SnapshotManifest fromNbt(CompoundTag root) {
+    public static SnapshotManifest fromNbt(NbtCompound root) {
         int v = root.getInt(K_VERSION);
         if (v != SCHEMA_VERSION) {
             throw new IllegalStateException("unsupported manifest schema version " + v);
         }
-        Hash levelDat = root.contains(K_LEVEL_DAT, Tag.TAG_BYTE_ARRAY)
+        Hash levelDat = root.contains(K_LEVEL_DAT, NbtType.BYTE_ARRAY)
                 ? new Hash(root.getByteArray(K_LEVEL_DAT))
                 : null;
-        // baselineComplete: 旧 manifest 无此字段, CompoundTag.getBoolean 缺键返回 false,
+        // baselineComplete: 旧 manifest 无此字段, getBoolean 缺键返回 false,
         // 正好等于"未完成 baseline"的安全默认 (装 mod 早期的快照本就不该放行 restore).
         return new SnapshotManifest(
                 v,
@@ -145,7 +148,7 @@ public record SnapshotManifest(
                 root.getLong(K_TOTAL_BYTES),
                 root.getLong(K_DELTA_BYTES),
                 root.getBoolean(K_BASELINE_COMPLETE),
-                // files: 旧 manifest 无此键, getCompound 返回空 CompoundTag, 解出空 FileManifest,
+                // files: 旧 manifest 无此键, getCompound 返回空 compound, 解出空 FileManifest,
                 // 等于"该快照没有玩家数据通道", restore 时不回装文件 (跟旧行为一致).
                 FileManifest.fromNbt(root.getCompound(K_FILES)));
     }
@@ -154,7 +157,10 @@ public record SnapshotManifest(
     public void writeTo(Path target) throws IOException {
         Files.createDirectories(target.getParent());
         Path tmp = target.resolveSibling(target.getFileName() + ".tmp");
-        NbtIo.writeCompressed(toNbt(), tmp.toFile());
+        try (OutputStream out = Files.newOutputStream(tmp, StandardOpenOption.CREATE,
+                StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
+            NbtWriter.writeCompressed(toNbt(), out);
+        }
         try (FileChannel ch = FileChannel.open(tmp, StandardOpenOption.READ)) {
             ch.force(true);
         }
@@ -162,18 +168,19 @@ public record SnapshotManifest(
     }
 
     public static SnapshotManifest readFrom(Path source) throws IOException {
-        CompoundTag root = NbtIo.readCompressed(source.toFile());
-        return fromNbt(root);
+        try (InputStream in = Files.newInputStream(source)) {
+            return fromNbt(NbtReader.readCompressed(in));
+        }
     }
 
-    private static CompoundTag dimMapToNbt(Map<String, Map<Long, Hash>> dimMap) {
-        CompoundTag tag = new CompoundTag();
+    private static NbtCompound dimMapToNbt(Map<String, Map<Long, Hash>> dimMap) {
+        NbtCompound tag = new NbtCompound();
         for (Map.Entry<String, Map<Long, Hash>> dimEntry : dimMap.entrySet()) {
-            ListTag list = new ListTag();
+            NbtList list = new NbtList();
             for (Map.Entry<Long, Hash> chunkEntry : dimEntry.getValue().entrySet()) {
-                CompoundTag chunkTag = new CompoundTag();
+                NbtCompound chunkTag = new NbtCompound();
                 chunkTag.putLong(K_POS, chunkEntry.getKey());
-                chunkTag.put(K_HASH, new ByteArrayTag(chunkEntry.getValue().bytes()));
+                chunkTag.putByteArray(K_HASH, chunkEntry.getValue().bytes());
                 list.add(chunkTag);
             }
             tag.put(dimEntry.getKey(), list);
@@ -181,13 +188,13 @@ public record SnapshotManifest(
         return tag;
     }
 
-    private static Map<String, Map<Long, Hash>> dimMapFromNbt(CompoundTag tag) {
+    private static Map<String, Map<Long, Hash>> dimMapFromNbt(NbtCompound tag) {
         Map<String, Map<Long, Hash>> result = new LinkedHashMap<>();
-        for (String dim : tag.getAllKeys()) {
-            ListTag list = tag.getList(dim, Tag.TAG_COMPOUND);
+        for (String dim : tag.keySet()) {
+            NbtList list = tag.getList(dim, NbtType.COMPOUND);
             Map<Long, Hash> chunkMap = new HashMap<>(list.size());
             for (int i = 0; i < list.size(); i++) {
-                CompoundTag chunkTag = list.getCompound(i);
+                NbtCompound chunkTag = (NbtCompound) list.get(i);
                 chunkMap.put(chunkTag.getLong(K_POS), new Hash(chunkTag.getByteArray(K_HASH)));
             }
             result.put(dim, chunkMap);
@@ -195,17 +202,17 @@ public record SnapshotManifest(
         return result;
     }
 
-    private static CompoundTag savedDataToNbt(Map<String, Hash> savedData) {
-        CompoundTag tag = new CompoundTag();
+    private static NbtCompound savedDataToNbt(Map<String, Hash> savedData) {
+        NbtCompound tag = new NbtCompound();
         for (Map.Entry<String, Hash> entry : savedData.entrySet()) {
-            tag.put(entry.getKey(), new ByteArrayTag(entry.getValue().bytes()));
+            tag.putByteArray(entry.getKey(), entry.getValue().bytes());
         }
         return tag;
     }
 
-    private static Map<String, Hash> savedDataFromNbt(CompoundTag tag) {
+    private static Map<String, Hash> savedDataFromNbt(NbtCompound tag) {
         Map<String, Hash> result = new HashMap<>();
-        for (String key : tag.getAllKeys()) {
+        for (String key : tag.keySet()) {
             result.put(key, new Hash(tag.getByteArray(key)));
         }
         return result;

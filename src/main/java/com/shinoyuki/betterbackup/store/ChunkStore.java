@@ -1,7 +1,7 @@
 package com.shinoyuki.betterbackup.store;
 
-import com.shinoyuki.betterbackup.BetterBackupMod;
 import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.channels.FileChannel;
@@ -31,7 +31,9 @@ import java.util.UUID;
  */
 public final class ChunkStore {
 
-    private static final Logger LOGGER = BetterBackupMod.LOGGER;
+    // 直接 SLF4J 而非 BetterBackupMod.LOGGER: store 是 content-addressed 持久层, 被离线
+    // CLI (零 net.minecraft 依赖) 复用, 不能经 BetterBackupMod 把 Minecraft 运行时拽进来。
+    private static final Logger LOGGER = LoggerFactory.getLogger(ChunkStore.class);
 
     private final Path storeRoot;
     private final Path chunksDir;
