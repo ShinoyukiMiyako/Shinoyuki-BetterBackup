@@ -160,10 +160,10 @@ public final class BetterBackupMod {
         try {
             RestoreFlow.RestoreResult result = flow.restore(snapshotId);
             PendingRestoreFlag.clear(worldRoot);
-            LOGGER.info("[BetterBackup] restore complete: chunks={} entity={} savedData={} levelDat={} backupDir={}",
+            LOGGER.info("[BetterBackup] restore complete: chunks={} entity={} savedData={} files={} levelDat={} backupDir={}",
                     result.chunkSlotsRestored(), result.entitySlotsRestored(),
-                    result.savedDataFilesRestored(), result.levelDatRestored(),
-                    result.worldBackupDir());
+                    result.savedDataFilesRestored(), result.playerDataFilesRestored(),
+                    result.levelDatRestored(), result.worldBackupDir());
         } catch (IOException e) {
             LOGGER.error("[BetterBackup] restore FAILED for snapshot {}, flag retained for retry, server will start with current world state",
                     snapshotId, e);

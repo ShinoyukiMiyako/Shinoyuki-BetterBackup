@@ -29,12 +29,18 @@ import java.util.Set;
  * <ol>
  *   <li>读 manifest</li>
  *   <li>verify store 完整性 (referenced hash 全在 store)</li>
- *   <li>atomic rename world 内 chunk-related 子目录 + level.dat 到
+ *   <li>atomic rename world 内 chunk-related 子目录 + 玩家数据目录 + level.dat 到
  *       {@code <worldRoot>.bak-<ts>/}</li>
  *   <li>按 manifest group by (dim, region) 用 RegionFileSlotWriter 重建 .mca 文件</li>
  *   <li>重建 SavedData .dat 文件 (从 store.get(hash) 写)</li>
+ *   <li>重建 files 段 (playerdata/ stats/ advancements/ poi/ 整文件, 从 store.get(hash) 写)</li>
  *   <li>重建 level.dat</li>
  * </ol>
+ *
+ * <p><b>原子边界</b>: region 与 files (玩家数据) 在同一边界内 -- 一起进 .bak, 一起回写。
+ * 回滚后玩家背包 (playerdata) 与世界 (region) 必定同时回到同一快照态, 杜绝
+ * FTB Backups 2 #95 的刷物品/丢物品事故 (只回 region 不回 playerdata 时玩家手里还留着
+ * 回滚点之后才拿到的物品)。suspect 文件 (采集时撕裂读未稳定) 回装时 WARN 提示。
  *
  * <p><b>失败处理</b>: 任何 step 抛 IOException 整体 abort, world.bak 仍保留给用户
  * 做兜底 (用户可手动从 .bak 复原). flag 不删, 用户看 log 修复后重启会再跑一次.
@@ -72,11 +78,13 @@ public final class RestoreFlow {
         long chunkSlots = rebuildChunkPath(manifest.chunks(), false);
         long entitySlots = rebuildChunkPath(manifest.entityChunks(), true);
         long savedDataFiles = rebuildSavedData(manifest.savedData());
+        long playerDataFiles = rebuildFiles(manifest.files());
         boolean levelDatRebuilt = rebuildLevelDat(manifest.levelDat());
 
-        LOGGER.info("[BetterBackup] restore complete: snapshot={} chunks={} entity={} savedData={} levelDat={} backup={}",
-                snapshotId, chunkSlots, entitySlots, savedDataFiles, levelDatRebuilt, backupDir);
-        return new RestoreResult(snapshotId, chunkSlots, entitySlots, savedDataFiles, levelDatRebuilt, backupDir);
+        LOGGER.info("[BetterBackup] restore complete: snapshot={} chunks={} entity={} savedData={} files={} levelDat={} backup={}",
+                snapshotId, chunkSlots, entitySlots, savedDataFiles, playerDataFiles, levelDatRebuilt, backupDir);
+        return new RestoreResult(snapshotId, chunkSlots, entitySlots, savedDataFiles, playerDataFiles,
+                levelDatRebuilt, backupDir);
     }
 
     /** verify referenced hash 全在 store; 缺失抛 IOException, 不动文件. */
@@ -85,6 +93,7 @@ public final class RestoreFlow {
         manifest.chunks().values().forEach(m -> referenced.addAll(m.values()));
         manifest.entityChunks().values().forEach(m -> referenced.addAll(m.values()));
         referenced.addAll(manifest.savedData().values());
+        referenced.addAll(manifest.files().hashes().values());
         if (manifest.levelDat() != null) {
             referenced.add(manifest.levelDat());
         }
@@ -96,9 +105,10 @@ public final class RestoreFlow {
     }
 
     /**
-     * 把 worldRoot 内 chunk-related 子目录 + level.dat 用 atomic rename 移到
-     * {@code <worldRoot>.bak-<ts>/}. 不动 playerdata / stats / advancements
-     * 等非备份范围文件 (跟 vanilla 一致语义, MVP 不 restore 它们).
+     * 把 worldRoot 内 chunk-related 子目录 + 玩家数据目录 + level.dat 用 atomic rename 移到
+     * {@code <worldRoot>.bak-<ts>/}. 玩家数据 (playerdata / stats / advancements / poi)
+     * 跟 region 在同一原子边界内一起进 .bak, 保证恢复后玩家背包与世界回到同一快照态
+     * (Phase D 推翻了 MVP 时期"不动 playerdata"的限制, 那会导致 FTB2 #95 刷物品事故)。
      */
     private Path moveCurrentWorldToBackup() throws IOException {
         Path worldRoot = paths.worldRoot();
@@ -109,6 +119,10 @@ public final class RestoreFlow {
         moveIfExists(worldRoot.resolve("region"), backupDir.resolve("region"));
         moveIfExists(worldRoot.resolve("entities"), backupDir.resolve("entities"));
         moveIfExists(worldRoot.resolve("data"), backupDir.resolve("data"));
+        moveIfExists(worldRoot.resolve("playerdata"), backupDir.resolve("playerdata"));
+        moveIfExists(worldRoot.resolve("stats"), backupDir.resolve("stats"));
+        moveIfExists(worldRoot.resolve("advancements"), backupDir.resolve("advancements"));
+        moveIfExists(worldRoot.resolve("poi"), backupDir.resolve("poi"));
         moveIfExists(worldRoot.resolve("DIM-1"), backupDir.resolve("DIM-1"));
         moveIfExists(worldRoot.resolve("DIM1"), backupDir.resolve("DIM1"));
         moveIfExists(worldRoot.resolve("dimensions"), backupDir.resolve("dimensions"));
@@ -195,6 +209,31 @@ public final class RestoreFlow {
         return total;
     }
 
+    /**
+     * 重建 files 段 (玩家数据通道). 相对路径相对 worldRoot, 一律 forward-slash, 拆回子路径
+     * 落到 worldRoot 下原位 (manifest 写时已用 RegionFileSlotWriter 同款 atomic-ish 直写;
+     * 此处旧文件已整目录进 .bak, 这里是从空目录全新落盘, 不存在覆盖半写问题)。
+     *
+     * <p>suspect 文件 (采集时撕裂读 3 次仍不稳定): 仍照常回写其入库字节 (有总比没有强),
+     * 但 WARN 提示该文件字节可能不一致, 让管理员知情 -- 不静默回装疑似坏数据。
+     */
+    private long rebuildFiles(com.shinoyuki.betterbackup.snapshot.FileManifest files) throws IOException {
+        long total = 0;
+        for (Map.Entry<String, Hash> entry : files.hashes().entrySet()) {
+            String relativePath = entry.getKey();
+            Path target = paths.worldRoot().resolve(relativePath);
+            byte[] bytes = store.get(entry.getValue());
+            Files.createDirectories(target.getParent());
+            Files.write(target, bytes);
+            if (files.suspect().contains(relativePath)) {
+                LOGGER.warn("[BetterBackup] restored suspect player-data file (bytes may be inconsistent, "
+                        + "captured during a torn read): {}", relativePath);
+            }
+            total++;
+        }
+        return total;
+    }
+
     private boolean rebuildLevelDat(Hash levelDatHash) throws IOException {
         if (levelDatHash == null) {
             return false;
@@ -211,6 +250,7 @@ public final class RestoreFlow {
             long chunkSlotsRestored,
             long entitySlotsRestored,
             long savedDataFilesRestored,
+            long playerDataFilesRestored,
             boolean levelDatRestored,
             Path worldBackupDir) {
     }
