@@ -132,6 +132,11 @@ public final class BaselineScanner {
                 allRegionsClean = pr.noTornReads();
                 break;
             }
+            // 停止请求也会让 runPass 提前返回 allRegionsDone=false. 先于 WARN 判断,
+            // 否则关服时剩余 pass 全部空转并打出误导性的 "torn reads, retrying".
+            if (stopRequested) {
+                break;
+            }
             LOGGER.warn("[BetterBackup] baseline pass {} left regions incomplete (torn reads), retrying", pass);
         }
 
