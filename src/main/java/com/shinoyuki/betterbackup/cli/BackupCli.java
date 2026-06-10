@@ -36,6 +36,7 @@ import java.util.stream.Stream;
  * info    --store &lt;dir&gt; --id &lt;snapshotId&gt;
  * verify  --store &lt;dir&gt; [--id &lt;snapshotId&gt;]
  * restore --store &lt;dir&gt; --id &lt;snapshotId&gt; --world &lt;worldRoot&gt;
+ * fsck    --store &lt;dir&gt; [--rebuild-index]
  * </pre>
  */
 public final class BackupCli {
@@ -70,6 +71,7 @@ public final class BackupCli {
                 case "info" -> cmdInfo(parsed);
                 case "verify" -> cmdVerify(parsed);
                 case "restore" -> cmdRestore(parsed);
+                case "fsck" -> cmdFsck(parsed);
                 case "help", "--help", "-h" -> {
                     printUsage();
                     yield 0;
@@ -199,6 +201,49 @@ public final class BackupCli {
         return 0;
     }
 
+    /**
+     * 深度自检: 逐 store 对象重 hash + zlib 完整性校验。{@code --rebuild-index} 时额外从
+     * store + manifests 重建快照索引落 index.txt。退出码非 0 当存在任何损坏 / 不完整 / 缺失。
+     */
+    private int cmdFsck(Args args) throws IOException {
+        Path storeRoot = requireStore(args);
+        Path snapshotsDir = storeRoot.resolve(SNAPSHOTS_SUBDIR);
+        ChunkStore store = openStore(storeRoot);
+        StoreFsck fsck = new StoreFsck(store, snapshotsDir, hashFunction());
+
+        StoreFsck.VerifyResult verify = fsck.verifyStore();
+        out.println("fsck store: scanned=" + verify.scanned() + " ok=" + verify.ok()
+                + " hashMismatch=" + verify.hashMismatch().size()
+                + " corrupt=" + verify.corrupt().size());
+        for (String s : verify.hashMismatch()) {
+            out.println("  HASH-MISMATCH " + s);
+        }
+        for (String s : verify.corrupt()) {
+            out.println("  CORRUPT " + s);
+        }
+
+        int failures = verify.clean() ? 0 : 1;
+        if (args.flag("rebuild-index")) {
+            StoreFsck.RebuildResult rebuild = fsck.rebuildIndex();
+            out.println("rebuilt index: " + rebuild.entries().size() + " snapshot(s) -> "
+                    + snapshotsDir.resolve(StoreFsck.INDEX_FILE_NAME));
+            for (StoreFsck.SnapshotEntry e : rebuild.entries()) {
+                if (e.corrupt()) {
+                    out.println("  CORRUPT  " + e.id() + " (" + e.corruptReason() + ")");
+                    failures = 1;
+                } else if (e.missingObjects() > 0) {
+                    out.println("  INCOMPLETE " + e.id() + " missing=" + e.missingObjects()
+                            + "/" + e.referencedObjects());
+                    failures = 1;
+                } else {
+                    out.println("  OK       " + e.id() + " objects=" + e.referencedObjects()
+                            + " chunks=" + e.chunks() + " baselineComplete=" + e.baselineComplete());
+                }
+            }
+        }
+        return failures;
+    }
+
     private List<String> listSnapshotIds(Path snapshotsDir) throws IOException {
         if (!Files.isDirectory(snapshotsDir)) {
             return List.of();
@@ -239,6 +284,7 @@ public final class BackupCli {
         err.println("  info    --store <dir> --id <snapshotId>");
         err.println("  verify  --store <dir> [--id <snapshotId>]");
         err.println("  restore --store <dir> --id <snapshotId> --world <worldRoot>");
+        err.println("  fsck    --store <dir> [--rebuild-index]");
     }
 
     /**
