@@ -72,7 +72,8 @@ class StoreGcTest {
                 new HashMap<>(),
                 null,
                 0L,
-                0L);
+                0L,
+                false);
         Path target = snapshotsDir.resolve(id + ".manifest");
         m.writeTo(target);
         return target;

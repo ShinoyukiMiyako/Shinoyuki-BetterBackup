@@ -2,6 +2,9 @@ package com.shinoyuki.betterbackup;
 
 import com.mojang.logging.LogUtils;
 import com.shinoyuki.betterautosave.api.SaveListenerRegistry;
+import com.shinoyuki.betterbackup.baseline.BaselineProgress;
+import com.shinoyuki.betterbackup.baseline.BaselineScanner;
+import com.shinoyuki.betterbackup.baseline.ThrottlingRateLimiter;
 import com.shinoyuki.betterbackup.command.BetterBackupCommand;
 import com.shinoyuki.betterbackup.config.BetterBackupConfig;
 import com.shinoyuki.betterbackup.config.ConfigSpec;
@@ -207,6 +210,11 @@ public final class BetterBackupMod {
             HashFunction hashFunction = new Xxh128HashFunction();
             BetterBackupMetrics metrics = new BetterBackupMetrics();
             Set<Hash> writtenThisWindow = ConcurrentHashMap.newKeySet();
+
+            // baseline 进度先于 creator 创建: creator 需要 baselineCompleteSupplier 给每份
+            // manifest 盖 baselineComplete 戳, scanner 跑完才置位. load() 读已记录进度供续传.
+            BaselineProgress baselineProgress = new BaselineProgress(storeRoot);
+            baselineProgress.load();
             // queue 先于 context 创建: context 持有同一个 queue 引用, chunk/entity task
             // 命中撕裂读时把自己重 offer 回这个 queue 延后重试 (BackupContext.retryQueue).
             BlockingQueue<BackupTask> queue = new LinkedBlockingQueue<>();
@@ -233,7 +241,8 @@ public final class BetterBackupMod {
 
             MinecraftServer server = event.getServer();
             SnapshotCreator creator = new SnapshotCreator(store, snapshotState, paths, hashFunction,
-                    storeRoot, () -> overworldGameTime(server), writtenThisWindow, metrics);
+                    storeRoot, () -> overworldGameTime(server), writtenThisWindow, metrics,
+                    baselineProgress::isComplete);
             SnapshotScheduler scheduler = createScheduler();
             scheduler.start(creator);
 
@@ -241,7 +250,9 @@ public final class BetterBackupMod {
             MinecraftForge.EVENT_BUS.register(diagnosticLogger);
 
             BetterBackupCore.install(store, snapshotState, context, queue, workers, workerThreads,
-                    bridge, creator, scheduler, diagnosticLogger, metrics);
+                    bridge, creator, scheduler, diagnosticLogger, metrics, baselineProgress);
+
+            startBaselineScan(store, snapshotState, paths, hashFunction, writtenThisWindow, baselineProgress);
 
             if (BetterBackupConfig.prometheusEnabled()) {
                 String bind = BetterBackupConfig.prometheusBindAddress();
@@ -352,6 +363,40 @@ public final class BetterBackupMod {
 
         BetterBackupCore.uninstall();
         LOGGER.info("[BetterBackup] uninstalled");
+    }
+
+    /**
+     * 启动 baseline 全量扫描后台线程. 扫描限速 (默认 50 chunk/s) 跑时间可能很长, 必须
+     * 在独立线程跑, 不阻塞 server 启动. 扫描把每个 chunk 登记进 CurrentSnapshotState,
+     * 由下一次定时 / 关服快照统一 drain 进 manifest, 跑完置 baselineProgress.complete,
+     * 此后快照 baselineComplete=true, restore 门禁放行.
+     *
+     * <p>daemon=true: 关服时若扫描还没跑完直接随 JVM 退出, 进度已按 region 持久化,
+     * 下次启动续传. 扫描异常只 log, 不影响活跃 dirty 路径备份继续工作.
+     */
+    private static void startBaselineScan(ChunkStore store,
+                                          CurrentSnapshotState state,
+                                          WorldPaths paths,
+                                          HashFunction hashFunction,
+                                          Set<Hash> writtenThisWindow,
+                                          BaselineProgress baselineProgress) {
+        if (baselineProgress.isComplete()) {
+            LOGGER.info("[BetterBackup] baseline already complete, full scan skipped");
+            return;
+        }
+        int rate = BetterBackupConfig.baselineScanChunksPerSecond();
+        BaselineScanner scanner = new BaselineScanner(store, state, paths, hashFunction,
+                writtenThisWindow, baselineProgress, new ThrottlingRateLimiter(rate));
+        Thread thread = new Thread(() -> {
+            try {
+                scanner.scan();
+            } catch (IOException e) {
+                LOGGER.error("[BetterBackup] baseline scan failed (progress persisted, will resume next start)", e);
+            }
+        }, "BetterBackup-Baseline-Scan");
+        thread.setDaemon(true);
+        thread.start();
+        LOGGER.info("[BetterBackup] baseline full scan started (rate={} chunk/s)", rate);
     }
 
     private static SnapshotScheduler createScheduler() {

@@ -24,6 +24,7 @@ import java.util.HashSet;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.BooleanSupplier;
 import java.util.function.LongSupplier;
 import java.util.stream.Stream;
 
@@ -63,6 +64,7 @@ public final class SnapshotCreator implements SnapshotTrigger {
     private final StoreGc gc;
     private final Path storeRoot;
     private final SnapshotFailureMarker failureMarker;
+    private final BooleanSupplier baselineCompleteSupplier;
 
     public SnapshotCreator(ChunkStore store,
                            CurrentSnapshotState state,
@@ -71,7 +73,8 @@ public final class SnapshotCreator implements SnapshotTrigger {
                            Path storeRoot,
                            LongSupplier gameTimeSupplier,
                            Set<Hash> writtenThisWindow,
-                           BetterBackupMetrics metrics) {
+                           BetterBackupMetrics metrics,
+                           BooleanSupplier baselineCompleteSupplier) {
         this.store = store;
         this.state = state;
         this.paths = paths;
@@ -83,6 +86,7 @@ public final class SnapshotCreator implements SnapshotTrigger {
         this.gc = new StoreGc(store, this.snapshotsDir);
         this.storeRoot = storeRoot;
         this.failureMarker = new SnapshotFailureMarker(storeRoot);
+        this.baselineCompleteSupplier = baselineCompleteSupplier;
     }
 
     public Path snapshotsDir() {
@@ -128,11 +132,12 @@ public final class SnapshotCreator implements SnapshotTrigger {
             int chunkCount = newManifest.chunks().values().stream().mapToInt(Map::size).sum();
             int entityCount = newManifest.entityChunks().values().stream().mapToInt(Map::size).sum();
             LOGGER.info(
-                    "[BetterBackup] snapshot created: {} ({}) chunks={} entity={} savedData={} levelDat={}",
+                    "[BetterBackup] snapshot created: {} ({}) chunks={} entity={} savedData={} levelDat={} baselineComplete={}",
                     newManifest.snapshotId(), reason,
                     chunkCount, entityCount,
                     newManifest.savedData().size(),
-                    newManifest.levelDat() != null);
+                    newManifest.levelDat() != null,
+                    newManifest.baselineComplete());
 
             runIncrementalGc(newManifest);
         } catch (IOException e) {
@@ -231,7 +236,8 @@ public final class SnapshotCreator implements SnapshotTrigger {
                 savedData,
                 level,
                 0L,  // totalUniqueBytes: Phase 5 metrics commit 接入
-                0L); // deltaBytes: 同上
+                0L,  // deltaBytes: 同上
+                baselineCompleteSupplier.getAsBoolean());
     }
 
     private Optional<SnapshotManifest> findLatestManifest() {

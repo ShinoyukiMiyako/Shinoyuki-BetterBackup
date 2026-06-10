@@ -75,7 +75,8 @@ class RestoreFlowExternalChunkTest {
                         new HashMap<>(),
                         null,
                         externalObject.length + inlineObject.length,
-                        0L);
+                        0L,
+                        true);
         manifest.writeTo(snapshotsDir.resolve("snap-ext.manifest"));
 
         WorldPaths paths = new WorldPaths(worldRoot);

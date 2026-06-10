@@ -43,6 +43,7 @@ import java.util.Objects;
  *     levelDat: byte[] hash (可省略),
  *     totalUniqueBytes: long,
  *     deltaBytes: long,
+ *     baselineComplete: byte (0/1, 缺字段按 0=false 读, 兼容旧 manifest),
  * }
  * </pre>
  */
@@ -56,7 +57,8 @@ public record SnapshotManifest(
         Map<String, Hash> savedData,
         Hash levelDat,
         long totalUniqueBytes,
-        long deltaBytes) {
+        long deltaBytes,
+        boolean baselineComplete) {
 
     public static final int SCHEMA_VERSION = 1;
 
@@ -70,6 +72,7 @@ public record SnapshotManifest(
     private static final String K_LEVEL_DAT = "levelDat";
     private static final String K_TOTAL_BYTES = "totalUniqueBytes";
     private static final String K_DELTA_BYTES = "deltaBytes";
+    private static final String K_BASELINE_COMPLETE = "baselineComplete";
     private static final String K_POS = "pos";
     private static final String K_HASH = "hash";
 
@@ -92,7 +95,8 @@ public record SnapshotManifest(
                 new HashMap<>(),
                 null,
                 0L,
-                0L);
+                0L,
+                false);
     }
 
     public CompoundTag toNbt() {
@@ -109,6 +113,7 @@ public record SnapshotManifest(
         }
         root.putLong(K_TOTAL_BYTES, totalUniqueBytes);
         root.putLong(K_DELTA_BYTES, deltaBytes);
+        root.putBoolean(K_BASELINE_COMPLETE, baselineComplete);
         return root;
     }
 
@@ -120,6 +125,8 @@ public record SnapshotManifest(
         Hash levelDat = root.contains(K_LEVEL_DAT, Tag.TAG_BYTE_ARRAY)
                 ? new Hash(root.getByteArray(K_LEVEL_DAT))
                 : null;
+        // baselineComplete: 旧 manifest 无此字段, CompoundTag.getBoolean 缺键返回 false,
+        // 正好等于"未完成 baseline"的安全默认 (装 mod 早期的快照本就不该放行 restore).
         return new SnapshotManifest(
                 v,
                 root.getString(K_SNAPSHOT_ID),
@@ -130,7 +137,8 @@ public record SnapshotManifest(
                 savedDataFromNbt(root.getCompound(K_SAVED_DATA)),
                 levelDat,
                 root.getLong(K_TOTAL_BYTES),
-                root.getLong(K_DELTA_BYTES));
+                root.getLong(K_DELTA_BYTES),
+                root.getBoolean(K_BASELINE_COMPLETE));
     }
 
     /** 写到磁盘 (atomic: tmp + fsync + rename). */

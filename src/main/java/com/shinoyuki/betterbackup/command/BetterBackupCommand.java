@@ -5,6 +5,7 @@ import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.context.CommandContext;
 import com.shinoyuki.betterbackup.BetterBackupCore;
 import com.shinoyuki.betterbackup.BetterBackupMod;
+import com.shinoyuki.betterbackup.baseline.BaselineProgress;
 import com.shinoyuki.betterbackup.config.BetterBackupConfig;
 import com.shinoyuki.betterbackup.gc.StoreGc;
 import com.shinoyuki.betterbackup.restore.PendingRestoreFlag;
@@ -80,6 +81,14 @@ public final class BetterBackupCommand {
         }
         if (store != null) {
             out.append("Store: ").append(store.storeRoot()).append('\n');
+        }
+        // baseline 全量扫描进度: 完成前 restore 被拒, 服主据此判断何时可恢复.
+        BaselineProgress baselineProgress = BetterBackupCore.baselineProgress();
+        if (baselineProgress != null) {
+            out.append("Baseline scan: ")
+                    .append(baselineProgress.isComplete() ? "COMPLETE" : "IN PROGRESS")
+                    .append(" (region files done=").append(baselineProgress.completedRegionCount())
+                    .append(")\n");
         }
         // 快照失败可见性: .incomplete 标记存在 = 最近一次快照失败且此后无成功快照.
         // 读失败也展示给服主 (不静默吞), 因为这正是要暴露的健康信号.
@@ -273,6 +282,31 @@ public final class BetterBackupCommand {
             ctx.getSource().sendFailure(Component.literal("Snapshot not found: " + id));
             return 0;
         }
+
+        // baseline 门禁: baseline 未完成的快照只覆盖了被加载过的 chunk, 早期 restore
+        // 会丢失从未加载的世界部分 (P0). 拒绝并提示当前扫描进度, 让服主等扫描跑完.
+        SnapshotManifest manifest;
+        try {
+            manifest = SnapshotManifest.readFrom(manifestFile);
+        } catch (IOException e) {
+            ctx.getSource().sendFailure(Component.literal("Failed to read manifest: " + e.getMessage()));
+            return 0;
+        }
+        if (!manifest.baselineComplete()) {
+            BaselineProgress progress = BetterBackupCore.baselineProgress();
+            String done = progress != null ? Integer.toString(progress.completedRegionCount()) : "unknown";
+            boolean nowComplete = progress != null && progress.isComplete();
+            ctx.getSource().sendFailure(Component.literal(
+                    "Restore refused: snapshot " + id + " was taken before the baseline full scan finished, "
+                            + "so it does not contain chunks that were never loaded. Restoring it would lose "
+                            + "world data. Baseline scan: " + (nowComplete ? "now COMPLETE" : "IN PROGRESS")
+                            + " (region files done=" + done + "). "
+                            + (nowComplete
+                                    ? "Take a fresh snapshot, then restore that one."
+                                    : "Wait for the scan to finish, then take a fresh snapshot and restore it.")));
+            return 0;
+        }
+
         Path worldRoot = ctx.getSource().getServer().getWorldPath(LevelResource.ROOT);
         try {
             PendingRestoreFlag.write(worldRoot, id);

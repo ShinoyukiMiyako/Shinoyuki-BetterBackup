@@ -1,5 +1,6 @@
 package com.shinoyuki.betterbackup;
 
+import com.shinoyuki.betterbackup.baseline.BaselineProgress;
 import com.shinoyuki.betterbackup.diagnostic.BetterBackupMetrics;
 import com.shinoyuki.betterbackup.diagnostic.DiagnosticLogger;
 import com.shinoyuki.betterbackup.diagnostic.PrometheusExporter;
@@ -35,6 +36,7 @@ public final class BetterBackupCore {
     private static volatile DiagnosticLogger DIAGNOSTIC_LOGGER;
     private static volatile BetterBackupMetrics METRICS;
     private static volatile PrometheusExporter EXPORTER;
+    private static volatile BaselineProgress BASELINE_PROGRESS;
 
     public static void install(ChunkStore store,
                                CurrentSnapshotState snapshotState,
@@ -46,7 +48,8 @@ public final class BetterBackupCore {
                                SnapshotCreator creator,
                                SnapshotScheduler scheduler,
                                DiagnosticLogger diagnosticLogger,
-                               BetterBackupMetrics metrics) {
+                               BetterBackupMetrics metrics,
+                               BaselineProgress baselineProgress) {
         STORE = store;
         SNAPSHOT_STATE = snapshotState;
         CONTEXT = context;
@@ -58,6 +61,7 @@ public final class BetterBackupCore {
         SCHEDULER = scheduler;
         DIAGNOSTIC_LOGGER = diagnosticLogger;
         METRICS = metrics;
+        BASELINE_PROGRESS = baselineProgress;
     }
 
     public static void uninstall() {
@@ -73,6 +77,7 @@ public final class BetterBackupCore {
         DIAGNOSTIC_LOGGER = null;
         METRICS = null;
         EXPORTER = null;
+        BASELINE_PROGRESS = null;
     }
 
     public static void setExporter(PrometheusExporter exporter) {
@@ -129,6 +134,10 @@ public final class BetterBackupCore {
 
     public static PrometheusExporter exporter() {
         return EXPORTER;
+    }
+
+    public static BaselineProgress baselineProgress() {
+        return BASELINE_PROGRESS;
     }
 
     private BetterBackupCore() {
