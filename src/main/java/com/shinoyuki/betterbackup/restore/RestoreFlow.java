@@ -3,6 +3,7 @@ package com.shinoyuki.betterbackup.restore;
 import com.shinoyuki.betterbackup.BetterBackupMod;
 import com.shinoyuki.betterbackup.io.RegionFileSlotWriter;
 import com.shinoyuki.betterbackup.io.WorldPaths;
+import com.shinoyuki.betterbackup.safety.DiskSpaceCheck;
 import com.shinoyuki.betterbackup.snapshot.SnapshotManifest;
 import com.shinoyuki.betterbackup.store.ChunkStore;
 import com.shinoyuki.betterbackup.store.Hash;
@@ -61,6 +62,10 @@ public final class RestoreFlow {
         SnapshotManifest manifest = SnapshotManifest.readFrom(manifestFile);
 
         verifyStoreCompleteness(manifest);
+
+        // 磁盘预检在移动旧世界之前: restore 把整套快照引用的 store 字节回写进 world,
+        // 盘满会产出半覆盖的世界. 预检不过直接抛, 旧世界原封不动 (Advanced Backups #128).
+        DiskSpaceCheck.require(paths.worldRoot(), DiskSpaceCheck.MIN_FREE_BYTES, "restore");
 
         Path backupDir = moveCurrentWorldToBackup();
 

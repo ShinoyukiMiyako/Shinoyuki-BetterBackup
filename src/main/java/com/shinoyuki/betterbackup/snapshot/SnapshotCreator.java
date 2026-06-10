@@ -4,6 +4,8 @@ import com.shinoyuki.betterbackup.BetterBackupMod;
 import com.shinoyuki.betterbackup.diagnostic.BetterBackupMetrics;
 import com.shinoyuki.betterbackup.gc.StoreGc;
 import com.shinoyuki.betterbackup.io.WorldPaths;
+import com.shinoyuki.betterbackup.safety.DiskSpaceCheck;
+import com.shinoyuki.betterbackup.safety.SnapshotFailureMarker;
 import com.shinoyuki.betterbackup.schedule.SnapshotTrigger;
 import com.shinoyuki.betterbackup.store.ChunkStore;
 import com.shinoyuki.betterbackup.store.Hash;
@@ -59,6 +61,8 @@ public final class SnapshotCreator implements SnapshotTrigger {
     private final Set<Hash> writtenThisWindow;
     private final BetterBackupMetrics metrics;
     private final StoreGc gc;
+    private final Path storeRoot;
+    private final SnapshotFailureMarker failureMarker;
 
     public SnapshotCreator(ChunkStore store,
                            CurrentSnapshotState state,
@@ -77,10 +81,17 @@ public final class SnapshotCreator implements SnapshotTrigger {
         this.writtenThisWindow = writtenThisWindow;
         this.metrics = metrics;
         this.gc = new StoreGc(store, this.snapshotsDir);
+        this.storeRoot = storeRoot;
+        this.failureMarker = new SnapshotFailureMarker(storeRoot);
     }
 
     public Path snapshotsDir() {
         return snapshotsDir;
+    }
+
+    /** 给 /betterbackup status 读最近一次快照失败标记 (.incomplete). */
+    public SnapshotFailureMarker failureMarker() {
+        return failureMarker;
     }
 
     @Override
@@ -89,7 +100,17 @@ public final class SnapshotCreator implements SnapshotTrigger {
             Files.createDirectories(snapshotsDir);
         } catch (IOException e) {
             LOGGER.error("[BetterBackup] failed to create snapshots dir {}", snapshotsDir, e);
-            metrics.recordSnapshotFailed();
+            recordFailure("snapshots dir creation failed: " + e.getMessage());
+            return;
+        }
+
+        // 磁盘预检在 drainAndClear 之前: 预检不过时 dirty 状态保留, 留给下一次重试,
+        // 否则 drain 已清空 dirtyMap, 这一窗口标过 dirty 的 chunk 会永远丢出快照.
+        try {
+            DiskSpaceCheck.require(storeRoot, DiskSpaceCheck.MIN_FREE_BYTES, "snapshot");
+        } catch (IOException e) {
+            LOGGER.error("[BetterBackup] snapshot aborted by disk space precheck", e);
+            recordFailure("disk space precheck failed: " + e.getMessage());
             return;
         }
 
@@ -103,6 +124,7 @@ public final class SnapshotCreator implements SnapshotTrigger {
         try {
             newManifest.writeTo(target);
             metrics.recordSnapshotCreated();
+            clearFailureMarker();
             int chunkCount = newManifest.chunks().values().stream().mapToInt(Map::size).sum();
             int entityCount = newManifest.entityChunks().values().stream().mapToInt(Map::size).sum();
             LOGGER.info(
@@ -115,7 +137,29 @@ public final class SnapshotCreator implements SnapshotTrigger {
             runIncrementalGc(newManifest);
         } catch (IOException e) {
             LOGGER.error("[BetterBackup] snapshot write failed: {}", target, e);
-            metrics.recordSnapshotFailed();
+            recordFailure("manifest write failed: " + e.getMessage());
+        }
+    }
+
+    /**
+     * 记录一次快照失败: counter + 落 .incomplete 标记让 /betterbackup status 可见.
+     * 标记写盘自身再失败只 log, 不掩盖原始失败 (原始失败已由调用处 log).
+     */
+    private void recordFailure(String reason) {
+        metrics.recordSnapshotFailed();
+        try {
+            failureMarker.write(System.currentTimeMillis(), reason);
+        } catch (IOException markerError) {
+            LOGGER.error("[BetterBackup] failed to write snapshot failure marker", markerError);
+        }
+    }
+
+    /** 快照成功后清除上一次失败的 .incomplete 标记. 清除失败只 log, 不影响快照成功语义. */
+    private void clearFailureMarker() {
+        try {
+            failureMarker.clear();
+        } catch (IOException e) {
+            LOGGER.error("[BetterBackup] failed to clear snapshot failure marker", e);
         }
     }
 

@@ -65,6 +65,7 @@ public final class BetterBackupCommand {
         }
         CurrentSnapshotState state = BetterBackupCore.snapshotState();
         ChunkStore store = BetterBackupCore.store();
+        SnapshotCreator creator = BetterBackupCore.creator();
         int queueDepth = BetterBackupCore.queue() != null ? BetterBackupCore.queue().size() : 0;
         StringBuilder out = new StringBuilder();
         out.append("=== BetterBackup ===\n");
@@ -79,6 +80,16 @@ public final class BetterBackupCommand {
         }
         if (store != null) {
             out.append("Store: ").append(store.storeRoot()).append('\n');
+        }
+        // 快照失败可见性: .incomplete 标记存在 = 最近一次快照失败且此后无成功快照.
+        // 读失败也展示给服主 (不静默吞), 因为这正是要暴露的健康信号.
+        if (creator != null) {
+            try {
+                creator.failureMarker().read().ifPresent(f -> out
+                        .append("Last snapshot: FAILED (").append(f.reason()).append(")\n"));
+            } catch (IOException e) {
+                out.append("Last snapshot: marker read error (").append(e.getMessage()).append(")\n");
+            }
         }
         ctx.getSource().sendSuccess(() -> Component.literal(out.toString()), false);
         return 1;
