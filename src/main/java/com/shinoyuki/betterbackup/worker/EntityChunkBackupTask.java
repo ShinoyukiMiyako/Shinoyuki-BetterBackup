@@ -2,6 +2,7 @@ package com.shinoyuki.betterbackup.worker;
 
 import com.shinoyuki.betterbackup.BetterBackupMod;
 import com.shinoyuki.betterbackup.io.RegionFileSlotReader;
+import com.shinoyuki.betterbackup.io.TornReadException;
 import com.shinoyuki.betterbackup.store.Hash;
 import net.minecraft.world.level.ChunkPos;
 import org.slf4j.Logger;
@@ -14,15 +15,20 @@ import java.nio.file.Path;
  * 读 entities/r.x.z.mca 里指定 chunk slot raw bytes → hash → store → state.
  *
  * <p>逻辑跟 {@link ChunkBackupTask} 同, 仅 region 子目录从 region/ 换成 entities/.
+ * 撕裂读重试语义见 {@link ChunkBackupTask} 的类注释.
  */
-public record EntityChunkBackupTask(String dimensionId, long packedPos) implements BackupTask {
+public record EntityChunkBackupTask(String dimensionId, long packedPos, int retryAttempt) implements BackupTask {
 
     private static final Logger LOGGER = BetterBackupMod.LOGGER;
+
+    public EntityChunkBackupTask(String dimensionId, long packedPos) {
+        this(dimensionId, packedPos, 0);
+    }
 
     @Override
     public String taskName() {
         return "entity@" + ChunkPos.getX(packedPos) + "," + ChunkPos.getZ(packedPos)
-                + "/" + dimensionId;
+                + "/" + dimensionId + (retryAttempt > 0 ? " (retry " + retryAttempt + ")" : "");
     }
 
     @Override
@@ -34,6 +40,9 @@ public record EntityChunkBackupTask(String dimensionId, long packedPos) implemen
         byte[] rawBytes;
         try {
             rawBytes = RegionFileSlotReader.readChunk(entitiesDir, chunkX, chunkZ);
+        } catch (TornReadException e) {
+            handleTornRead(ctx, chunkX, chunkZ, e);
+            return;
         } catch (IOException e) {
             ctx.metrics().recordEntityFailed();
             throw e;
@@ -53,5 +62,22 @@ public record EntityChunkBackupTask(String dimensionId, long packedPos) implemen
             ctx.metrics().recordEntityDeduped();
         }
         ctx.state().putEntityChunk(dimensionId, packedPos, hash);
+    }
+
+    /**
+     * 撕裂读处理: 未超重试上限 → 以 attempt+1 重新 offer 回队列 (延后重试, 不入库);
+     * 超上限 → 记失败放弃本轮, 不把混合字节入库, 该 chunk 靠下次 BAS save 再采.
+     */
+    private void handleTornRead(BackupContext ctx, int chunkX, int chunkZ, TornReadException e) {
+        if (retryAttempt < ChunkBackupTask.MAX_RETRY_ATTEMPTS) {
+            LOGGER.warn("[BetterBackup] torn read on entity chunk ({},{}) dim={} attempt={}, requeue: {}",
+                    chunkX, chunkZ, dimensionId, retryAttempt, e.getMessage());
+            ctx.retryQueue().offer(new EntityChunkBackupTask(dimensionId, packedPos, retryAttempt + 1));
+        } else {
+            LOGGER.error("[BetterBackup] torn read on entity chunk ({},{}) dim={} exceeded {} retries, "
+                            + "skipping this round (will be re-captured on next save): {}",
+                    chunkX, chunkZ, dimensionId, ChunkBackupTask.MAX_RETRY_ATTEMPTS, e.getMessage());
+            ctx.metrics().recordEntityFailed();
+        }
     }
 }

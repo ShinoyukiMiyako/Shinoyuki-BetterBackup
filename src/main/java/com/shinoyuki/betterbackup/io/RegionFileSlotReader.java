@@ -28,11 +28,22 @@ import java.nio.file.StandardOpenOption;
  * <p>本 reader 返回的 byte[] 是 "1 byte compression type + zlib 压缩 NBT". 不含
  * 4 byte length header (那是 region file 内部 layout, 不是 chunk 内容). 跟 ChronoVault
  * 同模式, 跨 JVM 字节恒等做 dedup 主键.
+ *
+ * <p><b>撕裂读防御</b>: worker 读 slot 时可能撞上 vanilla IOWorker 对同一扇区的
+ * 原地重写, 读到新旧混合字节. 垃圾入库后 hash 自洽, verify 查不出, 只在 restore 时炸.
+ * 必须在采集点拦截, 见 {@link #readSlot} 的双重防御 (header entry 前后比对 +
+ * inflate 完整性校验), 命中抛 {@link TornReadException}.
+ *
+ * <p><b>超大 chunk (.mcc)</b>: compression type 字节高位 0x80 置位 = 数据外置在同
+ * 目录 c.&lt;chunkX&gt;.&lt;chunkZ&gt;.mcc, slot 内只有 1 byte stub. reader 识别后
+ * 读外置文件拼成完整 store 对象, 见 {@link ChunkPayloadCodec} 的布局定义.
  */
 public final class RegionFileSlotReader {
 
     private static final int SECTOR_BYTES = 4096;
     private static final int LENGTH_HEADER_BYTES = 4;
+    private static final int REGION_SHIFT = 5;
+    private static final int REGION_SIZE = 1 << REGION_SHIFT;
 
     private RegionFileSlotReader() {
     }
@@ -42,9 +53,39 @@ public final class RegionFileSlotReader {
      * 其中 rx = chunkX &gt;&gt; 5, rz = chunkZ &gt;&gt; 5 (一个 region = 32x32 chunks).
      */
     public static Path mcaPathFor(Path regionDir, int chunkX, int chunkZ) {
-        int rx = chunkX >> 5;
-        int rz = chunkZ >> 5;
+        int rx = chunkX >> REGION_SHIFT;
+        int rz = chunkZ >> REGION_SHIFT;
         return regionDir.resolve("r." + rx + "." + rz + ".mca");
+    }
+
+    /**
+     * 给 .mca 文件 + region 内 local 坐标算回外置 .mcc 文件路径.
+     * .mcc 用绝对 chunk 坐标命名 (vanilla: c.&lt;chunkX&gt;.&lt;chunkZ&gt;.mcc),
+     * 绝对坐标由 .mca 文件名里的 region 坐标 + local 坐标推回.
+     */
+    public static Path mccPathFor(Path mcaFile, int localX, int localZ) {
+        long rxrz = regionCoordsFromName(mcaFile);
+        int rx = (int) (rxrz >> 32);
+        int rz = (int) rxrz;
+        int chunkX = (rx << REGION_SHIFT) + localX;
+        int chunkZ = (rz << REGION_SHIFT) + localZ;
+        return mcaFile.resolveSibling("c." + chunkX + "." + chunkZ + ".mcc");
+    }
+
+    /** 从 r.&lt;rx&gt;.&lt;rz&gt;.mca 文件名解析 region 坐标, 打包成 (rx&lt;&lt;32)|rz. */
+    private static long regionCoordsFromName(Path mcaFile) {
+        String name = mcaFile.getFileName().toString();
+        if (!name.startsWith("r.") || !name.endsWith(".mca")) {
+            throw new IllegalArgumentException("not a region file name: " + name);
+        }
+        String mid = name.substring(2, name.length() - 4);
+        int dot = mid.indexOf('.');
+        if (dot < 0) {
+            throw new IllegalArgumentException("malformed region file name: " + name);
+        }
+        int rx = Integer.parseInt(mid.substring(0, dot));
+        int rz = Integer.parseInt(mid.substring(dot + 1));
+        return ((long) rx << 32) | (rz & 0xFFFFFFFFL);
     }
 
     /** 用 chunk world 坐标读 (会内部计算 .mca 路径 + local x/z). */
@@ -53,30 +94,33 @@ public final class RegionFileSlotReader {
         if (!Files.exists(mcaFile)) {
             return null;
         }
-        return readSlot(mcaFile, chunkX & 31, chunkZ & 31);
+        return readSlot(mcaFile, chunkX & (REGION_SIZE - 1), chunkZ & (REGION_SIZE - 1));
     }
 
     /**
      * 读 .mca 文件里指定 (localX, localZ) 的 chunk slot. 返回 raw "compression type +
-     * 压缩 payload" 字节, 或 null 当 slot 为空 (chunk 没生成过).
+     * 压缩 payload" 字节 (external 形态下含 .mcc 内容), 或 null 当 slot 为空 (chunk 没生成过).
+     *
+     * <p>撕裂读双重防御:
+     * <ol>
+     *   <li>读 payload 前后各读一次 4 byte location entry, 不一致 = 期间 chunk 被搬迁
+     *       (vanilla 重写换了扇区), 整次读作废抛 {@link TornReadException}</li>
+     *   <li>对组装好的 store 对象做 inflate 完整性校验, 校验和不符 = 新旧字节混合,
+     *       抛 {@link TornReadException}</li>
+     * </ol>
      *
      * @param localX 0-31
      * @param localZ 0-31
+     * @throws TornReadException 检出撕裂读 (调用方应延后重试, 不得入库)
      */
     public static byte[] readSlot(Path mcaFile, int localX, int localZ) throws IOException {
         if (localX < 0 || localX > 31 || localZ < 0 || localZ > 31) {
             throw new IllegalArgumentException("local coords out of range: " + localX + "," + localZ);
         }
         try (FileChannel ch = FileChannel.open(mcaFile, StandardOpenOption.READ)) {
-            int headerByteOffset = 4 * (localX + localZ * 32);
+            int headerByteOffset = 4 * (localX + localZ * REGION_SIZE);
 
-            ByteBuffer headerBuf = ByteBuffer.allocate(4);
-            int headerRead = readFully(ch, headerBuf, headerByteOffset);
-            if (headerRead < 4) {
-                return null;
-            }
-            headerBuf.flip();
-            int locationEntry = headerBuf.getInt();
+            int locationEntry = readLocationEntry(ch, headerByteOffset);
             if (locationEntry == 0) {
                 return null;
             }
@@ -108,8 +152,64 @@ public final class RegionFileSlotReader {
 
             byte[] payload = new byte[actualLength];
             dataBuf.get(payload);
+
+            // 撕裂读防御 step 1: 读 payload 后再读一次 location entry. vanilla 原地重写
+            // 一个 chunk 时会改 location table (新扇区分配), 前后不一致即证明读期间发生
+            // 搬迁, 读到的 payload 可能横跨新旧两份数据.
+            int locationEntryAfter = readLocationEntry(ch, headerByteOffset);
+            if (locationEntryAfter != locationEntry) {
+                throw new TornReadException("chunk slot relocated during read at " + mcaFile
+                        + " slot=(" + localX + "," + localZ + "): location entry "
+                        + Integer.toHexString(locationEntry) + " -> " + Integer.toHexString(locationEntryAfter));
+            }
+
+            byte[] storeObject = resolveExternal(mcaFile, localX, localZ, payload);
+
+            // 撕裂读防御 step 2: inflate 完整性校验. header entry 没变但 vanilla 在同
+            // 扇区原地覆写部分字节 (size 不变的更新) 仍会让我们读到新旧混合 payload,
+            // 这种只有 zlib/gzip 的校验和能抓出来.
+            ChunkPayloadCodec.validateIntegrity(storeObject);
+
+            return storeObject;
+        }
+    }
+
+    /**
+     * 识别 external (.mcc) 形态. payload 首字节高位 0x80 置位时, slot 内只有 1 byte
+     * stub, 真实压缩数据在同目录 c.&lt;x&gt;.&lt;z&gt;.mcc. 读外置文件拼成完整 store
+     * 对象 = "stub byte + .mcc 内容". inline 形态直接返回 payload 不变.
+     */
+    private static byte[] resolveExternal(Path mcaFile, int localX, int localZ, byte[] payload) throws IOException {
+        if (!ChunkPayloadCodec.isExternal(payload[0])) {
             return payload;
         }
+        // external stub 的 in-slot payload 必须恰好 1 byte (vanilla 写 length=1).
+        // 长度不符说明 slot 同时含 internal + external 数据 = 损坏.
+        if (payload.length != 1) {
+            throw new IOException("external chunk stub has unexpected in-slot length " + payload.length
+                    + " in " + mcaFile + " slot=(" + localX + "," + localZ + ")");
+        }
+        Path mccFile = mccPathFor(mcaFile, localX, localZ);
+        if (!Files.isRegularFile(mccFile)) {
+            throw new IOException("external chunk file missing: " + mccFile
+                    + " (slot stub present in " + mcaFile + ")");
+        }
+        byte[] external = Files.readAllBytes(mccFile);
+        byte[] storeObject = new byte[1 + external.length];
+        storeObject[0] = payload[0];
+        System.arraycopy(external, 0, storeObject, 1, external.length);
+        return storeObject;
+    }
+
+    /** 读单个 4 byte big-endian location entry. EOF 视为 0 (空 slot). */
+    private static int readLocationEntry(FileChannel ch, int headerByteOffset) throws IOException {
+        ByteBuffer headerBuf = ByteBuffer.allocate(4);
+        int headerRead = readFully(ch, headerBuf, headerByteOffset);
+        if (headerRead < 4) {
+            return 0;
+        }
+        headerBuf.flip();
+        return headerBuf.getInt();
     }
 
     /** 把 buf 填满, 或者直到 EOF. 返回实际读到的字节数. */

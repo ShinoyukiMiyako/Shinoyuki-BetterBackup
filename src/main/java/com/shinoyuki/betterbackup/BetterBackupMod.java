@@ -207,10 +207,12 @@ public final class BetterBackupMod {
             HashFunction hashFunction = new Xxh128HashFunction();
             BetterBackupMetrics metrics = new BetterBackupMetrics();
             Set<Hash> writtenThisWindow = ConcurrentHashMap.newKeySet();
-            BackupContext context = new BackupContext(store, snapshotState, paths, hashFunction,
-                    writtenThisWindow, metrics);
-
+            // queue 先于 context 创建: context 持有同一个 queue 引用, chunk/entity task
+            // 命中撕裂读时把自己重 offer 回这个 queue 延后重试 (BackupContext.retryQueue).
             BlockingQueue<BackupTask> queue = new LinkedBlockingQueue<>();
+            BackupContext context = new BackupContext(store, snapshotState, paths, hashFunction,
+                    writtenThisWindow, metrics, queue);
+
             int threadCount = BetterBackupConfig.backupWorkerThreads();
             List<BackupWorker> workers = new ArrayList<>();
             List<Thread> workerThreads = new ArrayList<>();
