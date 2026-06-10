@@ -28,8 +28,9 @@ import java.util.stream.Stream;
  * 并登记到 {@link CurrentSnapshotState}, 由下一次快照统一纳入, 补齐降级窗口的缺口.
  *
  * <p><b>复用 Phase C baseline 机制</b>: 单 slot 的"读 raw bytes -> hash -> store.put ->
- * 登记 state"与撕裂读处理逻辑与 {@link BaselineScanner#scanRegionFile} 同源 (同一
- * {@link RegionFileSlotReader} + 同样的 TornReadException 不入库语义 + 同样以
+ * 登记 state"与错误处理逻辑与 {@link BaselineScanner#scanRegionFile} 同源 (同一
+ * {@link RegionFileSlotReader} + 同样的 TornReadException 不入库语义 + 同样对单 slot 的
+ * 结构性 IOException per-slot catch 后 continue 跳过坏块继续扫 + 同样以
  * CurrentSnapshotState 命中即跳过)。区别仅在选区: baseline 扫全量 region 一次, 本类只
  * 扫 mtime 晚于 cutoff 的 region (降级窗口可能变更的子集), 不持久化逐 region 进度
  * (一次性补采, 不续传)。
@@ -136,6 +137,14 @@ public final class DegradedRescan {
             } catch (TornReadException e) {
                 // 撕裂读: 不入库混合字节. 该 slot 正被 vanilla 原地重写, 是高频写的已加载
                 // chunk, 新进程的活跃 dirty 路径终会采到它. 补采放过即可, 不入库垃圾.
+                continue;
+            } catch (IOException e) {
+                // 单 slot 结构损坏 / 截断 (非撕裂的硬错误). 与 BaselineScanner.scanRegionFile
+                // 同源: 不让一个坏 chunk 中止整个降级窗口补采, 否则该 region 之后所有 region
+                // 的窗口 chunk 全部漏采, 且 degraded-session 标志保留导致下次启动重撞同一坏块
+                // 死循环. 记 ERROR 不吞细节, 跳过该 slot 继续扫其余 slot/region. 不入库残缺字节.
+                LOGGER.error("[BetterBackup] degraded-window rescan failed to read chunk slot ({},{}) dim={} entityChannel={} in {}",
+                        chunkX, chunkZ, dim, entityChannel, mca, e);
                 continue;
             }
             if (rawBytes == null) {
