@@ -193,6 +193,14 @@ public final class BaselineScanner {
                 // 路径已把它采进 state, 重查命中即不算漏 (clean 仍可能在下一轮恢复).
                 clean = false;
                 continue;
+            } catch (IOException e) {
+                // 单 slot 结构损坏 / 截断 (非撕裂的硬错误). 不让一个坏 chunk 中止整个全量
+                // 扫描 -- baseline 必须能跑完并续传. 记 ERROR 不吞细节, 标 unclean 留重扫;
+                // 该 chunk 若被加载过仍会由活跃 dirty 路径采到. 不入库残缺字节.
+                LOGGER.error("[BetterBackup] baseline failed to read chunk slot ({},{}) dim={} channel={} in {}",
+                        chunkX, chunkZ, dim, channel, mca, e);
+                clean = false;
+                continue;
             }
             if (rawBytes == null) {
                 continue; // 空 slot (chunk 没生成过), 正常跳过

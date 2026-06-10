@@ -10,6 +10,7 @@ import java.util.HashMap;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 
@@ -121,6 +122,37 @@ class SnapshotManifestTest {
         assertEquals(m.deltaBytes(), read.deltaBytes());
         assertEquals(hash(7), read.chunks().get("minecraft:overworld").get(100L));
         assertEquals(hash(8), read.levelDat());
+    }
+
+    @Test
+    void baseline_complete_round_trips_both_values() {
+        SnapshotManifest done = new SnapshotManifest(
+                SnapshotManifest.SCHEMA_VERSION, "id", 1L, 2L,
+                new HashMap<>(), new HashMap<>(), new HashMap<>(),
+                null, 0L, 0L, true);
+        assertEquals(true, SnapshotManifest.fromNbt(done.toNbt()).baselineComplete());
+
+        SnapshotManifest notDone = new SnapshotManifest(
+                SnapshotManifest.SCHEMA_VERSION, "id", 1L, 2L,
+                new HashMap<>(), new HashMap<>(), new HashMap<>(),
+                null, 0L, 0L, false);
+        assertEquals(false, SnapshotManifest.fromNbt(notDone.toNbt()).baselineComplete());
+    }
+
+    @Test
+    void legacy_manifest_without_baseline_field_reads_as_false() {
+        // 模拟旧 manifest: toNbt 后删掉 baselineComplete 字段, fromNbt 必须按 false 读
+        SnapshotManifest m = new SnapshotManifest(
+                SnapshotManifest.SCHEMA_VERSION, "id", 1L, 2L,
+                new HashMap<>(), new HashMap<>(), new HashMap<>(),
+                null, 0L, 0L, true);
+        var nbt = m.toNbt();
+        nbt.remove("baselineComplete");
+        assertFalse(nbt.contains("baselineComplete"), "field removed to simulate old manifest");
+
+        SnapshotManifest restored = SnapshotManifest.fromNbt(nbt);
+        assertEquals(false, restored.baselineComplete(),
+                "missing baselineComplete must default to false (old snapshot = baseline not done)");
     }
 
     @Test
