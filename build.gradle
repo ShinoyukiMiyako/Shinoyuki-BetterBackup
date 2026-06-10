@@ -61,8 +61,20 @@ repositories {
     mavenCentral()
 }
 
+// 单独解析 OpenHFT jar 供 -all jar 平铺 (shadow 式 flatten), 不拉传递依赖 (它本就零运行时依赖).
+// 用独立 configuration 而非复用 implementation, 是为了 zipTree 时拿到的就是这一个 jar.
+// 仅声明 + transitive=false; 不动 canBeResolved/canBeConsumed 标志, 否则会触发 configuration
+// 容器提前实化, 跟 ForgeGradle 的 fg.deobf bundled 仓库懒注册撞 "Cannot mutate ... repository".
+configurations {
+    openhftFlatten {
+        transitive = false
+    }
+}
+
 dependencies {
     minecraft "net.minecraftforge:forge:${minecraft_version}-${forge_version}"
+
+    openhftFlatten 'net.openhft:zero-allocation-hashing:0.16'
 
     // BAS hard dependency: 编译期 link API package (com.shinoyuki.betterautosave.api),
     // 运行时通过 mods.toml mandatory=true 强制要求装 BAS mod jar.
@@ -71,10 +83,8 @@ dependencies {
     implementation fg.deobf("com.shinoyuki.betterautosave:shinoyuki_betterautosave:${bas_version}")
 
     // xxh128 hash (DESIGN §7 默认): OpenHFT zero-allocation-hashing 是纯 Java
-    // 实现, 无 native 依赖, mod-friendly. 通过 jarJar 嵌入最终 mod jar 让用户
-    // 装 mod 时不需要单独装这个库.
+    // 实现, 无 native 依赖, mod-friendly. 编译期 link + 游戏内运行时都要它.
     implementation 'net.openhft:zero-allocation-hashing:0.16'
-    jarJar(group: 'net.openhft', name: 'zero-allocation-hashing', version: '[0.16,0.17)')
 
     testImplementation 'org.junit.jupiter:junit-jupiter:5.10.0'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.10.0'
@@ -82,6 +92,13 @@ dependencies {
 
 tasks.named('test', Test) {
     useJUnitPlatform()
+
+    // 进程级集成测试 (BackupCliAllJarProcessTest) 要起子进程跑最终 -all jar, 因此 test 必须
+    // 先产出它。依赖 reobfJarJar (= 最终落 build/libs 的那个 -all jar, reobf 后形态), 而非
+    // jarJar 半成品, 以验证真正给用户的产物。jar 路径经 system property 传给测试。
+    dependsOn('reobfJarJar')
+    def allJar = layout.buildDirectory.file("libs/${mod_id}-${mod_version}-all.jar")
+    systemProperty 'betterbackup.allJar', allJar.get().asFile.absolutePath
 }
 
 tasks.withType(JavaCompile).configureEach {
@@ -129,11 +146,32 @@ jar {
     finalizedBy 'reobfJar'
 }
 
-// ForgeGradle 6 的 jarJar 任务默认 disabled, 必须显式 enable. 否则 OpenHFT
-// zero-allocation-hashing 不会嵌入最终 mod jar, 用户装 mod 时 runtime
-// ClassNotFoundException. enable 后 jarJar 产出 fat jar 名为
-// shinoyuki_betterbackup-0.1.0-all.jar, 真正给用户装的是这个.
+// ForgeGradle 6 的 jarJar 任务默认 disabled, 必须显式 enable. enable 后 jarJar 产出 fat jar
+// 名为 shinoyuki_betterbackup-0.1.0-all.jar, 这是真正给用户装 / 跑离线 CLI 的产物.
 jarJar.enable()
+
+// OpenHFT zero-allocation-hashing 平铺进 -all jar (shadow 式 flatten) 而非 jarJar 嵌套.
+// 为什么不用 jarJar 嵌套: jarJar 把库放进 META-INF/jarjar/<lib>.jar, 这条路径只有 FML 的
+// 模块层加载器认得; `java -jar` 的应用类加载器看不见嵌套 jar, 导致离线 CLI 一调
+// Xxh128HashFunction 就 NoClassDefFoundError: net/openhft/hashing/LongTupleHashFunction.
+// 平铺成顶层 net/openhft/hashing/*.class 后, 应用类加载器与 FML 模块层都能解析.
+// reobf 只映射 Minecraft SRG 名, net.openhft.* 无映射原样透传, 平铺类不受影响.
+// 排除 OpenHFT 自带的 MANIFEST.MF / maven 元数据, 避免覆盖本 jar 的 manifest (含 Main-Class).
+// Apache-2.0 LICENSE / NOTICE 由 src/main/resources/META-INF/licenses/ 经 processResources 入 jar.
+// 注意: 顶层 `jarJar { }` 是 JarJarProjectExtension (声明要嵌套的库), 不是 Jar 任务.
+// 平铺要配的是 `jarJar` 这个 Jar-派生任务本身, 用 tasks.named 拿任务实例再 from().
+tasks.named('jarJar', net.minecraftforge.gradle.userdev.tasks.JarJar) {
+    // 用闭包包住 zipTree 让 configuration 解析推迟到任务执行期: 若在配置期 collect/zipTree
+    // 就会触发 openhftFlatten 解析 + 仓库定型, 跟 ForgeGradle 在 afterEvaluate 才定型 deobf
+    // 仓库的时序撞 "Cannot mutate ... repository". 闭包形式的 from() 是惰性求值.
+    from({ project.configurations.openhftFlatten.collect { zipTree(it) } }) {
+        exclude 'META-INF/MANIFEST.MF'
+        exclude 'META-INF/maven/**'
+    }
+    // 库内可能有重名条目 (与 FML jarJar 自身写入的 META-INF 目录项), 去重避免 jar 报错.
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
 tasks.build.dependsOn('jarJar')
 
 publishing {

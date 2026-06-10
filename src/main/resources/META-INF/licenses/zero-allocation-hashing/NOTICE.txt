@@ -1,0 +1,10 @@
+This product bundles net.openhft:zero-allocation-hashing version 0.16,
+which is available under the Apache License, Version 2.0.
+
+  Project: https://github.com/OpenHFT/Zero-Allocation-Hashing
+  Copyright Higher Frequency Trading http://www.higherfrequencytrading.com
+
+The bundled class files (net/openhft/hashing/*) are flattened into this
+jar so the offline CLI (java -jar) can resolve them from the application
+class loader. The full Apache-2.0 license text is in LICENSE.txt alongside
+this file.

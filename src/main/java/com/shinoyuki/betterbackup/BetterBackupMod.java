@@ -15,6 +15,8 @@ import com.shinoyuki.betterbackup.diagnostic.PrometheusExporter;
 import com.shinoyuki.betterbackup.integration.BackupListenerBridge;
 import com.shinoyuki.betterbackup.integration.PipelineDegradedHandler;
 import com.shinoyuki.betterbackup.io.WorldPaths;
+import com.shinoyuki.betterbackup.log.BackupLog;
+import com.shinoyuki.betterbackup.log.Slf4jLogSink;
 import com.shinoyuki.betterbackup.restore.PendingRestoreFlag;
 import com.shinoyuki.betterbackup.restore.RestoreFlow;
 import com.shinoyuki.betterbackup.safety.StoreLocationCheck;
@@ -106,6 +108,11 @@ public final class BetterBackupMod {
     private static volatile Thread activeBaselineThread;
 
     public BetterBackupMod() {
+        // 游戏内: 把 BackupLog 门面桥回 slf4j, 让已迁到门面的 CLI 可达类 (ChunkStore 等)
+        // 仍走 Forge 的 slf4j -> log4j2 管线, 服主日志观感不变。裸 JRE CLI 不走这里, 门面留默认
+        // System.err sink。安装放构造最前: store 在 onServerStarting 才用, 此时 sink 早已就位。
+        BackupLog.install(new Slf4jLogSink());
+
         IEventBus modBus = FMLJavaModLoadingContext.get().getModEventBus();
         modBus.addListener(BetterBackupConfig::onLoad);
         modBus.addListener(BetterBackupConfig::onReload);

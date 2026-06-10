@@ -1,7 +1,6 @@
 package com.shinoyuki.betterbackup.store;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import com.shinoyuki.betterbackup.log.BackupLog;
 
 import java.io.IOException;
 import java.nio.channels.FileChannel;
@@ -31,9 +30,10 @@ import java.util.UUID;
  */
 public final class ChunkStore {
 
-    // 直接 SLF4J 而非 BetterBackupMod.LOGGER: store 是 content-addressed 持久层, 被离线
-    // CLI (零 net.minecraft 依赖) 复用, 不能经 BetterBackupMod 把 Minecraft 运行时拽进来。
-    private static final Logger LOGGER = LoggerFactory.getLogger(ChunkStore.class);
+    // 走内部门面 BackupLog 而非 slf4j: store 是 content-addressed 持久层, 被离线 CLI (裸 JRE,
+    // classpath 无 slf4j) 复用。原先 slf4j 的 static LoggerFactory 调用让本类一加载就 NoClassDefFoundError。
+    // 门面默认 sink 直写 System.err, 游戏内由 BetterBackupMod 装 slf4j 桥接还原原 logger 名 / 格式。
+    private static final String LOGGER_NAME = ChunkStore.class.getName();
 
     private final Path storeRoot;
     private final Path chunksDir;
@@ -45,7 +45,7 @@ public final class ChunkStore {
 
     public void initialize() throws IOException {
         Files.createDirectories(chunksDir);
-        LOGGER.info("[BetterBackup] store initialized at {}", storeRoot.toAbsolutePath());
+        BackupLog.info(LOGGER_NAME, "[BetterBackup] store initialized at {}", storeRoot.toAbsolutePath());
     }
 
     public Path storeRoot() {
@@ -122,9 +122,9 @@ public final class ChunkStore {
             try {
                 Files.deleteIfExists(p);
                 count[0]++;
-                LOGGER.warn("[BetterBackup] removed orphan tmp file {}", p);
+                BackupLog.warn(LOGGER_NAME, "[BetterBackup] removed orphan tmp file {}", p);
             } catch (IOException e) {
-                LOGGER.error("[BetterBackup] failed to remove orphan tmp {}", p, e);
+                BackupLog.error(LOGGER_NAME, "[BetterBackup] failed to remove orphan tmp {}", p, e);
             }
         });
         return count[0];
