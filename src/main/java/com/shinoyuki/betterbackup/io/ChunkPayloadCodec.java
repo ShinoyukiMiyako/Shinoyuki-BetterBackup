@@ -36,6 +36,18 @@ public final class ChunkPayloadCodec {
     private ChunkPayloadCodec() {
     }
 
+    /**
+     * 校验一个 store 对象的压缩完整性 (fsck 用). 复用 {@link #validateIntegrity} 的
+     * inflate 校验逻辑, 不另写一套 zlib 解压。校验通过无返回, 损坏抛 {@link TornReadException}
+     * (撕裂读语义在 fsck 上下文等同 "store 对象压缩损坏"), 其余 IO 错误抛 IOException。
+     *
+     * <p>对外暴露 (public) 是因为离线 CLI 的 fsck 在 {@code cli} 包, 跨包复用本类的校验,
+     * 避免重复实现 gzip/zlib inflate 逻辑导致两份语义漂移。
+     */
+    public static void verifyStoreObject(byte[] storeObject) throws IOException {
+        validateIntegrity(storeObject);
+    }
+
     /** 该 compression type 字节是否标记 external (.mcc) 布局. */
     static boolean isExternal(byte compressionByte) {
         return (compressionByte & EXTERNAL_FLAG) != 0;
