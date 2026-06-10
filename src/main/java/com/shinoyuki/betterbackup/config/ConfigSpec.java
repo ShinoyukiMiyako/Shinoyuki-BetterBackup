@@ -46,6 +46,8 @@ public final class ConfigSpec {
 
     public static final ForgeConfigSpec.IntValue BACKUP_WORKER_THREADS;
 
+    public static final ForgeConfigSpec.IntValue BASELINE_SCAN_CHUNKS_PER_SECOND;
+
     public static final ForgeConfigSpec.BooleanValue VERIFY_ON_STARTUP;
     public static final ForgeConfigSpec.BooleanValue VERIFY_ON_SNAPSHOT;
     public static final ForgeConfigSpec.BooleanValue PANIC_ON_HASH_MISMATCH;
@@ -146,6 +148,19 @@ public final class ConfigSpec {
                          "CPU-bound (hash + optional compression). Default 2 covers typical loads.",
                          "Bump to 4 if you run a large server (~60+ players) with frequent autosave bursts.")
                 .defineInRange("backupWorkerThreads", 2, 1, 16);
+
+        BUILDER.pop();
+
+        BUILDER.comment("Baseline full scan: one-time sweep of every existing chunk so snapshots taken",
+                        "before the mod has seen a chunk load still contain the full world.").push("baseline");
+
+        BASELINE_SCAN_CHUNKS_PER_SECOND = BUILDER
+                .comment("Rate limit for the baseline full scan, in chunk slots read per second.",
+                         "The scan reads raw bytes off disk for every existing chunk in every dimension's",
+                         "region/ and entities/ directories; the limit keeps it from saturating disk IO",
+                         "while players are online. Default 50 finishes a ~1M chunk world in roughly 5.5 hours.",
+                         "Progress is checkpointed per region file, so a restart resumes where it left off.")
+                .defineInRange("scanChunksPerSecond", 50, 1, 100_000);
 
         BUILDER.pop();
 

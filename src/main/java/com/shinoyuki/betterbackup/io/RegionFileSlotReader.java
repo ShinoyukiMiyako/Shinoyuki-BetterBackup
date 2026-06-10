@@ -72,6 +72,21 @@ public final class RegionFileSlotReader {
         return mcaFile.resolveSibling("c." + chunkX + "." + chunkZ + ".mcc");
     }
 
+    /**
+     * 解析 r.&lt;rx&gt;.&lt;rz&gt;.mca 文件名为 region 坐标 (rx, rz). baseline 全量扫描枚举
+     * region 文件后用它把 region 内 local slot 还原成绝对 chunk 坐标.
+     *
+     * @throws IllegalArgumentException 文件名不符合 region 命名约定
+     */
+    public static RegionCoords parseRegionCoords(Path mcaFile) {
+        long packed = regionCoordsFromName(mcaFile);
+        return new RegionCoords((int) (packed >> 32), (int) packed);
+    }
+
+    /** region 文件坐标. */
+    public record RegionCoords(int rx, int rz) {
+    }
+
     /** 从 r.&lt;rx&gt;.&lt;rz&gt;.mca 文件名解析 region 坐标, 打包成 (rx&lt;&lt;32)|rz. */
     private static long regionCoordsFromName(Path mcaFile) {
         String name = mcaFile.getFileName().toString();

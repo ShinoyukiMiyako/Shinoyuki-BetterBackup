@@ -31,6 +31,8 @@ public final class BetterBackupConfig {
 
     private static volatile int backupWorkerThreads;
 
+    private static volatile int baselineScanChunksPerSecond;
+
     private static volatile boolean verifyOnStartup;
     private static volatile boolean verifyOnSnapshot;
     private static volatile boolean panicOnHashMismatch;
@@ -95,6 +97,10 @@ public final class BetterBackupConfig {
         return backupWorkerThreads;
     }
 
+    public static int baselineScanChunksPerSecond() {
+        return baselineScanChunksPerSecond;
+    }
+
     public static boolean verifyOnStartup() {
         return verifyOnStartup;
     }
@@ -146,6 +152,7 @@ public final class BetterBackupConfig {
         retentionWeekly = ConfigSpec.RETENTION_WEEKLY.get();
         retentionMonthly = ConfigSpec.RETENTION_MONTHLY.get();
         backupWorkerThreads = ConfigSpec.BACKUP_WORKER_THREADS.get();
+        baselineScanChunksPerSecond = ConfigSpec.BASELINE_SCAN_CHUNKS_PER_SECOND.get();
         verifyOnStartup = ConfigSpec.VERIFY_ON_STARTUP.get();
         verifyOnSnapshot = ConfigSpec.VERIFY_ON_SNAPSHOT.get();
         panicOnHashMismatch = ConfigSpec.PANIC_ON_HASH_MISMATCH.get();

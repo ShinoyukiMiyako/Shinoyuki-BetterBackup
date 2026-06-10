@@ -46,6 +46,20 @@ public final class CurrentSnapshotState {
         dirtyLevelDat.set(hash);
     }
 
+    /**
+     * 该 chunk 是否已在本周期 dirty map 中 (BAS 活跃路径已采或 baseline 已采过).
+     * baseline 全量扫描用此判定跳过已入队/已处理的 chunk: 以 CurrentSnapshotState
+     * 为准, 活跃 dirty 路径采的版本是磁盘最新状态, baseline 不该用旧字节覆盖它.
+     */
+    public boolean containsChunk(String dimensionId, long packedPos) {
+        return dirtyChunks.containsKey(new DimChunkKey(dimensionId, packedPos));
+    }
+
+    /** 同 {@link #containsChunk} 但针对 entity chunk 通道. */
+    public boolean containsEntityChunk(String dimensionId, long packedPos) {
+        return dirtyEntityChunks.containsKey(new DimChunkKey(dimensionId, packedPos));
+    }
+
     public int size() {
         return dirtyChunks.size() + dirtyEntityChunks.size() + dirtySavedData.size()
                 + (dirtyLevelDat.get() != null ? 1 : 0);
