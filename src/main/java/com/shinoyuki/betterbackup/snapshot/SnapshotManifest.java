@@ -48,8 +48,14 @@ import java.util.Objects;
  *     deltaBytes: long,
  *     baselineComplete: byte (0/1, 缺字段按 0=false 读, 兼容旧 manifest),
  *     files: { 相对路径: {h: byte[] hash, s: byte 1 (suspect 才写)} } (Phase D, 缺字段=空),
+ *     incomplete: byte (0/1, 缺字段按 0=false 读; Phase F: BAS 降级期间产出的快照标 1,
+ *                 表示 listener 已停 fire, 该快照可能漏采降级窗口内变更的 chunk),
  * }
  * </pre>
+ *
+ * <p><b>incomplete vs baselineComplete</b>: baselineComplete 是"全量基线扫描是否跑完"
+ * 的正向门禁 (false=尚未覆盖全世界, restore 拒绝); incomplete 是"本快照是否在 BAS 降级
+ * 失明状态下产出"的负向告警 (true=可能漏采). 二者正交, 各占一字段.
  */
 public record SnapshotManifest(
         int version,
@@ -63,7 +69,8 @@ public record SnapshotManifest(
         long totalUniqueBytes,
         long deltaBytes,
         boolean baselineComplete,
-        FileManifest files) {
+        FileManifest files,
+        boolean incomplete) {
 
     public static final int SCHEMA_VERSION = 1;
 
@@ -79,6 +86,7 @@ public record SnapshotManifest(
     private static final String K_DELTA_BYTES = "deltaBytes";
     private static final String K_BASELINE_COMPLETE = "baselineComplete";
     private static final String K_FILES = "files";
+    private static final String K_INCOMPLETE = "incomplete";
     private static final String K_POS = "pos";
     private static final String K_HASH = "hash";
 
@@ -89,6 +97,26 @@ public record SnapshotManifest(
         Objects.requireNonNull(savedData, "savedData");
         Objects.requireNonNull(files, "files");
         // levelDat 允许 null (snapshot 没含 level.dat 时)
+    }
+
+    /**
+     * 兼容构造器: incomplete 默认 false. 旧调用点 (非降级期间的正常快照构造) 沿用
+     * 12 参签名, 不必显式传 incomplete=false.
+     */
+    public SnapshotManifest(int version,
+                            String snapshotId,
+                            long createdAtMillis,
+                            long worldGameTime,
+                            Map<String, Map<Long, Hash>> chunks,
+                            Map<String, Map<Long, Hash>> entityChunks,
+                            Map<String, Hash> savedData,
+                            Hash levelDat,
+                            long totalUniqueBytes,
+                            long deltaBytes,
+                            boolean baselineComplete,
+                            FileManifest files) {
+        this(version, snapshotId, createdAtMillis, worldGameTime, chunks, entityChunks,
+                savedData, levelDat, totalUniqueBytes, deltaBytes, baselineComplete, files, false);
     }
 
     public static SnapshotManifest empty(String snapshotId, long worldGameTime) {
@@ -123,6 +151,7 @@ public record SnapshotManifest(
         root.putLong(K_DELTA_BYTES, deltaBytes);
         root.putBoolean(K_BASELINE_COMPLETE, baselineComplete);
         root.put(K_FILES, files.toNbt());
+        root.putBoolean(K_INCOMPLETE, incomplete);
         return root;
     }
 
@@ -150,7 +179,10 @@ public record SnapshotManifest(
                 root.getBoolean(K_BASELINE_COMPLETE),
                 // files: 旧 manifest 无此键, getCompound 返回空 compound, 解出空 FileManifest,
                 // 等于"该快照没有玩家数据通道", restore 时不回装文件 (跟旧行为一致).
-                FileManifest.fromNbt(root.getCompound(K_FILES)));
+                FileManifest.fromNbt(root.getCompound(K_FILES)),
+                // incomplete: 旧 manifest 无此键, getBoolean 缺键返回 false. 等于"非降级期间
+                // 产出的正常快照", 跟旧行为一致 (不告警).
+                root.getBoolean(K_INCOMPLETE));
     }
 
     /** 写到磁盘 (atomic: tmp + fsync + rename). */

@@ -67,6 +67,15 @@ public final class SnapshotCreator implements SnapshotTrigger {
     private final BooleanSupplier baselineCompleteSupplier;
     private final PlayerDataCollector playerDataCollector;
 
+    /**
+     * BAS 降级单向闩锁. PipelineStateListener 收到 onDegraded 后 {@link #markDegraded()}
+     * 置位, 此后本 creator 产出的每份快照都盖 incomplete 戳 (BAS 已停 fire, 活跃 dirty
+     * 路径失明, 该快照可能漏采降级窗口内变更的 chunk). 跟 BAS 侧 degraded 同为单向,
+     * 恢复语义 = 重启 + 下次启动重扫补采.
+     */
+    private final java.util.concurrent.atomic.AtomicBoolean degraded =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+
     public SnapshotCreator(ChunkStore store,
                            CurrentSnapshotState state,
                            WorldPaths paths,
@@ -98,6 +107,19 @@ public final class SnapshotCreator implements SnapshotTrigger {
     /** 给 /betterbackup status 读最近一次快照失败标记 (.incomplete). */
     public SnapshotFailureMarker failureMarker() {
         return failureMarker;
+    }
+
+    /**
+     * 置降级闩锁. PipelineStateListener 收到 BAS onDegraded 后调用一次. 此后本 creator
+     * 产出的快照 manifest.incomplete=true. 单向: 无复位, 恢复靠重启.
+     */
+    public void markDegraded() {
+        degraded.set(true);
+    }
+
+    /** 本 creator 是否已收到降级信号. 测试 / 诊断用. */
+    public boolean isDegraded() {
+        return degraded.get();
     }
 
     @Override
@@ -145,14 +167,15 @@ public final class SnapshotCreator implements SnapshotTrigger {
             int chunkCount = newManifest.chunks().values().stream().mapToInt(Map::size).sum();
             int entityCount = newManifest.entityChunks().values().stream().mapToInt(Map::size).sum();
             LOGGER.info(
-                    "[BetterBackup] snapshot created: {} ({}) chunks={} entity={} savedData={} files={} suspect={} levelDat={} baselineComplete={}",
+                    "[BetterBackup] snapshot created: {} ({}) chunks={} entity={} savedData={} files={} suspect={} levelDat={} baselineComplete={} incomplete={}",
                     newManifest.snapshotId(), reason,
                     chunkCount, entityCount,
                     newManifest.savedData().size(),
                     newManifest.files().hashes().size(),
                     newManifest.files().suspect().size(),
                     newManifest.levelDat() != null,
-                    newManifest.baselineComplete());
+                    newManifest.baselineComplete(),
+                    newManifest.incomplete());
 
             runIncrementalGc(newManifest);
         } catch (IOException e) {
@@ -255,7 +278,8 @@ public final class SnapshotCreator implements SnapshotTrigger {
                 0L,  // totalUniqueBytes: Phase 5 metrics commit 接入
                 0L,  // deltaBytes: 同上
                 baselineCompleteSupplier.getAsBoolean(),
-                files);
+                files,
+                degraded.get());
     }
 
     private Optional<SnapshotManifest> findLatestManifest() {

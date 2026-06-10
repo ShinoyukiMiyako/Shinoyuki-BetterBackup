@@ -5,6 +5,7 @@ import com.shinoyuki.betterbackup.diagnostic.BetterBackupMetrics;
 import com.shinoyuki.betterbackup.diagnostic.DiagnosticLogger;
 import com.shinoyuki.betterbackup.diagnostic.PrometheusExporter;
 import com.shinoyuki.betterbackup.integration.BackupListenerBridge;
+import com.shinoyuki.betterbackup.integration.PipelineDegradedHandler;
 import com.shinoyuki.betterbackup.schedule.SnapshotScheduler;
 import com.shinoyuki.betterbackup.snapshot.CurrentSnapshotState;
 import com.shinoyuki.betterbackup.snapshot.SnapshotCreator;
@@ -37,6 +38,7 @@ public final class BetterBackupCore {
     private static volatile BetterBackupMetrics METRICS;
     private static volatile PrometheusExporter EXPORTER;
     private static volatile BaselineProgress BASELINE_PROGRESS;
+    private static volatile PipelineDegradedHandler PIPELINE_DEGRADED_HANDLER;
 
     public static void install(ChunkStore store,
                                CurrentSnapshotState snapshotState,
@@ -78,10 +80,19 @@ public final class BetterBackupCore {
         METRICS = null;
         EXPORTER = null;
         BASELINE_PROGRESS = null;
+        PIPELINE_DEGRADED_HANDLER = null;
     }
 
     public static void setExporter(PrometheusExporter exporter) {
         EXPORTER = exporter;
+    }
+
+    public static void setPipelineDegradedHandler(PipelineDegradedHandler handler) {
+        PIPELINE_DEGRADED_HANDLER = handler;
+    }
+
+    public static PipelineDegradedHandler pipelineDegradedHandler() {
+        return PIPELINE_DEGRADED_HANDLER;
     }
 
     public static boolean isInstalled() {

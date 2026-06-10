@@ -4,6 +4,7 @@ import com.mojang.logging.LogUtils;
 import com.shinoyuki.betterautosave.api.SaveListenerRegistry;
 import com.shinoyuki.betterbackup.baseline.BaselineProgress;
 import com.shinoyuki.betterbackup.baseline.BaselineScanner;
+import com.shinoyuki.betterbackup.baseline.DegradedRescan;
 import com.shinoyuki.betterbackup.baseline.ThrottlingRateLimiter;
 import com.shinoyuki.betterbackup.command.BetterBackupCommand;
 import com.shinoyuki.betterbackup.config.BetterBackupConfig;
@@ -12,6 +13,7 @@ import com.shinoyuki.betterbackup.diagnostic.BetterBackupMetrics;
 import com.shinoyuki.betterbackup.diagnostic.DiagnosticLogger;
 import com.shinoyuki.betterbackup.diagnostic.PrometheusExporter;
 import com.shinoyuki.betterbackup.integration.BackupListenerBridge;
+import com.shinoyuki.betterbackup.integration.PipelineDegradedHandler;
 import com.shinoyuki.betterbackup.io.WorldPaths;
 import com.shinoyuki.betterbackup.restore.PendingRestoreFlag;
 import com.shinoyuki.betterbackup.restore.RestoreFlow;
@@ -20,7 +22,9 @@ import com.shinoyuki.betterbackup.schedule.IntervalScheduler;
 import com.shinoyuki.betterbackup.schedule.ManualScheduler;
 import com.shinoyuki.betterbackup.schedule.SnapshotScheduler;
 import com.shinoyuki.betterbackup.snapshot.CurrentSnapshotState;
+import com.shinoyuki.betterbackup.snapshot.DegradedSession;
 import com.shinoyuki.betterbackup.snapshot.SnapshotCreator;
+import com.shinoyuki.betterbackup.snapshot.SnapshotManifest;
 import com.shinoyuki.betterbackup.store.ChunkStore;
 import com.shinoyuki.betterbackup.store.Hash;
 import com.shinoyuki.betterbackup.store.HashFunction;
@@ -52,9 +56,11 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.stream.Stream;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -246,6 +252,14 @@ public final class BetterBackupMod {
             SnapshotScheduler scheduler = createScheduler();
             scheduler.start(creator);
 
+            // BAS 降级感知: 注册 PipelineStateListener. BAS 管线降级时暂停 scheduler +
+            // 标后续快照 incomplete + 持久化 degraded-session 标志供下次启动补采.
+            DegradedSession degradedSession = new DegradedSession(storeRoot);
+            PipelineDegradedHandler degradedHandler =
+                    new PipelineDegradedHandler(creator, scheduler, degradedSession);
+            SaveListenerRegistry.registerPipelineState(degradedHandler);
+            BetterBackupCore.setPipelineDegradedHandler(degradedHandler);
+
             DiagnosticLogger diagnosticLogger = new DiagnosticLogger();
             MinecraftForge.EVENT_BUS.register(diagnosticLogger);
 
@@ -253,6 +267,12 @@ public final class BetterBackupMod {
                     bridge, creator, scheduler, diagnosticLogger, metrics, baselineProgress);
 
             startBaselineScan(store, snapshotState, paths, hashFunction, writtenThisWindow, baselineProgress);
+
+            // 上一次运行经历过 BAS 降级时, 补采降级窗口内变更的 chunk. 在 baseline 之后跑:
+            // 二者都把 chunk 登记进 CurrentSnapshotState 等下次快照 drain, 互不冲突 (state
+            // 已采的 chunk 双方都按 contains 跳过).
+            runDegradedRescanIfNeeded(store, snapshotState, paths, hashFunction, writtenThisWindow,
+                    storeRoot, creator);
 
             if (BetterBackupConfig.prometheusEnabled()) {
                 String bind = BetterBackupConfig.prometheusBindAddress();
@@ -315,6 +335,11 @@ public final class BetterBackupMod {
             SaveListenerRegistry.unregisterChunk(bridge);
             SaveListenerRegistry.unregisterEntityChunk(bridge);
             SaveListenerRegistry.unregisterSavedData(bridge);
+        }
+
+        PipelineDegradedHandler degradedHandler = BetterBackupCore.pipelineDegradedHandler();
+        if (degradedHandler != null) {
+            SaveListenerRegistry.unregisterPipelineState(degradedHandler);
         }
 
         List<BackupWorker> workers = BetterBackupCore.workers();
@@ -397,6 +422,76 @@ public final class BetterBackupMod {
         thread.setDaemon(true);
         thread.start();
         LOGGER.info("[BetterBackup] baseline full scan started (rate={} chunk/s)", rate);
+    }
+
+    /**
+     * 上一次运行经历过 BAS 降级时, 补采降级窗口内变更的 chunk (PLAN Phase F).
+     *
+     * <p>检测 {@code degraded-session} 标志: 不存在直接返回. 存在则以上次完整快照
+     * (manifest.incomplete=false) 的 createdAtMillis 为 cutoff, 对 mtime 晚于 cutoff 的
+     * region/entities 文件做增量重扫 ({@link DegradedRescan}), 把降级窗口内 vanilla 同步
+     * 写盘但没进快照的 chunk 登记进 CurrentSnapshotState, 由下次快照纳入. 完成后清标志.
+     *
+     * <p>同步跑 (非后台线程): 只扫 mtime 变化的子集, 远小于全量 baseline; 且必须在下次
+     * 快照前补完才有意义. 重扫失败保留标志 (下次启动重试), 不清, 不 throw 中止启动.
+     */
+    private static void runDegradedRescanIfNeeded(ChunkStore store,
+                                                  CurrentSnapshotState state,
+                                                  WorldPaths paths,
+                                                  HashFunction hashFunction,
+                                                  Set<Hash> writtenThisWindow,
+                                                  Path storeRoot,
+                                                  SnapshotCreator creator) {
+        DegradedSession session = new DegradedSession(storeRoot);
+        if (!session.exists()) {
+            return;
+        }
+        long cutoff = lastCompleteSnapshotMillis(creator.snapshotsDir());
+        LOGGER.warn("[BetterBackup] degraded-session flag present from a prior run; "
+                + "rescanning region files modified after lastCompleteSnapshotMillis={} to backfill the degraded window",
+                cutoff);
+        DegradedRescan rescan = new DegradedRescan(store, state, paths, hashFunction, writtenThisWindow);
+        try {
+            DegradedRescan.Result result = rescan.rescan(cutoff);
+            session.clear();
+            LOGGER.info("[BetterBackup] degraded-window backfill done: recovered={} deduped={} skipped(active)={} regions={}; flag cleared",
+                    result.recovered(), result.deduped(), result.skippedActive(), result.regionsScanned());
+        } catch (IOException e) {
+            LOGGER.error("[BetterBackup] degraded-window rescan failed, flag retained for retry next start", e);
+        }
+    }
+
+    /**
+     * 上次"完整"快照 (manifest.incomplete=false) 的 createdAtMillis. 取不到 (无快照 / 全是
+     * 降级期间的 incomplete 快照) 返回 0, 让 DegradedRescan 退化为全量重扫 (保守, 宁多勿漏).
+     */
+    private static long lastCompleteSnapshotMillis(Path snapshotsDir) {
+        if (!Files.isDirectory(snapshotsDir)) {
+            return 0L;
+        }
+        try (Stream<Path> files = Files.list(snapshotsDir)) {
+            return files
+                    .filter(p -> p.getFileName().toString().endsWith(".manifest"))
+                    .map(BetterBackupMod::tryReadManifestForCutoff)
+                    .filter(Optional::isPresent)
+                    .map(Optional::get)
+                    .filter(m -> !m.incomplete())
+                    .map(SnapshotManifest::createdAtMillis)
+                    .max(Comparator.naturalOrder())
+                    .orElse(0L);
+        } catch (IOException e) {
+            LOGGER.error("[BetterBackup] failed to scan snapshots for degraded-rescan cutoff, using 0 (full rescan)", e);
+            return 0L;
+        }
+    }
+
+    private static Optional<SnapshotManifest> tryReadManifestForCutoff(Path path) {
+        try {
+            return Optional.of(SnapshotManifest.readFrom(path));
+        } catch (IOException e) {
+            LOGGER.warn("[BetterBackup] failed to read manifest {} for degraded-rescan cutoff, ignoring", path, e);
+            return Optional.empty();
+        }
     }
 
     private static SnapshotScheduler createScheduler() {
