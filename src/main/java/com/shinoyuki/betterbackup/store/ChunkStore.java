@@ -11,6 +11,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.UUID;
+import java.util.stream.Stream;
 
 /**
  * Content-addressed dedup store. 文件名 = hash hex 全长, 二级分桶 ({@code chunks/<2>/<6>/<full>})
@@ -110,23 +111,49 @@ public final class ChunkStore {
     }
 
     /**
-     * 删 tmp 孤儿 (kill -9 前 fsync / rename 留下的 .tmp). 启动时 verify 调用.
-     * 返回清掉的文件数.
+     * 删全部 tmp 孤儿 (kill -9 前 fsync / rename 留下的 .tmp). 离线 CLI / fsck / 测试用:
+     * 无并发 writer 时全删安全. 返回清掉的文件数.
      */
     public int cleanupOrphanTmpFiles() throws IOException {
+        return cleanupOrphanTmpFiles(Long.MAX_VALUE);
+    }
+
+    /**
+     * 只删 lastModified 早于 {@code deleteOlderThanMillis} 的 tmp 孤儿.
+     *
+     * <p>在线服务器后台清扫用: cutoff 取本进程启动时刻, 则只清掉**上一次运行**崩溃残留的
+     * .tmp (mtime &lt; 启动时刻), 绝不碰本次运行 worker 正在写的在途 .tmp (mtime &gt;= 启动时刻).
+     * 后者由 {@link #put} 的 rename + UUID 隔离自行管理. 这道时间闸让本清扫可与活跃 worker
+     * 并发跑而无 race —— 清扫与 put 不会争同一个 .tmp. 传 {@link Long#MAX_VALUE} 即无条件全删
+     * (离线 / 无并发场景), 此时跳过 mtime 探测零额外 stat.
+     *
+     * <p>{@code Files.walk} 的 Stream 是 {@link java.io.Closeable}, 用 try-with-resources 关闭
+     * 防文件句柄泄漏 (Windows 下泄漏句柄会阻止后续删除/重命名 chunksDir).
+     *
+     * @param deleteOlderThanMillis 仅删 lastModified 严格小于此值 (epoch ms) 的 .tmp.
+     * @return 实际删除的文件数.
+     */
+    public int cleanupOrphanTmpFiles(long deleteOlderThanMillis) throws IOException {
         if (!Files.exists(chunksDir)) {
             return 0;
         }
         int[] count = {0};
-        Files.walk(chunksDir).filter(p -> p.getFileName().toString().endsWith(".tmp")).forEach(p -> {
-            try {
-                Files.deleteIfExists(p);
-                count[0]++;
-                BackupLog.warn(LOGGER_NAME, "[BetterBackup] removed orphan tmp file {}", p);
-            } catch (IOException e) {
-                BackupLog.error(LOGGER_NAME, "[BetterBackup] failed to remove orphan tmp {}", p, e);
-            }
-        });
+        try (Stream<Path> walk = Files.walk(chunksDir)) {
+            walk.filter(p -> p.getFileName().toString().endsWith(".tmp")).forEach(p -> {
+                try {
+                    if (deleteOlderThanMillis != Long.MAX_VALUE
+                            && Files.getLastModifiedTime(p).toMillis() >= deleteOlderThanMillis) {
+                        return; // 本次运行的在途 .tmp, 留给 put 自己管理, 不碰
+                    }
+                    if (Files.deleteIfExists(p)) {
+                        count[0]++;
+                        BackupLog.warn(LOGGER_NAME, "[BetterBackup] removed orphan tmp file {}", p);
+                    }
+                } catch (IOException e) {
+                    BackupLog.error(LOGGER_NAME, "[BetterBackup] failed to remove orphan tmp {}", p, e);
+                }
+            });
+        }
         return count[0];
     }
 }

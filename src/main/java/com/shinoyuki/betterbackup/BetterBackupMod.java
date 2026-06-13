@@ -199,6 +199,9 @@ public final class BetterBackupMod {
         LOGGER.info("[BetterBackup] starting for {}", event.getServer().name());
 
         try {
+            // orphan .tmp 后台清扫的时间闸 (见下方 verifyOnStartup 块): 此刻 worker 尚未启动,
+            // 无本次运行的在途 .tmp, 故 cutoff=此刻只清上次运行崩溃残留的孤儿, 不误删活跃 worker 的在途 .tmp。
+            long startMillis = System.currentTimeMillis();
             Path worldRoot = event.getServer().getWorldPath(LevelResource.ROOT);
             Path storeRoot = resolveStoreRoot(BetterBackupConfig.backupDirectory());
 
@@ -219,10 +222,25 @@ public final class BetterBackupMod {
             // 实际 atomic put (tmp + fsync + rename) 已经防止半写文件被引用, 但
             // 进程被强杀时 tmp 文件可能残留在磁盘, 这里启动时一次性清掉避免占空间.
             if (BetterBackupConfig.verifyOnStartup()) {
-                int cleaned = store.cleanupOrphanTmpFiles();
-                if (cleaned > 0) {
-                    LOGGER.warn("[BetterBackup] cleaned {} orphan .tmp files from store on startup", cleaned);
-                }
+                // orphan .tmp 全树扫描是 O(store 文件数), store 大时 (百万级 chunk) 可达数十秒。
+                // 绝不能在 server 主线程同步跑: ServerStartingEvent 在主线程同步 dispatch, 阻塞它
+                // 就推迟 ServerStarted / 登录门, 玩家被挡在 "server is still starting" 数十秒。改后台
+                // daemon 线程跑 (与下方 baseline 扫描同款)。cutoff=startMillis 只清上次运行的孤儿,
+                // 不碰本次 worker 在途 .tmp, 故可与活跃 worker 并发无 race。失败仅 warn (清扫不影响备份正确性)。
+                final long cleanupCutoff = startMillis;
+                Thread cleanupThread = new Thread(() -> {
+                    try {
+                        int cleaned = store.cleanupOrphanTmpFiles(cleanupCutoff);
+                        if (cleaned > 0) {
+                            LOGGER.warn("[BetterBackup] cleaned {} orphan .tmp files from store (background)", cleaned);
+                        }
+                    } catch (IOException e) {
+                        LOGGER.warn("[BetterBackup] orphan .tmp cleanup failed (non-fatal, retries next start)", e);
+                    }
+                }, "BetterBackup-Tmp-Cleanup");
+                cleanupThread.setDaemon(true);
+                cleanupThread.start();
+                LOGGER.info("[BetterBackup] orphan .tmp cleanup dispatched to background");
             }
 
             CurrentSnapshotState snapshotState = new CurrentSnapshotState();
