@@ -62,7 +62,7 @@ public final class PackStore {
     private final int hashLength;
     private final long targetPackSizeBytes;
 
-    private final Map<Hash, PackLocation> index = new ConcurrentHashMap<>();
+    private final PackIndex index = new InMemoryPackIndex();
     private final Map<Integer, FileChannel> readChannels = new ConcurrentHashMap<>();
     private final Object writeLock = new Object();
 
@@ -140,12 +140,33 @@ public final class PackStore {
         if (!Files.isDirectory(packsDir)) {
             return;
         }
+        List<Integer> ids = listPackIds();
         int maxId = -1;
-        for (int id : listPackIds()) {
-            scanPack(id);
+        for (int id : ids) {
             maxId = Math.max(maxId, id);
         }
         nextPackId = maxId + 1;
+
+        long fingerprint = packSetFingerprint(ids);
+        if (index.tryLoad(fingerprint)) {
+            return; // 持久索引命中 (mmap): 无需重扫 pack
+        }
+        // 无持久索引 / 指纹不匹配 (新 store / 崩溃恢复 / pack 变化): 顺序扫所有 pack 重建索引,
+        // 顺带截断 torn tail, 然后 checkpoint 落盘新索引.
+        for (int id : ids) {
+            scanPack(id);
+        }
+        index.checkpoint(fingerprint);
+    }
+
+    /** 当前 pack 集指纹: (sorted packId, 文件大小) 折叠. 用于持久索引判定是否仍与磁盘 pack 一致. */
+    private long packSetFingerprint(List<Integer> ids) throws IOException {
+        long fp = 1125899906842597L;
+        for (int id : ids) {
+            fp = fp * 31 + id;
+            fp = fp * 31 + Files.size(packPath(id));
+        }
+        return fp;
     }
 
     /**
@@ -158,13 +179,13 @@ public final class PackStore {
             throw new IllegalArgumentException("hash length " + hash.length()
                     + " != store hashLength " + hashLength);
         }
-        if (index.containsKey(hash)) {
+        if (index.contains(hash)) {
             return false;
         }
         storeLock.readLock().lock();
         try {
             synchronized (writeLock) {
-                if (index.containsKey(hash)) {
+                if (index.contains(hash)) {
                     return false;
                 }
                 ensureWriter();
@@ -186,7 +207,7 @@ public final class PackStore {
     }
 
     public boolean has(Hash hash) {
-        return index.containsKey(hash);
+        return index.contains(hash);
     }
 
     /** 读出对象原始字节. 不在 store 抛 {@link NoSuchFileException} (与 ChunkStore.get 缺失语义一致). */
@@ -251,21 +272,27 @@ public final class PackStore {
     }
 
     public void close() throws IOException {
-        synchronized (writeLock) {
+        storeLock.writeLock().lock();
+        try {
             if (writeChannel != null) {
                 writeChannel.force(true);
                 writeChannel.close();
                 writeChannel = null;
             }
-        }
-        for (FileChannel ch : readChannels.values()) {
-            try {
-                ch.close();
-            } catch (IOException e) {
-                BackupLog.warn(LOGGER_NAME, "[BetterBackup] failed to close pack read channel", e);
+            // checkpoint 索引: pack 文件此刻已最终化, 打上当前指纹, 下次 load 匹配即 mmap 命中免重扫.
+            index.checkpoint(packSetFingerprint(listPackIds()));
+            index.close();
+            for (FileChannel ch : readChannels.values()) {
+                try {
+                    ch.close();
+                } catch (IOException e) {
+                    BackupLog.warn(LOGGER_NAME, "[BetterBackup] failed to close pack read channel", e);
+                }
             }
+            readChannels.clear();
+        } finally {
+            storeLock.writeLock().unlock();
         }
-        readChannels.clear();
     }
 
     /**
@@ -349,10 +376,12 @@ public final class PackStore {
                 bytesReclaimed += deadBytes;
                 packsRewritten++;
             }
-            if (objectsRemoved > 0) {
+            if (packsDeleted > 0 || packsRewritten > 0) {
                 BackupLog.info(LOGGER_NAME,
                         "[BetterBackup] pack compact: objectsRemoved={} bytesReclaimed={} packsDeleted={} packsRewritten={}",
                         objectsRemoved, bytesReclaimed, packsDeleted, packsRewritten);
+                // pack 集已变, checkpoint 索引让下次 load 指纹匹配即可 mmap 命中.
+                index.checkpoint(packSetFingerprint(listPackIds()));
             }
             return new CompactResult(objectsRemoved, bytesReclaimed, packsDeleted, packsRewritten);
         } finally {
@@ -504,6 +533,9 @@ public final class PackStore {
 
     private List<Integer> listPackIds() throws IOException {
         List<Integer> ids = new ArrayList<>();
+        if (!Files.isDirectory(packsDir)) {
+            return ids;
+        }
         try (Stream<Path> list = Files.list(packsDir)) {
             for (Path p : (Iterable<Path>) list::iterator) {
                 String name = p.getFileName().toString();
