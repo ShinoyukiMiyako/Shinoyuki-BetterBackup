@@ -10,8 +10,10 @@ import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Random;
+import java.util.Set;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -165,6 +167,82 @@ class PackStoreTest {
         PackStore wrongLen = new PackStore(root, 32, PackStore.DEFAULT_TARGET_PACK_SIZE_BYTES);
         assertThrows(IOException.class, wrongLen::initialize,
                 "opening an existing store with a different hash length must be rejected");
+    }
+
+    @Test
+    void compact_physically_reclaims_dead_objects_and_survives_reopen(@TempDir Path root) throws IOException {
+        List<Hash> hashes = new ArrayList<>();
+        List<byte[]> objs = new ArrayList<>();
+        PackStore store = new PackStore(root, HASH_LEN, 1200); // 小封口 -> 多 pack
+        store.initialize();
+        for (int i = 0; i < 8; i++) {
+            byte[] o = randomBytes(500, 300 + i);
+            Hash h = hashFn.hash(o);
+            store.put(h, o);
+            hashes.add(h);
+            objs.add(o);
+        }
+        store.flushAndSync();
+        store.close();
+
+        // 重开后无在写 pack, 所有 pack 都可压实. 只保留偶数下标对象存活.
+        PackStore store2 = new PackStore(root, HASH_LEN, 1200);
+        store2.initialize();
+        Set<Hash> live = new HashSet<>();
+        for (int i = 0; i < 8; i += 2) {
+            live.add(hashes.get(i));
+        }
+        PackStore.CompactResult r = store2.compact(live, 0.0); // 阈值 0 -> 任何死字节都触发回收
+        assertEquals(4, r.objectsRemoved(), "4 odd-indexed dead objects reclaimed");
+        for (int i = 0; i < 8; i++) {
+            if (i % 2 == 0) {
+                assertArrayEquals(objs.get(i), store2.get(hashes.get(i)), "live object " + i + " survives compaction");
+            } else {
+                assertFalse(store2.has(hashes.get(i)), "dead object " + i + " physically reclaimed");
+            }
+        }
+        store2.flushAndSync();
+        store2.close();
+
+        // 回收必须跨重启保持 (物理删除, 非逻辑墓碑)
+        PackStore reopened = new PackStore(root, HASH_LEN, 1200);
+        reopened.initialize();
+        assertEquals(4, reopened.objectCount(), "only live objects remain after compaction + reopen");
+        for (int i = 0; i < 8; i++) {
+            if (i % 2 == 0) {
+                assertArrayEquals(objs.get(i), reopened.get(hashes.get(i)));
+            } else {
+                assertFalse(reopened.has(hashes.get(i)), "reclaimed object must stay gone after reopen");
+            }
+        }
+        reopened.close();
+    }
+
+    @Test
+    void compact_never_touches_the_active_write_pack(@TempDir Path root) throws IOException {
+        // 小封口下连写 4 个 ~520B 对象: 前 3 个落已封口的 pack0, 第 4 个落在写 pack1.
+        PackStore store = new PackStore(root, HASH_LEN, 1200);
+        store.initialize();
+        List<Hash> hashes = new ArrayList<>();
+        List<byte[]> objs = new ArrayList<>();
+        for (int i = 0; i < 4; i++) {
+            byte[] o = randomBytes(500, 700 + i);
+            Hash h = hashFn.hash(o);
+            store.put(h, o);
+            hashes.add(h);
+            objs.add(o);
+        }
+        store.flushAndSync();
+
+        // 全部标死. 封口 pack0 应被删, 在写 pack1 必须跳过 (其对象存活).
+        PackStore.CompactResult r = store.compact(new HashSet<>(), 0.0);
+        assertEquals(1, r.packsDeleted(), "the sealed all-dead pack is deleted");
+        for (int i = 0; i < 3; i++) {
+            assertFalse(store.has(hashes.get(i)), "object " + i + " in sealed pack reclaimed");
+        }
+        assertArrayEquals(objs.get(3), store.get(hashes.get(3)),
+                "object in the active write pack must survive compaction (pack still being appended)");
+        store.close();
     }
 
     private static byte[] randomBytes(int n, long seed) {

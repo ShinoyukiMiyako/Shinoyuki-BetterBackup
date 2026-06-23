@@ -15,7 +15,9 @@ import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.stream.Stream;
 
 /**
@@ -63,6 +65,10 @@ public final class PackStore {
     private final Map<Hash, PackLocation> index = new ConcurrentHashMap<>();
     private final Map<Integer, FileChannel> readChannels = new ConcurrentHashMap<>();
     private final Object writeLock = new Object();
+
+    // 压实排他锁: put/get/flushAndSync 持读锁 (彼此并发), compact 持写锁 (独占, 阻塞读写),
+    // 以便压实安全地重写/删除封口 pack 而不与活跃 worker 的 put/get 撞车.
+    private final ReentrantReadWriteLock storeLock = new ReentrantReadWriteLock();
 
     // 写状态 (writeLock 保护)
     private int nextPackId;
@@ -155,22 +161,27 @@ public final class PackStore {
         if (index.containsKey(hash)) {
             return false;
         }
-        synchronized (writeLock) {
-            if (index.containsKey(hash)) {
-                return false;
+        storeLock.readLock().lock();
+        try {
+            synchronized (writeLock) {
+                if (index.containsKey(hash)) {
+                    return false;
+                }
+                ensureWriter();
+                long recordStart = writeOffset;
+                ByteBuffer buf = ByteBuffer.allocate(hashLength + LEN_FIELD_BYTES + data.length);
+                buf.put(hash.bytes());
+                buf.putInt(data.length);
+                buf.put(data);
+                buf.flip();
+                writeFully(writeChannel, buf);
+                long dataOffset = recordStart + hashLength + LEN_FIELD_BYTES;
+                writeOffset += hashLength + LEN_FIELD_BYTES + data.length;
+                index.put(hash, new PackLocation(currentWritePackId, dataOffset, data.length));
+                return true;
             }
-            ensureWriter();
-            long recordStart = writeOffset;
-            ByteBuffer buf = ByteBuffer.allocate(hashLength + LEN_FIELD_BYTES + data.length);
-            buf.put(hash.bytes());
-            buf.putInt(data.length);
-            buf.put(data);
-            buf.flip();
-            writeFully(writeChannel, buf);
-            long dataOffset = recordStart + hashLength + LEN_FIELD_BYTES;
-            writeOffset += hashLength + LEN_FIELD_BYTES + data.length;
-            index.put(hash, new PackLocation(currentWritePackId, dataOffset, data.length));
-            return true;
+        } finally {
+            storeLock.readLock().unlock();
         }
     }
 
@@ -180,22 +191,32 @@ public final class PackStore {
 
     /** 读出对象原始字节. 不在 store 抛 {@link NoSuchFileException} (与 ChunkStore.get 缺失语义一致). */
     public byte[] get(Hash hash) throws IOException {
-        PackLocation loc = index.get(hash);
-        if (loc == null) {
-            throw new NoSuchFileException("object not in pack store: " + hash.toHex());
+        storeLock.readLock().lock();
+        try {
+            PackLocation loc = index.get(hash);
+            if (loc == null) {
+                throw new NoSuchFileException("object not in pack store: " + hash.toHex());
+            }
+            FileChannel ch = readChannel(loc.packId());
+            ByteBuffer buf = ByteBuffer.allocate(loc.length());
+            readFully(ch, buf, loc.dataOffset());
+            return buf.array();
+        } finally {
+            storeLock.readLock().unlock();
         }
-        FileChannel ch = readChannel(loc.packId());
-        ByteBuffer buf = ByteBuffer.allocate(loc.length());
-        readFully(ch, buf, loc.dataOffset());
-        return buf.array();
     }
 
     /** fsync 提交屏障: force 当前在写 pack. 封口的 pack 在换页时已各自 force, 无需重做. */
     public void flushAndSync() throws IOException {
-        synchronized (writeLock) {
-            if (writeChannel != null) {
-                writeChannel.force(true);
+        storeLock.readLock().lock();
+        try {
+            synchronized (writeLock) {
+                if (writeChannel != null) {
+                    writeChannel.force(true);
+                }
             }
+        } finally {
+            storeLock.readLock().unlock();
         }
     }
 
@@ -220,6 +241,150 @@ public final class PackStore {
             }
         }
         readChannels.clear();
+    }
+
+    /**
+     * 压实: 物理回收死字节. {@code live} 是存活对象 hash 集 (manifest 引用 ∪ 在途待引用),
+     * 不在其中的对象即死. 对每个封口 pack:
+     * <ul>
+     *   <li>全死 → 删整个 pack 文件 + 摘除其全部索引条目</li>
+     *   <li>死字节占比 &gt; {@code deadRatioThreshold} → 把存活对象重打包进新 pack, 删旧 pack</li>
+     *   <li>否则跳过 (死字节不够多, 重写不划算)</li>
+     * </ul>
+     * 当前在写 pack 不参与 (还在追加). 持写锁独占, 阻塞所有 put/get, 保证重写/删除安全.
+     *
+     * @param live              存活对象 hash 集; 不在其中的物理回收
+     * @param deadRatioThreshold 死字节占比超过此值才重打包 (0.0~1.0); 全死 pack 无视阈值直接删
+     */
+    public CompactResult compact(Set<Hash> live, double deadRatioThreshold) throws IOException {
+        storeLock.writeLock().lock();
+        try {
+            long objectsRemoved = 0;
+            long bytesReclaimed = 0;
+            int packsDeleted = 0;
+            int packsRewritten = 0;
+            int activeWritePack = currentWritePackId;
+            for (int packId : listPackIds()) {
+                if (packId == activeWritePack) {
+                    continue; // 在写 pack 不动
+                }
+                List<Rec> recs = readRecords(packId);
+                if (recs.isEmpty()) {
+                    continue;
+                }
+                long total = Files.size(packPath(packId));
+                long deadBytes = 0;
+                List<Rec> liveRecs = new ArrayList<>();
+                for (Rec r : recs) {
+                    if (live.contains(r.hash())) {
+                        liveRecs.add(r);
+                    } else {
+                        deadBytes += hashLength + LEN_FIELD_BYTES + (long) r.length();
+                    }
+                }
+                if (liveRecs.isEmpty()) {
+                    for (Rec r : recs) {
+                        index.remove(r.hash());
+                    }
+                    deletePackResources(packId);
+                    objectsRemoved += recs.size();
+                    bytesReclaimed += total;
+                    packsDeleted++;
+                    continue;
+                }
+                if ((double) deadBytes / total <= deadRatioThreshold) {
+                    continue;
+                }
+                rewritePackKeepingLive(packId, liveRecs);
+                for (Rec r : recs) {
+                    if (!live.contains(r.hash())) {
+                        index.remove(r.hash());
+                    }
+                }
+                deletePackResources(packId);
+                objectsRemoved += recs.size() - liveRecs.size();
+                bytesReclaimed += deadBytes;
+                packsRewritten++;
+            }
+            if (objectsRemoved > 0) {
+                BackupLog.info(LOGGER_NAME,
+                        "[BetterBackup] pack compact: objectsRemoved={} bytesReclaimed={} packsDeleted={} packsRewritten={}",
+                        objectsRemoved, bytesReclaimed, packsDeleted, packsRewritten);
+            }
+            return new CompactResult(objectsRemoved, bytesReclaimed, packsDeleted, packsRewritten);
+        } finally {
+            storeLock.writeLock().unlock();
+        }
+    }
+
+    /** 把 {@code liveRecs} 从旧 pack 读出重写进一个新 pack, 同步更新这些对象在索引中的位置. */
+    private void rewritePackKeepingLive(int oldPackId, List<Rec> liveRecs) throws IOException {
+        int newPackId = nextPackId++;
+        Path newPath = packPath(newPackId);
+        FileChannel in = readChannel(oldPackId);
+        try (FileChannel out = FileChannel.open(newPath, StandardOpenOption.CREATE, StandardOpenOption.WRITE)) {
+            long offset = 0;
+            for (Rec r : liveRecs) {
+                ByteBuffer data = ByteBuffer.allocate(r.length());
+                readFully(in, data, r.dataOffset());
+                ByteBuffer record = ByteBuffer.allocate(hashLength + LEN_FIELD_BYTES + r.length());
+                record.put(r.hash().bytes());
+                record.putInt(r.length());
+                record.put(data.array());
+                record.flip();
+                writeFully(out, record);
+                long newDataOffset = offset + hashLength + LEN_FIELD_BYTES;
+                index.put(r.hash(), new PackLocation(newPackId, newDataOffset, r.length()));
+                offset += hashLength + LEN_FIELD_BYTES + r.length();
+            }
+            out.force(true);
+        }
+    }
+
+    /** 关闭并摘除某 pack 的读 channel, 删除其文件. */
+    private void deletePackResources(int packId) throws IOException {
+        FileChannel ch = readChannels.remove(packId);
+        if (ch != null) {
+            try {
+                ch.close();
+            } catch (IOException e) {
+                BackupLog.warn(LOGGER_NAME, "[BetterBackup] failed to close read channel for pack {}", packId, e);
+            }
+        }
+        Files.deleteIfExists(packPath(packId));
+    }
+
+    /** 顺序扫一个 pack 读出全部记录 (不动索引). 遇 torn tail 停在上一条完整记录边界. */
+    private List<Rec> readRecords(int packId) throws IOException {
+        List<Rec> recs = new ArrayList<>();
+        Path p = packPath(packId);
+        try (FileChannel ch = FileChannel.open(p, StandardOpenOption.READ)) {
+            long size = ch.size();
+            long pos = 0;
+            while (pos + hashLength + LEN_FIELD_BYTES <= size) {
+                ByteBuffer header = ByteBuffer.allocate(hashLength + LEN_FIELD_BYTES);
+                readFully(ch, header, pos);
+                header.flip();
+                byte[] hashBytes = new byte[hashLength];
+                header.get(hashBytes);
+                int dataLength = header.getInt();
+                long dataStart = pos + hashLength + LEN_FIELD_BYTES;
+                if (dataLength < 0 || dataStart + dataLength > size) {
+                    break;
+                }
+                recs.add(new Rec(new Hash(hashBytes), dataStart, dataLength));
+                pos = dataStart + dataLength;
+            }
+        }
+        return recs;
+    }
+
+    /** 压实统计. */
+    public record CompactResult(long objectsRemoved, long bytesReclaimed, int packsDeleted, int packsRewritten) {
+    }
+
+    /** pack 内一条记录的 hash + 数据位置 (压实/扫描内部用). */
+    private record Rec(Hash hash, long dataOffset, int length) {
     }
 
     // ---- internals ----
