@@ -62,7 +62,7 @@ public final class PackStore {
     private final int hashLength;
     private final long targetPackSizeBytes;
 
-    private final PackIndex index = new InMemoryPackIndex();
+    private final PackIndex index;
     private final Map<Integer, FileChannel> readChannels = new ConcurrentHashMap<>();
     private final Object writeLock = new Object();
 
@@ -87,6 +87,9 @@ public final class PackStore {
         this.metaFile = packsDir.resolve("store.meta");
         this.hashLength = hashLength;
         this.targetPackSizeBytes = targetPackSizeBytes;
+        // 紧凑有序 off-heap 索引 (零 JVM 堆): 百万对象生产的默认. 无持久 base.idx / 指纹失配时
+        // PackStore.load 自动顺序扫 pack 重建.
+        this.index = new MmapPackIndex(storeRoot.resolve("index"), hashLength);
     }
 
     public Path packsDir() {
@@ -147,16 +150,16 @@ public final class PackStore {
         }
         nextPackId = maxId + 1;
 
-        long fingerprint = packSetFingerprint(ids);
-        if (index.tryLoad(fingerprint)) {
+        if (index.tryLoad(packSetFingerprint(ids))) {
             return; // 持久索引命中 (mmap): 无需重扫 pack
         }
         // 无持久索引 / 指纹不匹配 (新 store / 崩溃恢复 / pack 变化): 顺序扫所有 pack 重建索引,
-        // 顺带截断 torn tail, 然后 checkpoint 落盘新索引.
+        // 顺带截断 torn tail. checkpoint 的指纹必须在扫描 (可能截断改了 pack 大小) 之后重算,
+        // 否则记的是截断前的过期指纹, 下次 load 又判失配白白重扫.
         for (int id : ids) {
             scanPack(id);
         }
-        index.checkpoint(fingerprint);
+        index.checkpoint(packSetFingerprint(ids));
     }
 
     /** 当前 pack 集指纹: (sorted packId, 文件大小) 折叠. 用于持久索引判定是否仍与磁盘 pack 一致. */
