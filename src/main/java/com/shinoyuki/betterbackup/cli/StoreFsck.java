@@ -75,75 +75,82 @@ public final class StoreFsck {
      */
     public VerifyResult verifyStore() throws IOException {
         ReferenceIndex refs = collectReferences();
+        Counters c = new Counters();
 
-        long chunkObjects = 0;
-        long fileObjects = 0;
-        long ok = 0;
-        List<String> hashMismatch = new ArrayList<>();
-        List<String> corrupt = new ArrayList<>();
-        List<String> orphans = new ArrayList<>();
+        // 1. pack 对象: 顺序扫每个 pack (机械盘友好), 记录内联 hash 即 expected。
+        store.packStore().forEachObject((storedHash, bytes) ->
+                classifyObject(storedHash.toHex(), storedHash, bytes, refs, c));
 
-        if (!Files.isDirectory(store.chunksDir())) {
-            return new VerifyResult(0, 0, 0, 0, hashMismatch, corrupt, orphans);
-        }
-
-        long scanned = 0;
-        try (Stream<Path> walk = Files.walk(store.chunksDir())) {
-            List<Path> files = walk.filter(Files::isRegularFile).toList();
-            for (Path file : files) {
-                String name = file.getFileName().toString();
-                if (name.endsWith(".tmp")) {
-                    // .tmp 孤儿是 cleanupOrphanTmpFiles 的责任, 不是损坏对象, 跳过不计。
-                    continue;
-                }
-                Hash expected;
-                try {
-                    expected = Hash.fromHex(name);
-                } catch (IllegalArgumentException e) {
-                    // 文件名不是合法 hex = 脏文件 / 人工误放, 算损坏让用户知道, 不静默。
-                    corrupt.add(name + " (filename is not valid hex)");
-                    scanned++;
-                    continue;
-                }
-                scanned++;
-                byte[] bytes = Files.readAllBytes(file);
-
-                // 重 hash 对比: 文件名声称的 hash 必须等于内容实际 hash。这是所有三类对象共通的
-                // 权威完整性判据 (content-addressed 自校验)。
-                Hash actual = hashFunction.hash(bytes);
-                if (!actual.equals(expected)) {
-                    hashMismatch.add(name + " (content hashes to " + actual.toHex() + ")");
-                    continue;
-                }
-
-                boolean isChunkPayload = refs.chunkPayload().contains(expected);
-                boolean isReferenced = isChunkPayload || refs.opaqueFile().contains(expected);
-                if (!isReferenced) {
-                    // orphan: 未被任何 manifest 引用。重 hash 已通过 (字节自洽), 仅是 GC 未回收的
-                    // 残留, 不是损坏。单独归类, 不做压缩校验 (类型未知)、不计入 corrupt。
-                    orphans.add(name);
-                    continue;
-                }
-
-                if (isChunkPayload) {
-                    // chunk payload 才有 "compression-type byte + zlib/gzip 流" 布局, 才能做 inflate
-                    // 完整性校验 (抓 hash 自洽但压缩流损坏的对象, 例如 inflate 提前 EOF)。
-                    chunkObjects++;
-                    try {
-                        ChunkPayloadCodec.verifyStoreObject(bytes);
-                    } catch (IOException e) {
-                        corrupt.add(name + " (" + e.getMessage() + ")");
+        // 2. 旧文件树残留对象 (迁移前 "一对象一文件" 布局): 文件名即 expected hash。
+        if (Files.isDirectory(store.chunksDir())) {
+            try (Stream<Path> walk = Files.walk(store.chunksDir())) {
+                List<Path> files = walk.filter(Files::isRegularFile).toList();
+                for (Path file : files) {
+                    String name = file.getFileName().toString();
+                    if (name.endsWith(".tmp")) {
+                        // .tmp 孤儿是 cleanupOrphanTmpFiles 的责任, 不是损坏对象, 跳过不计。
                         continue;
                     }
-                } else {
-                    // opaque 整文件 (poi 整文件 / playerdata、level.dat、SavedData 的 gzip NBT /
-                    // stats、advancements 的 JSON): 首字节不是 compression-type, 重 hash 即权威判据。
-                    fileObjects++;
+                    Hash expected;
+                    try {
+                        expected = Hash.fromHex(name);
+                    } catch (IllegalArgumentException e) {
+                        // 文件名不是合法 hex = 脏文件 / 人工误放, 算损坏让用户知道, 不静默。
+                        c.corrupt.add(name + " (filename is not valid hex)");
+                        c.scanned++;
+                        continue;
+                    }
+                    classifyObject(name, expected, Files.readAllBytes(file), refs, c);
                 }
-                ok++;
             }
         }
-        return new VerifyResult(scanned, ok, chunkObjects, fileObjects, hashMismatch, corrupt, orphans);
+        return new VerifyResult(c.scanned, c.ok, c.chunkObjects, c.fileObjects,
+                c.hashMismatch, c.corrupt, c.orphans);
+    }
+
+    /**
+     * 单对象分类校验 (pack 与旧树共用). expected = 对象声称的 hash (pack 内联 / 旧树文件名)。
+     * 重 hash 对比是所有类型共通的权威完整性判据; chunk payload 类额外做压缩流校验; opaque 整文件
+     * 仅重 hash; 未被任何 manifest 引用的归 orphan (GC 残留, 非损坏)。
+     */
+    private void classifyObject(String label, Hash expected, byte[] bytes, ReferenceIndex refs, Counters c) {
+        c.scanned++;
+        Hash actual = hashFunction.hash(bytes);
+        if (!actual.equals(expected)) {
+            c.hashMismatch.add(label + " (content hashes to " + actual.toHex() + ")");
+            return;
+        }
+        boolean isChunkPayload = refs.chunkPayload().contains(expected);
+        boolean isReferenced = isChunkPayload || refs.opaqueFile().contains(expected);
+        if (!isReferenced) {
+            c.orphans.add(label);
+            return;
+        }
+        if (isChunkPayload) {
+            // chunk payload 才有 "compression-type byte + zlib/gzip 流" 布局, 才能 inflate 完整性校验。
+            c.chunkObjects++;
+            try {
+                ChunkPayloadCodec.verifyStoreObject(bytes);
+            } catch (IOException e) {
+                c.corrupt.add(label + " (" + e.getMessage() + ")");
+                return;
+            }
+        } else {
+            // opaque 整文件 (poi / playerdata、level.dat、SavedData 的 gzip NBT / JSON): 重 hash 即判据。
+            c.fileObjects++;
+        }
+        c.ok++;
+    }
+
+    /** verifyStore 跨 pack / 旧树累计计数的可变载体. */
+    private static final class Counters {
+        long scanned;
+        long ok;
+        long chunkObjects;
+        long fileObjects;
+        final List<String> hashMismatch = new ArrayList<>();
+        final List<String> corrupt = new ArrayList<>();
+        final List<String> orphans = new ArrayList<>();
     }
 
     /**

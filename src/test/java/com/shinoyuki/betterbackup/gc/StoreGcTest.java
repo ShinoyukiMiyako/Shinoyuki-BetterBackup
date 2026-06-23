@@ -154,7 +154,9 @@ class StoreGcTest {
         assertEquals(100, r.scanned());
         assertEquals(50, r.retained());
         assertEquals(50, r.deleted());
-        assertEquals(expectedBytesFreed, r.bytesFreed());
+        // pack 回收的字节含每对象 [hash][len] 帧头, 故 >= 纯数据字节
+        assertTrue(r.bytesFreed() >= expectedBytesFreed,
+                "reclaimed bytes must cover at least the dead object data (" + expectedBytesFreed + ")");
         // 物理验证: 引用的还在, 未引用的真删了
         for (int i = 1; i <= 100; i++) {
             Hash h = hash(i);
@@ -200,110 +202,92 @@ class StoreGcTest {
     }
 
     @Test
-    void gc_incremental_deletes_written_minus_referenced(@TempDir Path tempDir) throws IOException {
-        ChunkStore store = new ChunkStore(tempDir.resolve("backup-store"));
-        store.initialize();
+    void compact_after_snapshot_reclaims_unreferenced_intermediate_versions(@TempDir Path tempDir)
+            throws IOException {
+        Path storeRoot = tempDir.resolve("backup-store");
         Path snapshotsDir = tempDir.resolve("snapshots");
         Files.createDirectories(snapshotsDir);
+        ChunkStore store = new ChunkStore(storeRoot);
+        store.initialize();
 
-        // 模拟一个 BackupWorker 窗口写了 10 个 hash, 但 manifest 只引用其中 3 个
-        Set<Hash> written = new HashSet<>();
-        long expectedBytesFreed = 0;
+        // 一个窗口写 10 个对象, manifest 只引用前 3 个 (后 7 个是中间版本死字节)
         for (int i = 1; i <= 10; i++) {
-            Hash h = hash(i);
-            byte[] data = payload(i);
-            store.put(h, data);
-            written.add(h);
-            if (i > 3) {
-                // 后 7 个是中间版本, 应该被增量 GC 清掉
-                expectedBytesFreed += data.length;
-            }
+            store.put(hash(i), payload(i));
         }
         Set<Hash> referenced = new HashSet<>();
         for (int i = 1; i <= 3; i++) referenced.add(hash(i));
+        writeManifest(snapshotsDir, "snap-1", referenced);
+        store.close();
 
-        StoreGc gc = new StoreGc(store, snapshotsDir);
-        StoreGc.GcResult r = gc.gcIncremental(written, referenced);
+        // 重开 = 无在写 pack (封口), 所有 pack 可压实. 阈值 0 -> 任何死字节都回收.
+        ChunkStore reopened = new ChunkStore(storeRoot);
+        reopened.initialize();
+        StoreGc gc = new StoreGc(reopened, snapshotsDir);
+        StoreGc.GcResult r = gc.compactAfterSnapshot(0.0, new HashSet<>());
 
-        assertEquals(7, r.scanned(), "7 candidates = written(10) - referenced(3)");
-        assertEquals(0, r.retained());
-        assertEquals(7, r.deleted());
-        assertEquals(expectedBytesFreed, r.bytesFreed());
-        // 物理: 引用的留, 未引用的删
+        assertEquals(7, r.deleted(), "7 unreferenced intermediate versions reclaimed");
         for (int i = 1; i <= 3; i++) {
-            assertTrue(store.has(hash(i)), "referenced hash " + i + " kept");
+            assertTrue(reopened.has(hash(i)), "referenced object " + i + " kept");
         }
         for (int i = 4; i <= 10; i++) {
-            assertFalse(store.has(hash(i)), "unreferenced hash " + i + " deleted");
+            assertFalse(reopened.has(hash(i)), "intermediate object " + i + " reclaimed");
         }
     }
 
     @Test
-    void gc_incremental_no_op_when_written_subset_of_referenced(@TempDir Path tempDir)
+    void compact_after_snapshot_keeps_all_when_every_object_referenced(@TempDir Path tempDir)
             throws IOException {
-        ChunkStore store = new ChunkStore(tempDir.resolve("backup-store"));
-        store.initialize();
+        Path storeRoot = tempDir.resolve("backup-store");
         Path snapshotsDir = tempDir.resolve("snapshots");
         Files.createDirectories(snapshotsDir);
+        ChunkStore store = new ChunkStore(storeRoot);
+        store.initialize();
 
-        // written ⊆ referenced: 全部都被 manifest 引用, 无中间孤儿
-        Set<Hash> written = new HashSet<>();
-        Set<Hash> referenced = new HashSet<>();
+        Set<Hash> all = new HashSet<>();
         for (int i = 1; i <= 5; i++) {
-            Hash h = hash(i);
-            store.put(h, payload(i));
-            written.add(h);
-            referenced.add(h);
+            store.put(hash(i), payload(i));
+            all.add(hash(i));
         }
-        // referenced 还多包含一些不在 written 里的 hash (例如此前 snapshot 引用的)
-        for (int i = 100; i <= 110; i++) {
-            referenced.add(hash(i));
-        }
+        writeManifest(snapshotsDir, "snap-1", all);
+        store.close();
 
-        StoreGc gc = new StoreGc(store, snapshotsDir);
-        StoreGc.GcResult r = gc.gcIncremental(written, referenced);
+        ChunkStore reopened = new ChunkStore(storeRoot);
+        reopened.initialize();
+        StoreGc gc = new StoreGc(reopened, snapshotsDir);
+        StoreGc.GcResult r = gc.compactAfterSnapshot(0.0, new HashSet<>());
 
-        assertEquals(0, r.scanned());
-        assertEquals(0, r.retained());
-        assertEquals(0, r.deleted());
-        assertEquals(0, r.bytesFreed());
-        // 物理: 全部 written hash 还在 store
+        assertEquals(0, r.deleted(), "all referenced -> nothing reclaimed");
         for (int i = 1; i <= 5; i++) {
-            assertTrue(store.has(hash(i)));
+            assertTrue(reopened.has(hash(i)));
         }
     }
 
     @Test
-    void gc_incremental_tolerates_already_missing_files(@TempDir Path tempDir) throws IOException {
-        ChunkStore store = new ChunkStore(tempDir.resolve("backup-store"));
-        store.initialize();
+    void compact_after_snapshot_protects_in_flight_objects(@TempDir Path tempDir) throws IOException {
+        Path storeRoot = tempDir.resolve("backup-store");
         Path snapshotsDir = tempDir.resolve("snapshots");
         Files.createDirectories(snapshotsDir);
+        ChunkStore store = new ChunkStore(storeRoot);
+        store.initialize();
 
-        // 5 个 candidate, 其中 2 个真存在 store, 3 个不存在 (例如已被别处删 / 写失败)
-        Set<Hash> written = new HashSet<>();
-        long expectedBytes = 0;
+        // 5 个对象写入但还没进任何 manifest (在途待引用)
+        Set<Hash> inFlight = new HashSet<>();
         for (int i = 1; i <= 5; i++) {
-            Hash h = hash(i);
-            written.add(h);
-            if (i <= 2) {
-                byte[] data = payload(i);
-                store.put(h, data);
-                expectedBytes += data.length;
-            }
-            // i >= 3: written 集合里有, 但 store 里没文件
+            store.put(hash(i), payload(i));
+            inFlight.add(hash(i));
         }
-        Set<Hash> referenced = new HashSet<>(); // 空, 全部 candidate
+        store.close();
 
-        StoreGc gc = new StoreGc(store, snapshotsDir);
-        StoreGc.GcResult r = gc.gcIncremental(written, referenced);
+        ChunkStore reopened = new ChunkStore(storeRoot);
+        reopened.initialize();
+        StoreGc gc = new StoreGc(reopened, snapshotsDir);
+        // 无 manifest 引用它们, 但 protect 集保护 -> 一个都不能回收 (防压实误删在途对象)
+        StoreGc.GcResult r = gc.compactAfterSnapshot(0.0, inFlight);
 
-        // candidates 数永远等于 written - referenced, 跟物理是否存在无关
-        assertEquals(5, r.scanned());
-        assertEquals(0, r.retained());
-        // deleted 只反映实际删了几个物理文件
-        assertEquals(2, r.deleted());
-        assertEquals(expectedBytes, r.bytesFreed());
+        assertEquals(0, r.deleted(), "in-flight objects in the protect set must not be reclaimed");
+        for (int i = 1; i <= 5; i++) {
+            assertTrue(reopened.has(hash(i)), "protected object " + i + " survives");
+        }
     }
 
     @Test

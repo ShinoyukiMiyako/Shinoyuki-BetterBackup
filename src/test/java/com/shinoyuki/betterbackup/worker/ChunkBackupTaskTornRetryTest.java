@@ -79,7 +79,7 @@ class ChunkBackupTaskTornRetryTest {
         new ChunkBackupTask(DIM, packed).execute(h.ctx);
 
         // 1) 没有任何对象进 store (混合垃圾不得入库)
-        assertEquals(0, countStoreObjects(h.store.chunksDir()),
+        assertEquals(0, countStoreObjects(h.store),
                 "torn read must not write any garbage object to store");
         // 2) 不静默丢弃: 队列里出现一个 attempt=1 的重试 task
         assertEquals(1, h.queue.size(), "torn read must requeue exactly one retry task");
@@ -106,7 +106,7 @@ class ChunkBackupTaskTornRetryTest {
         // 已经达到上限的 task: 不应再 requeue, 应记失败并放弃
         new ChunkBackupTask(DIM, packed, ChunkBackupTask.MAX_RETRY_ATTEMPTS).execute(h.ctx);
 
-        assertEquals(0, countStoreObjects(h.store.chunksDir()),
+        assertEquals(0, countStoreObjects(h.store),
                 "at max attempts garbage still must not be stored");
         assertEquals(0, h.queue.size(), "at max attempts no further retry must be enqueued");
         assertEquals(1, h.metrics.snapshot().chunksFailed(),
@@ -124,7 +124,7 @@ class ChunkBackupTaskTornRetryTest {
         new ChunkBackupTask(DIM, packed).execute(h.ctx);
 
         assertEquals(0, h.queue.size(), "valid chunk must not be requeued");
-        assertEquals(1, countStoreObjects(h.store.chunksDir()), "valid chunk must be stored once");
+        assertEquals(1, countStoreObjects(h.store), "valid chunk must be stored once");
         // store 里那一个对象内容必须等于读回的 slot 字节
         Hash hash = new Xxh128HashFunction().hash(expected);
         assertTrue(h.store.has(hash), "stored object must be addressable by content hash");
@@ -184,14 +184,8 @@ class ChunkBackupTaskTornRetryTest {
         }
     }
 
-    private static long countStoreObjects(Path chunksDir) throws IOException {
-        if (!Files.exists(chunksDir)) {
-            return 0;
-        }
-        try (var stream = Files.walk(chunksDir)) {
-            return stream.filter(Files::isRegularFile)
-                    .filter(p -> !p.getFileName().toString().endsWith(".tmp"))
-                    .count();
-        }
+    /** store 当前对象数 (pack 时代: 新写入都进 pack, 直接读 pack 索引计数). */
+    private static long countStoreObjects(ChunkStore store) {
+        return store.packStore().objectCount();
     }
 }

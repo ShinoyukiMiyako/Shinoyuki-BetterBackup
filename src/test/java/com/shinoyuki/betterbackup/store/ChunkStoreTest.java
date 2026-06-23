@@ -7,6 +7,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -60,16 +61,20 @@ class ChunkStoreTest {
     }
 
     @Test
-    void put_atomic_no_orphan_tmp_after_normal_completion(@TempDir Path tempDir) throws IOException {
-        ChunkStore store = new ChunkStore(tempDir.resolve("backup-store"));
+    void put_persists_object_without_leaving_tmp(@TempDir Path tempDir) throws IOException {
+        Path storeRoot = tempDir.resolve("backup-store");
+        ChunkStore store = new ChunkStore(storeRoot);
         store.initialize();
         Hash hash = Hash.fromHex("22222222222222222222222222222222");
-        store.put(hash, new byte[]{1});
+        byte[] data = {1, 2, 3};
+        assertTrue(store.put(hash, data));
 
-        // .tmp 文件不应该残留
-        Path target = store.pathFor(hash);
-        assertFalse(Files.exists(target.resolveSibling(target.getFileName() + ".tmp")));
-        assertTrue(Files.exists(target));
+        // 对象可读回, 且 store 目录树里不残留任何 .tmp (pack append 无 per-object tmp)
+        assertArrayEquals(data, store.get(hash));
+        try (Stream<Path> walk = Files.walk(storeRoot)) {
+            assertFalse(walk.anyMatch(p -> p.getFileName().toString().endsWith(".tmp")),
+                    "no orphan .tmp anywhere under the store after a normal put");
+        }
     }
 
     @Test

@@ -225,6 +225,31 @@ public final class PackStore {
         return index.size();
     }
 
+    /**
+     * 顺序遍历所有 pack 的每个对象 (内联 storedHash + 原始字节). fsck 完整性校验用 ——
+     * 按 pack 顺序读, 机械盘友好. 持读锁防压实并发改 pack.
+     */
+    public void forEachObject(ObjectVisitor visitor) throws IOException {
+        storeLock.readLock().lock();
+        try {
+            for (int packId : listPackIds()) {
+                for (Rec r : readRecords(packId)) {
+                    ByteBuffer buf = ByteBuffer.allocate(r.length());
+                    readFully(readChannel(packId), buf, r.dataOffset());
+                    visitor.visit(r.hash(), buf.array());
+                }
+            }
+        } finally {
+            storeLock.readLock().unlock();
+        }
+    }
+
+    /** {@link #forEachObject} 的访问回调. storedHash = pack 内联记录的 hash. */
+    @FunctionalInterface
+    public interface ObjectVisitor {
+        void visit(Hash storedHash, byte[] data) throws IOException;
+    }
+
     public void close() throws IOException {
         synchronized (writeLock) {
             if (writeChannel != null) {
@@ -257,8 +282,26 @@ public final class PackStore {
      * @param deadRatioThreshold 死字节占比超过此值才重打包 (0.0~1.0); 全死 pack 无视阈值直接删
      */
     public CompactResult compact(Set<Hash> live, double deadRatioThreshold) throws IOException {
+        return compact(live, deadRatioThreshold, false);
+    }
+
+    /**
+     * 同 {@link #compact(Set, double)}, 但可选先封口在写 pack 使其也参与压实.
+     *
+     * @param sealActiveWritePack true = 先 force+封口当前在写 pack 再压实 (全量 GC: 连最新写入也
+     *                            一并回收死字节, 下次 put 开新 pack); false = 跳过在写 pack
+     *                            (自动压实: 不打扰活跃 worker 的在途追加)
+     */
+    public CompactResult compact(Set<Hash> live, double deadRatioThreshold, boolean sealActiveWritePack)
+            throws IOException {
         storeLock.writeLock().lock();
         try {
+            if (sealActiveWritePack && writeChannel != null) {
+                writeChannel.force(true);
+                writeChannel.close();
+                writeChannel = null;
+                currentWritePackId = -1; // 已封口, 不再排除; 下次 put 开新 pack
+            }
             long objectsRemoved = 0;
             long bytesReclaimed = 0;
             int packsDeleted = 0;
