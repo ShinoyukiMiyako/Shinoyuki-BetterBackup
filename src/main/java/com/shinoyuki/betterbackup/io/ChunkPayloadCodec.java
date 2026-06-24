@@ -48,8 +48,8 @@ public final class ChunkPayloadCodec {
         validateIntegrity(storeObject);
     }
 
-    /** 该 compression type 字节是否标记 external (.mcc) 布局. */
-    static boolean isExternal(byte compressionByte) {
+    /** 该 compression type 字节是否标记 external (.mcc) 布局. (部分恢复据此清理过期 .mcc) */
+    public static boolean isExternal(byte compressionByte) {
         return (compressionByte & EXTERNAL_FLAG) != 0;
     }
 
