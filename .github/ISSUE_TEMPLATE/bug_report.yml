@@ -1,0 +1,91 @@
+name: 问题反馈 / Bug 报告
+description: 报告备份失败、回退异常、存储损坏、卡顿或其它 BUG
+labels: ["needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提交前请尽量填全以下信息。环境与版本缺失会显著拖慢定位 —— 很多问题在新版本里已经修好，请先确认你用的是最新正式版。
+        带「必填」的项目请务必提供。
+
+  - type: dropdown
+    id: suspected-category
+    attributes:
+      label: 你觉得可能是哪类问题？
+      description: 只是你的初步判断，最终以实际内容为准，分诊时会重新归类。
+      options:
+        - 快照 / 备份失败
+        - 在线回退异常 (restore-chunk-live)
+        - 离线回退 (/betterbackup restore <id> 停服重启)
+        - 存储损坏 (content store / pack / 哈希校验)
+        - 卡顿 / 掉 TPS / 性能
+        - 启动失败 / 崩溃
+        - 用法疑问
+        - 其它 / 暂不确定
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: 问题描述
+      description: 简述发生了什么（快照失败 / 回退后数据错乱 / 存储损坏 / 卡顿 / 崩溃 等）。
+    validations:
+      required: true
+
+  - type: input
+    id: bb-version
+    attributes:
+      label: BetterBackup 版本（必填）
+      placeholder: 例 0.1.0，请确认是当前最新正式版
+    validations:
+      required: true
+
+  - type: input
+    id: mc-loader
+    attributes:
+      label: Minecraft 版本与加载器（必填）
+      placeholder: 例 1.20.1 Forge 47.4.20
+    validations:
+      required: true
+
+  - type: input
+    id: java-runtime
+    attributes:
+      label: Java 版本 / 运行环境
+      placeholder: 例 Java 17，服务端 / 单人
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志 / 崩溃报告 / spark（必填）
+      description: |
+        把完整 latest.log（崩溃时再附 crash-reports 里对应文件）传到 https://mclo.gs 后贴链接，不要直接粘贴整份。
+        卡顿 / 掉 TPS 类：请在卡顿前后跑一次 /spark profiler，贴 spark 报告链接，对定位帮助很大。
+      placeholder: mclo.gs 链接、spark 链接…
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤 / 触发场景
+      description: 问题发生前在做什么？是否在执行定时快照、/betterbackup restore、在线区块回退、baseline 全量扫描、GC 等。能稳定复现请写出步骤。
+
+  - type: textarea
+    id: backup-store
+    attributes:
+      label: 备份存储情况
+      description: 备份目录大致多大、有多少个快照？是否手动改动过 content store / pack 文件？回退异常请注明用的是哪个快照 id 与命令。
+
+  - type: textarea
+    id: other-mods
+    attributes:
+      label: 其它存档 / 备份相关 mod
+      description: 是否同时安装了改写存档、区块或备份逻辑的 mod（如 BetterAutoSave、PrimeBackup、FTB Backups、Fast Async World Save、C2ME 等）？同类叠加可能产生冲突，请如实列出。
+
+  - type: textarea
+    id: bb-config
+    attributes:
+      label: BetterBackup 配置
+      description: 若改过 betterbackup 配置，贴出 common.toml 的相关片段（快照间隔、保留策略、回退/GC 设置等）；使用默认配置请注明「默认」。
