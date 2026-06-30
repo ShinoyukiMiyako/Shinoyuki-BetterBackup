@@ -178,6 +178,20 @@ public final class SnapshotCreator implements SnapshotTrigger {
             return;
         }
 
+        // 读上一份 manifest 作 overlay base —— 也必须在 drainAndClear 之前: 若选中的最新 manifest
+        // 存在但损坏, 退空基线会把这份"最新快照"写成只含本窗口 drain 的近空 manifest, 丢掉历史累积
+        // 的全部未变 chunk 引用; 故损坏时中止并保留 dirty 留给下次重试 (与磁盘预检同样的"留给下次"
+        // 语义)。仅当目录里确无任何 manifest (首次) 才以空基线继续。
+        SnapshotManifest previous;
+        try {
+            previous = loadPreviousBaseline().orElse(null);
+        } catch (CorruptBaselineException e) {
+            LOGGER.error("[BetterBackup] snapshot aborted: latest manifest unreadable; refusing to overwrite "
+                    + "it with an empty-baseline snapshot (dirty state preserved for retry)", e);
+            recordFailure("latest manifest unreadable: " + e.getMessage());
+            return;
+        }
+
         // baseline 晋升时序: 必须在 drainAndClear 之前捕获当前 scanned 集合. 这些 region
         // 的 chunk 登记此刻已在 state 里, 即将被本次 drain 纳入本份 manifest; manifest 写盘
         // 成功后才把这个捕获集晋升为 committed. drain 之后扫描线程再扫完的 region 其登记
@@ -198,8 +212,7 @@ public final class SnapshotCreator implements SnapshotTrigger {
             return;
         }
 
-        Optional<SnapshotManifest> previous = findLatestManifest();
-        SnapshotManifest newManifest = build(previous.orElse(null), drained, levelDatHash, files);
+        SnapshotManifest newManifest = build(previous, drained, levelDatHash, files);
 
         Path target = snapshotsDir.resolve(newManifest.snapshotId() + ".manifest");
         try {
@@ -375,29 +388,44 @@ public final class SnapshotCreator implements SnapshotTrigger {
                 degraded.get());
     }
 
-    private Optional<SnapshotManifest> findLatestManifest() {
+    /**
+     * 读取作为 overlay base 的上一份 manifest (snapshots/ 字典序最大的). 必须区分两种语义:
+     * <ul>
+     *   <li>目录里确无任何 .manifest (首次) → {@link Optional#empty()}, 调用方以空基线起算合法;</li>
+     *   <li>选中的最新 manifest 存在但读失败 (IOException 截断/坏压缩, 或 fromNbt 对坏 schema
+     *       version 抛 IllegalStateException、dimMapFromNbt 强转抛 ClassCastException 等 RuntimeException)
+     *       → 抛 {@link CorruptBaselineException}, 调用方据此中止本次快照, 绝不能退空基线把 latest
+     *       覆盖成近空 manifest。</li>
+     * </ul>
+     * 与 {@link StoreGc} 对损坏 manifest 一律硬失败 abort 的纪律一致, 不再静默 fail-open。
+     */
+    private Optional<SnapshotManifest> loadPreviousBaseline() throws CorruptBaselineException {
         if (!Files.isDirectory(snapshotsDir)) {
             return Optional.empty();
         }
+        Optional<Path> latest;
         try (Stream<Path> files = Files.list(snapshotsDir)) {
-            return files
+            latest = files
                     .filter(p -> p.getFileName().toString().endsWith(".manifest"))
-                    .max(Comparator.comparing(p -> p.getFileName().toString()))
-                    .map(this::tryReadManifest)
-                    .filter(Optional::isPresent)
-                    .map(Optional::get);
+                    .max(Comparator.comparing(p -> p.getFileName().toString()));
         } catch (IOException e) {
-            LOGGER.error("[BetterBackup] failed to list snapshots dir {}", snapshotsDir, e);
+            // 列目录失败 != 没有 manifest: 不能 fail-open 退空基线 (可能漏掉真实 latest 并覆盖它)。
+            throw new CorruptBaselineException("failed to list snapshots dir " + snapshotsDir, e);
+        }
+        if (latest.isEmpty()) {
             return Optional.empty();
+        }
+        try {
+            return Optional.of(SnapshotManifest.readFrom(latest.get()));
+        } catch (IOException | RuntimeException e) {
+            throw new CorruptBaselineException("latest manifest unreadable: " + latest.get(), e);
         }
     }
 
-    private Optional<SnapshotManifest> tryReadManifest(Path path) {
-        try {
-            return Optional.of(SnapshotManifest.readFrom(path));
-        } catch (IOException e) {
-            LOGGER.warn("[BetterBackup] failed to read manifest {}, ignoring", path, e);
-            return Optional.empty();
+    /** 选中的最新 manifest 存在却读不出 (损坏). create() 据此中止本次快照并保留 dirty。 */
+    private static final class CorruptBaselineException extends Exception {
+        CorruptBaselineException(String message, Throwable cause) {
+            super(message, cause);
         }
     }
 
