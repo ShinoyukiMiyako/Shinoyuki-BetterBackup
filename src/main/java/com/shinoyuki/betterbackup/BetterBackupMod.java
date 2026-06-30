@@ -139,8 +139,11 @@ public final class BetterBackupMod {
      * flag, 有的话临时 new ChunkStore + WorldPaths 跑 RestoreFlow 重建 region/
      * entities/ data/ + level.dat. 跑完删 flag, vanilla 接着正常 init world.
      *
-     * <p>失败 → log ERROR 不 throw, 不 abort vanilla 启动 (server 起来用户能进
-     * 游戏看 log 排查). flag 不删, 用户修复后重启会再跑一次.
+     * <p><b>失败即中止启动</b>: restore 在 moveCurrentWorldToBackup 之后、回写中途盘错时,
+     * worldRoot 会停在半重建态。此时绝不能放行 vanilla loadLevel —— 否则 vanilla 把缺失
+     * region 当新地形生成、autosave 写回, 污染现场且不可逆。故任何失败 (flag 读 / store init /
+     * 重建中途) 一律抛异常中止本次启动: 旧世界完好留在 {@code <world>.bak-*}, flag 保留,
+     * 服主看 log 修复后重启重试 (亦可手工从 .bak 复原)。
      *
      * <p>EventPriority.HIGHEST: 别的 mod 也 hook ServerAboutToStartEvent 时,
      * BetterBackup 必须先跑保证 region 文件已重建.
@@ -151,42 +154,60 @@ public final class BetterBackupMod {
             return;
         }
         Path worldRoot = event.getServer().getWorldPath(LevelResource.ROOT);
-
-        Optional<String> pendingId;
+        Path storeRoot = resolveStoreRoot(BetterBackupConfig.backupDirectory());
+        RestoreFlow.RestoreResult result;
         try {
-            pendingId = PendingRestoreFlag.read(worldRoot);
+            result = runPendingRestore(worldRoot, storeRoot);
         } catch (IOException e) {
-            LOGGER.error("[BetterBackup] failed to read pending restore flag", e);
-            return;
+            // worldRoot 可能停在半重建态: 中止启动而非放行 vanilla 加载半成品, .bak 与 flag 均保留。
+            throw new IllegalStateException(
+                    "[BetterBackup] pending restore FAILED; aborting server start to avoid loading a "
+                            + "half-restored world. The pre-restore world is preserved in <world>.bak-*, the "
+                            + "restore flag is retained for retry. Fix the underlying error and restart.", e);
         }
+        if (result != null) {
+            LOGGER.info("[BetterBackup] restore complete: chunks={} entity={} savedData={} files={} levelDat={} backupDir={}",
+                    result.chunkSlotsRestored(), result.entitySlotsRestored(),
+                    result.savedDataFilesRestored(), result.playerDataFilesRestored(),
+                    result.levelDatRestored(), result.worldBackupDir());
+        }
+    }
+
+    /**
+     * 执行 pending restore (若有): 检测 flag, 命中则跑 RestoreFlow 重建世界, 成功后删 flag。
+     * 任何失败 (flag 读 / store init / 重建中途) 都抛 IOException 冒泡, 绝不吞 —— 调用方据此
+     * 中止服务器启动, 防止 vanilla 加载半重建的 worldRoot。flag 仅在 restore 完整成功后才清,
+     * 失败时保留供重试。
+     *
+     * @return 执行了 restore 返回非空结果; 无 pending flag 返回 null。
+     */
+    static RestoreFlow.RestoreResult runPendingRestore(Path worldRoot, Path storeRoot) throws IOException {
+        Optional<String> pendingId = PendingRestoreFlag.read(worldRoot);
         if (pendingId.isEmpty()) {
-            return;
+            return null;
         }
         String snapshotId = pendingId.get();
         LOGGER.warn("[BetterBackup] pending restore detected: {} - rebuilding world before vanilla load",
                 snapshotId);
 
-        Path storeRoot = resolveStoreRoot(BetterBackupConfig.backupDirectory());
         ChunkStore store = new ChunkStore(storeRoot);
+        store.initialize();
+        // 临时 restore store 用完即关: 否则它与 onServerStarting 再开的常驻 store 会在同一
+        // storeRoot 上并存, Windows 下 mmap pack 索引互锁。close 失败仅降级为 warn, 不掩盖
+        // restore 本身的失败异常 (后者才是调用方中止启动的依据)。
         try {
-            store.initialize();
-        } catch (IOException e) {
-            LOGGER.error("[BetterBackup] cannot initialize store for restore at {}", storeRoot, e);
-            return;
-        }
-        Path snapshotsDir = storeRoot.resolve("snapshots");
-        WorldPaths paths = new WorldPaths(worldRoot);
-        RestoreFlow flow = new RestoreFlow(store, paths, snapshotsDir);
-        try {
+            Path snapshotsDir = storeRoot.resolve("snapshots");
+            WorldPaths paths = new WorldPaths(worldRoot);
+            RestoreFlow flow = new RestoreFlow(store, paths, snapshotsDir);
             RestoreFlow.RestoreResult result = flow.restore(snapshotId);
             PendingRestoreFlag.clear(worldRoot);
-            LOGGER.info("[BetterBackup] restore complete: chunks={} entity={} savedData={} files={} levelDat={} backupDir={}",
-                    result.chunkSlotsRestored(), result.entitySlotsRestored(),
-                    result.savedDataFilesRestored(), result.playerDataFilesRestored(),
-                    result.levelDatRestored(), result.worldBackupDir());
-        } catch (IOException e) {
-            LOGGER.error("[BetterBackup] restore FAILED for snapshot {}, flag retained for retry, server will start with current world state",
-                    snapshotId, e);
+            return result;
+        } finally {
+            try {
+                store.close();
+            } catch (IOException closeEx) {
+                LOGGER.warn("[BetterBackup] failed to close temporary restore store at {}", storeRoot, closeEx);
+            }
         }
     }
 
