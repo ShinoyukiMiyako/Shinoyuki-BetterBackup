@@ -40,8 +40,13 @@ public final class CurrentSnapshotState {
         dirtyEntityChunks.put(new DimChunkKey(dimensionId, packedPos), hash);
     }
 
-    public void putSavedData(String fileName, Hash hash) {
-        dirtySavedData.put(fileName, hash);
+    /**
+     * 登记一个 SavedData 条目。{@code key} 是该 .dat 相对 worldRoot 的路径 (含维度子目录,
+     * 如 {@code data/raids.dat}、{@code DIM1/data/raids_end.dat}), 由 SavedDataBackupTask 计算 ——
+     * 维度隐含在 key 里, restore 据此落回原维度。
+     */
+    public void putSavedData(String key, Hash hash) {
+        dirtySavedData.put(key, hash);
     }
 
     public void putLevelDat(Hash hash) {

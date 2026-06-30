@@ -310,19 +310,27 @@ public final class OfflineRestore {
     }
 
     private long rebuildSavedData(Map<String, Hash> savedData) throws IOException {
-        if (savedData.isEmpty()) {
-            return 0;
-        }
-        Path dataDir = paths.dataDir("minecraft:overworld");
-        Files.createDirectories(dataDir);
         long total = 0;
         for (Map.Entry<String, Hash> entry : savedData.entrySet()) {
             byte[] bytes = store.get(entry.getValue());
-            Path target = dataDir.resolve(entry.getKey() + ".dat");
+            Path target = resolveSavedDataTarget(entry.getKey());
+            Files.createDirectories(target.getParent());
             Files.write(target, bytes);
             total++;
         }
         return total;
+    }
+
+    /**
+     * savedData key 落盘目标。新版 key 是含维度子目录的 worldRoot 相对路径 (含 "/") -> 直接
+     * resolve; 旧版裸 SavedData 名 (无 "/") -> 退回 overworld {@code data/<name>.dat}。与
+     * {@link com.shinoyuki.betterbackup.restore.RestoreFlow} 口径一致。
+     */
+    private Path resolveSavedDataTarget(String key) {
+        if (key.indexOf('/') >= 0) {
+            return paths.worldRoot().resolve(key);
+        }
+        return paths.dataDir("minecraft:overworld").resolve(key + ".dat");
     }
 
     private long rebuildFiles(FileManifest files) throws IOException {

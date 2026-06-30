@@ -14,9 +14,11 @@ import java.nio.file.Path;
  * <p>SavedData 不是 region file 格式, 是直接的 .dat 文件 (vanilla NbtIo.writeCompressed
  * 写盘). 直接读整个文件字节 hash 即可. 文件小 (典型 < 1 MB, 大型 mod 如 MTR 可达数 MB).
  *
- * <p>BAS 给的 fileName 是 SavedData 的 name (例如 "raids", "mtr_train_data"),
- * 通过 ServerLevel 的 dimensionId 推断目录. MVP 阶段不带 dim 信息, 假设 SavedData
- * 在 overworld 的 data/ 目录. v0.2+ BAS Listener API 加 dimension 字段时再细化.
+ * <p>BAS 给的 fileName 是 SavedData 的 name (例如 "raids", "mtr_train_data")。BAS listener
+ * 不带 dim 字段, 故按 overworld -> nether -> end 顺序探测该 .dat 实际落在哪个维度的 data/
+ * 目录, 命中即用; 登记进 state 的 key 是该文件相对 worldRoot 的路径 (含维度子目录, 如
+ * {@code data/raids.dat}、{@code DIM1/data/raids_end.dat}), 让 restore 能把各维度 SavedData
+ * 落回原维度的 data/ 而非一律塞进 overworld。
  */
 public record SavedDataBackupTask(String fileName) implements BackupTask {
 
@@ -51,8 +53,11 @@ public record SavedDataBackupTask(String fileName) implements BackupTask {
         }
         Hash hash = ctx.hashFunction().hash(rawBytes);
         boolean wrote = ctx.store().put(hash, rawBytes);
-        // 先登记 state 再 add writtenThisWindow (GC 并发安全, 见 ChunkBackupTask 同址注释).
-        ctx.state().putSavedData(fileName, hash);
+        // key 用该 .dat 相对 worldRoot 的路径 (含维度子目录, 探测命中哪个维度就记哪个), 而非裸
+        // SavedData 名 -- 维度隐含在路径里, restore 据此落回原维度的 data/。先登记 state 再 add
+        // writtenThisWindow (GC 并发安全, 见 ChunkBackupTask 同址注释).
+        String relativeKey = ctx.paths().worldRoot().relativize(datFile).toString().replace('\\', '/');
+        ctx.state().putSavedData(relativeKey, hash);
         if (wrote) {
             ctx.writtenThisWindow().add(hash);
             ctx.metrics().recordSavedDataUnique();

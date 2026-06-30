@@ -190,23 +190,31 @@ public final class RestoreFlow {
     }
 
     /**
-     * 重建 SavedData .dat 文件. MVP 假设全部 SavedData 在 overworld data/ 目录
-     * (跟 SavedDataBackupTask 一致), v0.2+ 升级时按 dim 拆分.
+     * 重建 SavedData .dat 文件. key 是相对 worldRoot 的路径 (含维度子目录), 落回原维度 data/。
+     * 兼容旧 manifest 的裸 SavedData 名 (无 "/"): 当年未记维度, 退回 overworld data/<name>.dat。
      */
     private long rebuildSavedData(Map<String, Hash> savedData) throws IOException {
-        if (savedData.isEmpty()) {
-            return 0;
-        }
-        Path dataDir = paths.dataDir("minecraft:overworld");
-        Files.createDirectories(dataDir);
         long total = 0;
         for (Map.Entry<String, Hash> entry : savedData.entrySet()) {
             byte[] bytes = store.get(entry.getValue());
-            Path target = dataDir.resolve(entry.getKey() + ".dat");
+            Path target = resolveSavedDataTarget(entry.getKey());
+            Files.createDirectories(target.getParent());
             Files.write(target, bytes);
             total++;
         }
         return total;
+    }
+
+    /**
+     * 把 manifest 里的 savedData key 解析成落盘目标。新版 key 是含维度子目录的 worldRoot 相对
+     * 路径 (必含 "/", 如 {@code DIM1/data/raids_end.dat}) -> 直接 resolve; 旧版是裸 SavedData 名
+     * (无 "/") -> 退回 overworld {@code data/<name>.dat} (老快照未记维度, 尽力而为)。
+     */
+    private Path resolveSavedDataTarget(String key) {
+        if (key.indexOf('/') >= 0) {
+            return paths.worldRoot().resolve(key);
+        }
+        return paths.dataDir("minecraft:overworld").resolve(key + ".dat");
     }
 
     /**
