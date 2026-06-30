@@ -122,6 +122,24 @@ public final class CurrentSnapshotState {
     }
 
     /**
+     * 把一次 drain 出来但未能成功落盘的快照回灌 dirty map, 供下次快照重试。SnapshotCreator 在
+     * drainAndClear 之后的失败分支 (玩家数据采集 / manifest 写盘) 调用 —— 此时 dirty 已被清空,
+     * 不回灌这些条目就永久丢出备份 (BAS 活跃路径采的版本除本 state 外无第二份记录)。
+     *
+     * <p>用 putIfAbsent / compareAndSet(null, ..) 而非 put: 若该 key 在失败窗口内已被新 fire
+     * 覆盖 (dirty 里已有更新的 hash), 保留更新值, 不让回灌的旧 hash 造成版本回退。
+     */
+    public void reinject(Drained drained) {
+        drained.chunks().forEach(dirtyChunks::putIfAbsent);
+        drained.entityChunks().forEach(dirtyEntityChunks::putIfAbsent);
+        drained.savedData().forEach(dirtySavedData::putIfAbsent);
+        Hash level = drained.levelDat();
+        if (level != null) {
+            dirtyLevelDat.compareAndSet(null, level);
+        }
+    }
+
+    /**
      * drain 出来的快照. 不持任何对底层 ConcurrentHashMap 的引用,
      * SnapshotCreator 处理它时跟 putXxx 调用方互不干扰.
      */

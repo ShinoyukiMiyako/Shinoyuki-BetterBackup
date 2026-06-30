@@ -208,6 +208,8 @@ public final class SnapshotCreator implements SnapshotTrigger {
             files = playerDataCollector.collect();
         } catch (IOException e) {
             LOGGER.error("[BetterBackup] snapshot aborted: player data collection failed", e);
+            // drain 已清空 dirty: 回灌本次 drained 否则这些 chunk/entity/savedData 永久丢出备份。
+            state.reinject(drained);
             recordFailure("player data collection failed: " + e.getMessage());
             return;
         }
@@ -246,6 +248,10 @@ public final class SnapshotCreator implements SnapshotTrigger {
             runIncrementalGc(newManifest);
         } catch (IOException e) {
             LOGGER.error("[BetterBackup] snapshot write failed: {}", target, e);
+            // manifest 未落盘 (flushAndSync/writeTo 抛, writeTo 为 atomic rename 不会半写): 回灌
+            // drained 否则本窗口变更随 drain 丢失。manifest 写成功后才执行 promote/GC, 故到这里
+            // 必是未成功写盘, 不会重复计成功。
+            state.reinject(drained);
             recordFailure("manifest write failed: " + e.getMessage());
         }
     }
