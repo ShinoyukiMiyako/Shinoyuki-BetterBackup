@@ -99,6 +99,7 @@ class BaselineScannerTest {
         assertEquals(3, result.stored(), "all 3 occupied slots stored");
         // 每个 chunk 都登记进 state, 且 store 里按 hash 取回的字节 == 写入的 raw payload
         ChunkStore readBack = new ChunkStore(storeRoot);
+        readBack.initialize(); // pack 时代: 全新 store 须 load 扫 pack 重建索引才能 get/has
         HashFunction hf = new Xxh128HashFunction();
         assertEquals(3, state.chunkCount(), "every scanned chunk registered in CurrentSnapshotState");
         for (Map.Entry<Long, byte[]> e : expected.entrySet()) {

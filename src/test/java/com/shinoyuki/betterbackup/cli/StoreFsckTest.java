@@ -129,19 +129,24 @@ class StoreFsckTest {
         Hash h = hashFn.hash(obj);
         store.put(h, obj);
         writeChunkManifest(snapshotsDir, "snap-tamper", h);
+        store.close();
 
-        // 篡改字节但保留文件名 (模拟位翻转 / 外部改写): 内容 hash != 文件名 hash
-        Path stored = store.pathFor(h);
-        byte[] tampered = obj.clone();
-        tampered[tampered.length - 1] ^= 0x5A;
-        Files.write(stored, tampered);
+        // 篡改 pack 内对象的数据字节 (模拟位翻转 / 外部改写). 记录布局 [16B hash][4B len][data]:
+        // 只翻转 data 区一个字节, 内联 hash 字段不动 -> 内容重 hash != 内联 hash -> mismatch。
+        Path pack = storeRoot.resolve("packs").resolve("0000000000.pack");
+        byte[] packBytes = Files.readAllBytes(pack);
+        int dataStart = 16 + 4; // xxh128(16) + 长度字段(4) 之后即第一条记录的数据起点
+        packBytes[dataStart + 5] ^= 0x5A;
+        Files.write(pack, packBytes);
 
-        StoreFsck fsck = new StoreFsck(store, snapshotsDir, hashFn);
+        ChunkStore reopened = new ChunkStore(storeRoot);
+        reopened.initialize();
+        StoreFsck fsck = new StoreFsck(reopened, snapshotsDir, hashFn);
         StoreFsck.VerifyResult r = fsck.verifyStore();
         assertEquals(1, r.scanned());
         assertEquals(0, r.ok());
-        assertEquals(1, r.hashMismatch().size(), "tampered object must be flagged as hash mismatch");
-        assertTrue(r.hashMismatch().get(0).contains(h.toHex()), "mismatch report must name the file");
+        assertEquals(1, r.hashMismatch().size(), "tampered pack object must be flagged as hash mismatch");
+        assertTrue(r.hashMismatch().get(0).contains(h.toHex()), "mismatch report must name the object hash");
         assertFalse(r.clean());
     }
 

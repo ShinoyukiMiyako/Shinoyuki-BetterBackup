@@ -1,51 +1,57 @@
 package com.shinoyuki.betterbackup.store;
 
 import com.shinoyuki.betterbackup.log.BackupLog;
+import com.shinoyuki.betterbackup.store.pack.PackStore;
 
 import java.io.IOException;
-import java.nio.channels.FileChannel;
-import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
-import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
-import java.nio.file.StandardOpenOption;
-import java.util.UUID;
+import java.util.stream.Stream;
 
 /**
- * Content-addressed dedup store. 文件名 = hash hex 全长, 二级分桶 ({@code chunks/<2>/<6>/<full>})
- * 防单目录文件过多.
+ * 内容寻址 dedup store 门面. 自 pack 改造起, 新写入一律进 append-only {@link PackStore}
+ * (机械盘适配, 根治百万小文件的随机寻道与每对象 fsync). 历史"一对象一文件"布局
+ * ({@code chunks/<2>/<6>/<full>}) 转为<b>只读 + 惰性漏水</b>: 不再有新文件写进去, 旧对象
+ * 留在原地供读, 随其所属快照被保留策略淘汰而由 GC 按对象删除, 在保留窗口内自然排空。
  *
- * <p>每条 store entry 是一个 .mca chunk slot 的 raw 压缩字节 (vanilla zlib).
- * SavedData / level.dat 等其他类型 payload 也复用此 store, 跟 chunk 共享 dedup pool.
+ * <p><b>惰性双读</b> ({@link #has}/{@link #get}): 先查 pack, 命中即走 pack; 否则回退旧文件树。
+ * 写入 ({@link #put}) 命中 pack 或旧树即 dedup 跳过, 否则只写 pack —— 旧对象绝不复制进 pack,
+ * 避免迁移期数据翻倍。
  *
- * <p><b>atomic put</b>: 先写 {@code <hash>.tmp} → {@code FileChannel.force(true)}
- * (fsync 保证字节落盘) → atomic rename 到 {@code <hash>}. kill -9 发生在 fsync
- * 前: 启动时孤立 .tmp 由 verify 路径清理 (后续 commit). kill -9 在 rename 前: 数据
- * 已 fsync, 但 manifest 尚未引用此 hash, 增量 GC 会清掉.
+ * <p><b>atomic / 崩溃安全</b>: 字节落盘语义下放给 {@link PackStore} —— put 仅顺序追加,
+ * 持久化由 {@link #flushAndSync} 屏障 (SnapshotCreator 写 manifest 前调一次) 完成, 把每对象
+ * fsync 压成每快照 1 次。manifest 落盘即其引用对象落盘的不变量保持。
  *
- * <p><b>线程安全</b>: 多线程 put 同一 hash 时, atomic_move 在已存在 target 上抛
- * {@code FileAlreadyExistsException}, catch 后删 .tmp 即可 (内容相同, 哪个先到都行).
- * has / get 是只读, 跟 put 并发安全 (目标文件 atomic 出现).
+ * <p>走内部门面 {@link BackupLog} 而非 slf4j: store 被离线 CLI (裸 JRE, 无 slf4j) 复用,
+ * slf4j 的 static LoggerFactory 会让本类一加载就 NoClassDefFoundError。
  */
 public final class ChunkStore {
 
-    // 走内部门面 BackupLog 而非 slf4j: store 是 content-addressed 持久层, 被离线 CLI (裸 JRE,
-    // classpath 无 slf4j) 复用。原先 slf4j 的 static LoggerFactory 调用让本类一加载就 NoClassDefFoundError。
-    // 门面默认 sink 直写 System.err, 游戏内由 BetterBackupMod 装 slf4j 桥接还原原 logger 名 / 格式。
     private static final String LOGGER_NAME = ChunkStore.class.getName();
+
+    /** xxh128 = 16 字节. 当前唯一落地的 hash 算法 (SHA256/BLAKE3 未实现), pack store.meta 据此校验. */
+    private static final int DEFAULT_HASH_LENGTH = 16;
 
     private final Path storeRoot;
     private final Path chunksDir;
+    private final PackStore packStore;
 
     public ChunkStore(Path storeRoot) {
+        this(storeRoot, DEFAULT_HASH_LENGTH, PackStore.DEFAULT_TARGET_PACK_SIZE_BYTES);
+    }
+
+    public ChunkStore(Path storeRoot, int hashLength, long targetPackSizeBytes) {
         this.storeRoot = storeRoot;
         this.chunksDir = storeRoot.resolve("chunks");
+        this.packStore = new PackStore(storeRoot, hashLength, targetPackSizeBytes);
     }
 
     public void initialize() throws IOException {
+        // 仍建旧 chunks 目录: GC/fsck 与旧 store 兼容路径据其存在与否判断; 新 store 下保持空目录无害.
         Files.createDirectories(chunksDir);
-        BackupLog.info(LOGGER_NAME, "[BetterBackup] store initialized at {}", storeRoot.toAbsolutePath());
+        packStore.initialize();
+        BackupLog.info(LOGGER_NAME, "[BetterBackup] store initialized at {} (pack objects={})",
+                storeRoot.toAbsolutePath(), packStore.objectCount());
     }
 
     public Path storeRoot() {
@@ -56,7 +62,12 @@ public final class ChunkStore {
         return chunksDir;
     }
 
-    /** 二级分桶路径: chunks/<前2hex>/<前6hex>/<32hex全名>. */
+    /** 底层 pack store. GC 压实 / fsck 扫描用. */
+    public PackStore packStore() {
+        return packStore;
+    }
+
+    /** 旧布局二级分桶路径: chunks/<前2hex>/<前6hex>/<32hex全名>. 旧对象读 / GC 旧树删 / fsck 旧树扫用. */
     public Path pathFor(Hash hash) {
         String hex = hash.toHex();
         if (hex.length() < 6) {
@@ -66,67 +77,78 @@ public final class ChunkStore {
     }
 
     public boolean has(Hash hash) {
-        return Files.exists(pathFor(hash));
+        return packStore.has(hash) || Files.exists(pathFor(hash));
     }
 
     public byte[] get(Hash hash) throws IOException {
+        if (packStore.has(hash)) {
+            return packStore.get(hash);
+        }
+        // 旧树回退: 不存在时 readAllBytes 抛 NoSuchFileException, 与原 get 缺失语义一致.
         return Files.readAllBytes(pathFor(hash));
     }
 
     /**
-     * 写入. 若该 hash 已存在 → 跳过 (idempotent, dedup 命中).
+     * 写入. 命中 pack 或旧树即 dedup 跳过; 否则只写 pack (旧对象不复制进 pack).
      * 返回 true = 实际写入 (新 unique), false = 已存在跳过.
      */
     public boolean put(Hash hash, byte[] data) throws IOException {
-        Path target = pathFor(hash);
-        if (Files.exists(target)) {
+        if (packStore.has(hash)) {
             return false;
         }
-        Files.createDirectories(target.getParent());
-        // tmp 文件名带 UUID 让多线程并发 put 同一 hash 时各自用独立 tmp, 避免 race:
-        // 之前共享 <hash>.tmp 时 A 写 + rename 完后 B 还在用同一路径, B 的 fsync /
-        // move 会找不到文件 (NoSuchFileException). UUID 隔离后 A/B 互不干扰,
-        // 第一个成功 rename 进 target, 第二个被 FileAlreadyExistsException 接住
-        // 删自己的 tmp.
-        Path tmp = target.resolveSibling(target.getFileName() + "." + UUID.randomUUID() + ".tmp");
-        Files.write(tmp, data, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING,
-                StandardOpenOption.WRITE);
-        // fsync: 确保字节落盘后再 rename, kill -9 重启时不会出现 rename 完但内容半空的文件.
-        try (FileChannel ch = FileChannel.open(tmp, StandardOpenOption.READ)) {
-            ch.force(true);
+        if (Files.exists(pathFor(hash))) {
+            return false; // 已在旧树, 留在原地, 不复制进 pack
         }
-        try {
-            Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE);
-            return true;
-        } catch (FileAlreadyExistsException raceWin) {
-            // 别的线程同时 put 同 hash, 它先 rename. 删自己的 tmp 即可.
-            Files.deleteIfExists(tmp);
-            return false;
-        } catch (NoSuchFileException e) {
-            // 极端 race: 没用 UUID 隔离时会撞 (此版本已修). 防御性兜底, 不应发生.
-            Files.deleteIfExists(tmp);
-            throw e;
-        }
+        return packStore.put(hash, data);
+    }
+
+    /** fsync 提交屏障. SnapshotCreator 写 manifest 前调一次, 把每对象 fsync 压成每快照 1 次. */
+    public void flushAndSync() throws IOException {
+        packStore.flushAndSync();
+    }
+
+    public void close() throws IOException {
+        packStore.close();
     }
 
     /**
-     * 删 tmp 孤儿 (kill -9 前 fsync / rename 留下的 .tmp). 启动时 verify 调用.
-     * 返回清掉的文件数.
+     * 删全部旧树 tmp 孤儿 (历史"一对象一文件"布局 kill -9 残留). 离线 CLI / fsck / 测试用:
+     * 无并发 writer 时全删安全. 返回清掉的文件数. (pack 布局无此类 tmp, 本方法只清旧树。)
      */
     public int cleanupOrphanTmpFiles() throws IOException {
+        return cleanupOrphanTmpFiles(Long.MAX_VALUE);
+    }
+
+    /**
+     * 只删 lastModified 早于 {@code deleteOlderThanMillis} 的旧树 tmp 孤儿.
+     *
+     * <p>{@link java.util.stream.Stream} 是 {@link java.io.Closeable}, try-with-resources 关闭
+     * 防文件句柄泄漏 (Windows 下泄漏句柄会阻止后续删除/重命名 chunksDir).
+     *
+     * @param deleteOlderThanMillis 仅删 lastModified 严格小于此值 (epoch ms) 的 .tmp.
+     * @return 实际删除的文件数.
+     */
+    public int cleanupOrphanTmpFiles(long deleteOlderThanMillis) throws IOException {
         if (!Files.exists(chunksDir)) {
             return 0;
         }
         int[] count = {0};
-        Files.walk(chunksDir).filter(p -> p.getFileName().toString().endsWith(".tmp")).forEach(p -> {
-            try {
-                Files.deleteIfExists(p);
-                count[0]++;
-                BackupLog.warn(LOGGER_NAME, "[BetterBackup] removed orphan tmp file {}", p);
-            } catch (IOException e) {
-                BackupLog.error(LOGGER_NAME, "[BetterBackup] failed to remove orphan tmp {}", p, e);
-            }
-        });
+        try (Stream<Path> walk = Files.walk(chunksDir)) {
+            walk.filter(p -> p.getFileName().toString().endsWith(".tmp")).forEach(p -> {
+                try {
+                    if (deleteOlderThanMillis != Long.MAX_VALUE
+                            && Files.getLastModifiedTime(p).toMillis() >= deleteOlderThanMillis) {
+                        return; // 本次运行的在途 .tmp, 留给 put 自己管理, 不碰
+                    }
+                    if (Files.deleteIfExists(p)) {
+                        count[0]++;
+                        BackupLog.warn(LOGGER_NAME, "[BetterBackup] removed orphan tmp file {}", p);
+                    }
+                } catch (IOException e) {
+                    BackupLog.error(LOGGER_NAME, "[BetterBackup] failed to remove orphan tmp {}", p, e);
+                }
+            });
+        }
         return count[0];
     }
 }

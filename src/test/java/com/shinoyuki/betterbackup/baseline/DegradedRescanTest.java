@@ -105,6 +105,7 @@ class DegradedRescanTest {
 
         // 模拟下次快照: drain state, 窗口 chunk 在内, 且 store 按 hash 取回的字节 == 原 raw payload
         ChunkStore readBack = new ChunkStore(storeRoot);
+        readBack.initialize(); // pack 时代: 全新 store 须 load 扫 pack 重建索引才能 get/has
         HashFunction hf = new Xxh128HashFunction();
         CurrentSnapshotState.Drained drained = state.drainAndClear();
         Hash h = drained.chunks().get(new DimChunkKey(OVERWORLD, packed));
@@ -257,6 +258,7 @@ class DegradedRescanTest {
 
         // store 内补采字节逐字节等于磁盘 region slot raw payload.
         ChunkStore readBack = new ChunkStore(storeRoot);
+        readBack.initialize(); // pack 时代: 全新 store 须 load 扫 pack 重建索引才能 get/has
         HashFunction hf = new Xxh128HashFunction();
         CurrentSnapshotState.Drained drained = state.drainAndClear();
         Hash sameRegionHash = drained.chunks().get(new DimChunkKey(OVERWORLD, goodInSamePacked));

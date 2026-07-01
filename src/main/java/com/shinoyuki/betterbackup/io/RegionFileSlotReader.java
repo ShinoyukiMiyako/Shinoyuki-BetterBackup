@@ -129,6 +129,22 @@ public final class RegionFileSlotReader {
      * @throws TornReadException 检出撕裂读 (调用方应延后重试, 不得入库)
      */
     public static byte[] readSlot(Path mcaFile, int localX, int localZ) throws IOException {
+        return readSlotInternal(mcaFile, localX, localZ, true);
+    }
+
+    /**
+     * 宽容读: 跟 {@link #readSlot} 一样还原 external (.mcc) 形态, 但<b>跳过撕裂读重定位检测与
+     * inflate 完整性校验</b>。离线场景 (无并发 writer, 撕裂读不会发生) 保留 region 内非目标 chunk
+     * 时用 —— 一个邻居 chunk 字节损坏不该阻断对健康目标 chunk 的部分回退; 损坏字节原样透传保留,
+     * 既不就地恶化也不放大。结构性损坏 (sector 越界 / 长度非法 / external .mcc 物理缺失) 仍抛
+     * IOException, 由调用方按 slot 粒度容错 (跳过该 slot 并告警)。
+     */
+    public static byte[] readSlotLenient(Path mcaFile, int localX, int localZ) throws IOException {
+        return readSlotInternal(mcaFile, localX, localZ, false);
+    }
+
+    private static byte[] readSlotInternal(Path mcaFile, int localX, int localZ, boolean validate)
+            throws IOException {
         if (localX < 0 || localX > 31 || localZ < 0 || localZ > 31) {
             throw new IllegalArgumentException("local coords out of range: " + localX + "," + localZ);
         }
@@ -168,22 +184,26 @@ public final class RegionFileSlotReader {
             byte[] payload = new byte[actualLength];
             dataBuf.get(payload);
 
-            // 撕裂读防御 step 1: 读 payload 后再读一次 location entry. vanilla 原地重写
-            // 一个 chunk 时会改 location table (新扇区分配), 前后不一致即证明读期间发生
-            // 搬迁, 读到的 payload 可能横跨新旧两份数据.
-            int locationEntryAfter = readLocationEntry(ch, headerByteOffset);
-            if (locationEntryAfter != locationEntry) {
-                throw new TornReadException("chunk slot relocated during read at " + mcaFile
-                        + " slot=(" + localX + "," + localZ + "): location entry "
-                        + Integer.toHexString(locationEntry) + " -> " + Integer.toHexString(locationEntryAfter));
+            // 撕裂读防御 step 1 (仅 validate): 读 payload 后再读一次 location entry. vanilla 原地
+            // 重写一个 chunk 时会改 location table (新扇区分配), 前后不一致即证明读期间发生搬迁,
+            // 读到的 payload 可能横跨新旧两份数据. 离线宽容读跳过 (无并发 writer)。
+            if (validate) {
+                int locationEntryAfter = readLocationEntry(ch, headerByteOffset);
+                if (locationEntryAfter != locationEntry) {
+                    throw new TornReadException("chunk slot relocated during read at " + mcaFile
+                            + " slot=(" + localX + "," + localZ + "): location entry "
+                            + Integer.toHexString(locationEntry) + " -> " + Integer.toHexString(locationEntryAfter));
+                }
             }
 
             byte[] storeObject = resolveExternal(mcaFile, localX, localZ, payload);
 
-            // 撕裂读防御 step 2: inflate 完整性校验. header entry 没变但 vanilla 在同
-            // 扇区原地覆写部分字节 (size 不变的更新) 仍会让我们读到新旧混合 payload,
-            // 这种只有 zlib/gzip 的校验和能抓出来.
-            ChunkPayloadCodec.validateIntegrity(storeObject);
+            // 撕裂读防御 step 2 (仅 validate): inflate 完整性校验. header entry 没变但 vanilla 在同
+            // 扇区原地覆写部分字节 (size 不变的更新) 仍会让我们读到新旧混合 payload, 只有 zlib/gzip
+            // 校验和能抓出来. 离线宽容读跳过 —— 损坏邻居原样保留而非阻断目标回退。
+            if (validate) {
+                ChunkPayloadCodec.validateIntegrity(storeObject);
+            }
 
             return storeObject;
         }

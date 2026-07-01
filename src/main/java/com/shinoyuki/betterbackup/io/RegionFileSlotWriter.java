@@ -41,9 +41,9 @@ public final class RegionFileSlotWriter implements Closeable {
     private final Path mcaFile;
     private final int[] locations;
     private final ByteArrayOutputStream chunkData;
-    // external chunk 的 .mcc 写入推迟到 close(): mcc 文件路径 -> 外置内容. 用
-    // LinkedHashMap 保证写盘顺序确定, 便于诊断. 在 .mca atomic rename 成功后再落 .mcc,
-    // 跟 vanilla commit 顺序一致 (先 location table 指向 stub, 再保证外置文件存在).
+    // external chunk 的 .mcc 写入推迟到 close(): mcc 文件路径 -> 外置内容. 用 LinkedHashMap
+    // 保证写盘顺序确定, 便于诊断. close() 把这些 .mcc 落盘排在 .mca atomic rename **之前**,
+    // 保证 .mca 提交时其 stub 指向的 .mcc 必已存在 (修崩溃窗口, 见 close() 注释).
     private final Map<Path, byte[]> pendingExternal;
     private int nextFreeSector;
     private boolean closed;
@@ -150,47 +150,53 @@ public final class RegionFileSlotWriter implements Closeable {
         closed = true;
 
         Path tmp = mcaFile.resolveSibling(mcaFile.getFileName() + ".tmp");
-        // 用 try 块保证异常时 tmp 被清掉, 不留孤儿
-        try (FileChannel ch = FileChannel.open(tmp,
-                StandardOpenOption.CREATE,
-                StandardOpenOption.TRUNCATE_EXISTING,
-                StandardOpenOption.WRITE)) {
+        // 整块 try: 任一步失败都清掉 .mca tmp 不留孤儿 (已 atomic rename 的 .mcc 留下, 见下方分析为无害)
+        try {
+            try (FileChannel ch = FileChannel.open(tmp,
+                    StandardOpenOption.CREATE,
+                    StandardOpenOption.TRUNCATE_EXISTING,
+                    StandardOpenOption.WRITE)) {
 
-            // 1. location table: 1024 个 BE int
-            ByteBuffer locBuf = ByteBuffer.allocate(LOCATION_TABLE_BYTES);
-            for (int i = 0; i < LOCATION_ENTRY_COUNT; i++) {
-                locBuf.putInt(locations[i]);
+                // 1. location table: 1024 个 BE int
+                ByteBuffer locBuf = ByteBuffer.allocate(LOCATION_TABLE_BYTES);
+                for (int i = 0; i < LOCATION_ENTRY_COUNT; i++) {
+                    locBuf.putInt(locations[i]);
+                }
+                locBuf.flip();
+                writeFully(ch, locBuf);
+
+                // 2. timestamps: MVP 写全 0 (vanilla 仅作 dirty 检测, restore 出来的 region 全新无意义)
+                ByteBuffer tsBuf = ByteBuffer.allocate(TIMESTAMP_TABLE_BYTES);
+                // ByteBuffer 默认 0 填充, 直接 flip 到 limit 即可
+                tsBuf.position(TIMESTAMP_TABLE_BYTES);
+                tsBuf.flip();
+                writeFully(ch, tsBuf);
+
+                // 3. 累积的 chunk data sectors
+                byte[] data = chunkData.toByteArray();
+                if (data.length > 0) {
+                    writeFully(ch, ByteBuffer.wrap(data));
+                }
+
+                // fsync: 字节落盘后才能 rename, kill -9 重启不会出现 rename 完但内容半空
+                ch.force(true);
             }
-            locBuf.flip();
-            writeFully(ch, locBuf);
 
-            // 2. timestamps: MVP 写全 0 (vanilla 仅作 dirty 检测, restore 出来的 region 全新无意义)
-            ByteBuffer tsBuf = ByteBuffer.allocate(TIMESTAMP_TABLE_BYTES);
-            // ByteBuffer 默认 0 填充, 直接 flip 到 limit 即可
-            tsBuf.position(TIMESTAMP_TABLE_BYTES);
-            tsBuf.flip();
-            writeFully(ch, tsBuf);
-
-            // 3. 累积的 chunk data sectors
-            byte[] data = chunkData.toByteArray();
-            if (data.length > 0) {
-                writeFully(ch, ByteBuffer.wrap(data));
+            // external chunk 的 .mcc 落盘排在 .mca rename **之前** (修崩溃窗口): .mca 一旦原子
+            // 提交, 它 external slot 的 stub 指向的 .mcc 必已存在, 不会出现"新 .mca 指向尚未落盘
+            // 的 .mcc"导致该 chunk 读不出 / 丢失的窗口。本 writer 只服务 restore: 非目标 chunk 的
+            // .mcc 是同字节回写 (no-op), 目标 chunk 的 .mcc 即恢复内容, 故 rename 之前的窗口
+            // (旧 .mca + 新 .mcc) 读到的都是一致或恢复值, 不产生不一致。崩在 rename 前: .mca tmp
+            // 被 catch 清掉, 已对齐的 .mcc 留下无害 (旧 .mca inline chunk 视其为孤儿; 旧 .mca
+            // external chunk 视其为同字节/恢复值)。每个 .mcc 仍走 tmp + fsync + atomic rename。
+            for (Map.Entry<Path, byte[]> entry : pendingExternal.entrySet()) {
+                writeExternalAtomic(entry.getKey(), entry.getValue());
             }
 
-            // fsync: 字节落盘后才能 rename, kill -9 重启不会出现 rename 完但内容半空
-            ch.force(true);
+            Files.move(tmp, mcaFile, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
         } catch (IOException | RuntimeException e) {
             Files.deleteIfExists(tmp);
             throw e;
-        }
-
-        Files.move(tmp, mcaFile, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-
-        // external chunk 的 .mcc 落盘排在 .mca rename 之后: slot 内的 stub 已指向外置
-        // 文件, 此时必须保证 .mcc 存在 reader 才读得到. 每个 .mcc 走 tmp + fsync +
-        // atomic rename, 跟 .mca 同 crash 安全模型.
-        for (Map.Entry<Path, byte[]> entry : pendingExternal.entrySet()) {
-            writeExternalAtomic(entry.getKey(), entry.getValue());
         }
     }
 

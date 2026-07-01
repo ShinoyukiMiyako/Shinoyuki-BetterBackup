@@ -44,6 +44,9 @@ public final class BackupCli {
     private static final String SNAPSHOTS_SUBDIR = "snapshots";
     private static final String MANIFEST_SUFFIX = ".manifest";
 
+    /** 区域回退 (--center/--radius) 单次目标 chunk 数上限, 防误输巨 radius 撑爆堆。 */
+    private static final long MAX_AREA_CHUNKS = 10_000;
+
     private final PrintStream out;
     private final PrintStream err;
 
@@ -197,8 +200,67 @@ public final class BackupCli {
         ChunkStore store = openStore(storeRoot);
         WorldPaths paths = new WorldPaths(worldRoot);
         OfflineRestore restore = new OfflineRestore(store, paths, storeRoot.resolve(SNAPSHOTS_SUBDIR), out);
-        restore.restore(id);
+
+        String chunkArg = args.optional("chunk");
+        String centerArg = args.optional("center");
+        if (chunkArg == null && centerArg == null) {
+            restore.restore(id); // 全量快照回退
+            return 0;
+        }
+        // 部分恢复 (只回地形): --dim 必填, --chunk x,z 单 chunk 或 --center x,z --radius r 矩形区域
+        String dim = args.optional("dim");
+        if (dim == null) {
+            throw new IllegalArgumentException("partial restore requires --dim <dimensionId>");
+        }
+        java.util.Set<Long> targets = new java.util.HashSet<>();
+        if (chunkArg != null) {
+            int[] xz = parseCoord(chunkArg, "--chunk");
+            targets.add(ChunkPosCodec.asLong(xz[0], xz[1]));
+        }
+        if (centerArg != null) {
+            int[] c = parseCoord(centerArg, "--center");
+            int radius = Integer.parseInt(args.require("radius"));
+            if (radius < 0) {
+                throw new IllegalArgumentException("--radius must be >= 0");
+            }
+            // long 运算防 int 溢出 (大坐标 c[0]+radius 回绕成负会静默产出空目标集), 并对目标数设上限防 OOM
+            long side = 2L * radius + 1;
+            if (side * side > MAX_AREA_CHUNKS) {
+                throw new IllegalArgumentException("--radius too large: would target " + (side * side)
+                        + " chunks (max " + MAX_AREA_CHUNKS + "); use a smaller radius");
+            }
+            long xLo = (long) c[0] - radius;
+            long xHi = (long) c[0] + radius;
+            long zLo = (long) c[1] - radius;
+            long zHi = (long) c[1] + radius;
+            if (xLo < Integer.MIN_VALUE || xHi > Integer.MAX_VALUE
+                    || zLo < Integer.MIN_VALUE || zHi > Integer.MAX_VALUE) {
+                throw new IllegalArgumentException("--center +/- --radius overflows chunk coordinate range");
+            }
+            for (int x = (int) xLo; x <= (int) xHi; x++) {
+                for (int z = (int) zLo; z <= (int) zHi; z++) {
+                    targets.add(ChunkPosCodec.asLong(x, z));
+                }
+            }
+        }
+        // 单 chunk (显式点名) 未采集即报错; 区域回退跳过未采集 (区域里几乎必有未加载/未采集 chunk)
+        restore.restorePartial(id, dim, targets, centerArg == null);
         return 0;
+    }
+
+    /** 解析 {@code <x>,<z>} 坐标对。 */
+    private static int[] parseCoord(String s, String optName) {
+        int comma = s.indexOf(',');
+        if (comma < 0) {
+            throw new IllegalArgumentException(optName + " must be <x>,<z>, got: " + s);
+        }
+        try {
+            int x = Integer.parseInt(s.substring(0, comma).trim());
+            int z = Integer.parseInt(s.substring(comma + 1).trim());
+            return new int[]{x, z};
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException(optName + " must be <x>,<z> integers, got: " + s);
+        }
     }
 
     /**
@@ -291,6 +353,8 @@ public final class BackupCli {
         err.println("  info    --store <dir> --id <snapshotId>");
         err.println("  verify  --store <dir> [--id <snapshotId>]");
         err.println("  restore --store <dir> --id <snapshotId> --world <worldRoot>");
+        err.println("          [--dim <dimId> --chunk <x>,<z>]              (partial: single chunk, terrain only)");
+        err.println("          [--dim <dimId> --center <x>,<z> --radius <r>] (partial: square area, terrain only)");
         err.println("  fsck    --store <dir> [--rebuild-index]");
     }
 

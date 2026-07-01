@@ -116,17 +116,15 @@ class BackupCliAllJarProcessTest {
         assertEquals(0, runCli("verify", "--store", fx.storeRoot.toString(), "--id", fx.snapshotId).exitCode(),
                 "precondition: intact store must verify clean");
 
-        // 损坏: 删掉快照引用的 chunk 对象, store 不再能完整 restore 这个快照
-        ChunkStore store = new ChunkStore(fx.storeRoot);
-        Path victim = store.pathFor(fx.chunkHash);
-        assertTrue(Files.deleteIfExists(victim), "test setup: referenced object must exist before deletion");
+        // 损坏: 删掉 pack (快照引用的对象都在里面), store 不再能完整 restore 这个快照
+        Path pack = fx.storeRoot.resolve("packs").resolve("0000000000.pack");
+        assertTrue(Files.deleteIfExists(pack), "test setup: pack file must exist before deletion");
 
         ProcessResult r = runCli("verify", "--store", fx.storeRoot.toString(), "--id", fx.snapshotId);
         assertNotEquals(0, r.exitCode(),
-                "verify must exit non-zero after a referenced object is removed; output=\n" + r.combined());
-        assertTrue(r.combined().contains("INCOMPLETE " + fx.snapshotId)
-                        && r.combined().contains("missing=1"),
-                "verify must report the snapshot INCOMPLETE missing=1; output=\n" + r.combined());
+                "verify must exit non-zero after referenced objects go missing; output=\n" + r.combined());
+        assertTrue(r.combined().contains("INCOMPLETE " + fx.snapshotId),
+                "verify must report the snapshot INCOMPLETE; output=\n" + r.combined());
     }
 
     @Test
@@ -138,13 +136,14 @@ class BackupCliAllJarProcessTest {
         // 损坏: 翻转受引用对象的若干字节, 文件名 (= 内容 hash) 与实际内容失配。verify 只查存在
         // 性查不出这种位翻转, fsck 逐对象重 hash 才能抓。这条断言依赖子进程里 openhft xxh128
         // 真的算出新 hash 并与文件名比对 -- openhft 缺失则子进程在重 hash 前就崩, 拿不到退出码 1。
-        ChunkStore store = new ChunkStore(fx.storeRoot);
-        Path victim = store.pathFor(fx.chunkHash);
-        byte[] bytes = Files.readAllBytes(victim);
-        for (int i = 1; i < bytes.length; i += 7) {
+        // 翻转 pack 内首条记录 (chunk 对象, buildFixture 第一个 put) 数据区的字节: 内联 hash
+        // 与实际内容失配。跳过 [16B hash][4B len] 头, 只动数据区起始几字节 (不碰后续记录的帧)。
+        Path pack = fx.storeRoot.resolve("packs").resolve("0000000000.pack");
+        byte[] bytes = Files.readAllBytes(pack);
+        for (int i = 25; i < 36; i++) {
             bytes[i] ^= (byte) 0xFF;
         }
-        Files.write(victim, bytes);
+        Files.write(pack, bytes);
 
         ProcessResult r = runCli("fsck", "--store", fx.storeRoot.toString());
         assertNotEquals(0, r.exitCode(),

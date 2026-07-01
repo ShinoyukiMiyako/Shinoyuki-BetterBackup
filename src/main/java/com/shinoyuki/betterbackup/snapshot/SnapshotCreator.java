@@ -55,6 +55,15 @@ public final class SnapshotCreator implements SnapshotTrigger {
     private static final DateTimeFormatter SNAPSHOT_ID_FORMAT =
             DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH-mm-ss'Z'").withZone(ZoneOffset.UTC);
 
+    /**
+     * pack 阈值压实触发: 累计死对象 (本窗口写入但未被任何 manifest 引用的中间版本) 达此值,
+     * 下次快照后触发一次阈值压实物理回收死字节. (Step 8 接 config storage.compactTriggerObjects)
+     */
+    private static final long COMPACT_TRIGGER_DEAD_OBJECTS = 50_000L;
+
+    /** 阈值压实: pack 死字节占比超此值才重打包 (有界, 不全量重写). (Step 8 接 config) */
+    private static final double COMPACT_DEAD_RATIO_THRESHOLD = 0.5;
+
     private final ChunkStore store;
     private final CurrentSnapshotState state;
     private final WorldPaths paths;
@@ -90,6 +99,12 @@ public final class SnapshotCreator implements SnapshotTrigger {
      * 恢复语义 = 重启 + 下次启动重扫补采.
      */
     private final AtomicBoolean degraded = new AtomicBoolean(false);
+
+    /**
+     * 自上次压实以来累计的死对象数 (中间版本). 只在 synchronized create() 内读写, 无并发.
+     * 达 {@link #COMPACT_TRIGGER_DEAD_OBJECTS} 触发一次阈值压实并清零.
+     */
+    private long deadObjectsSinceCompaction;
 
     public SnapshotCreator(ChunkStore store,
                            CurrentSnapshotState state,
@@ -188,6 +203,10 @@ public final class SnapshotCreator implements SnapshotTrigger {
 
         Path target = snapshotsDir.resolve(newManifest.snapshotId() + ".manifest");
         try {
+            // fsync 提交屏障: 把本窗口写入 pack 的所有对象一次性落盘, 再写 manifest.
+            // 保证"manifest 落盘即其引用对象落盘"的不变量, 同时把每对象 fsync 压成每快照 1 次
+            // (pack 改造的机械盘核心收益: 让磁盘电梯合并写回而非每对象一次带屏障寻道).
+            store.flushAndSync();
             newManifest.writeTo(target);
             metrics.recordSnapshotCreated();
             clearFailureMarker();
@@ -259,22 +278,20 @@ public final class SnapshotCreator implements SnapshotTrigger {
     }
 
     /**
-     * snapshot 写盘成功后立即清"本周期 BackupWorker 写入但 manifest 未引用的中间版本 hash"
-     * (DESIGN §2.6). 不接通会让 store 单调增长 (大服 ~24 GB/天).
+     * snapshot 写盘成功后的 pack 死字节回收 (延迟压实模型). pack append-only 删不掉单对象,
+     * 故本周期写入但 manifest 未引用的中间版本不再立即删, 沦为 pack 死字节, 这里累计其数量,
+     * 攒够 {@link #COMPACT_TRIGGER_DEAD_OBJECTS} 触发一次有界的阈值压实物理回收.
      *
-     * <p>scope = writtenThisWindow - referenced(manifest) - pending(state), 远小于全量
-     * GC, 秒级完成. 失败 log error 不抛 — snapshot 已经写盘, GC 是 polish, 下次 snapshot
-     * 会再清.
+     * <p>失败 log error 不抛 — snapshot 已写盘, 压实是 polish, 下次累计到阈值会再触发.
      *
-     * <p><b>并发安全 (修复 GC 误删 pending-baseline 写入)</b>: baseline 扫描线程与本
-     * create() 并发跑, drain 之后仍在往 writtenThisWindow.add + state.put 登记 chunk.
-     * 这些 chunk 的登记没进本份 manifest (drain 已过), 故不在 referenced 里, 却已在
-     * writtenThisWindow 里 — 若仅按 writtenThisWindow - referenced 删, 会误删它们的
-     * store 字节, 而其登记还在 state 里等下一份 manifest 引用 -> 下份 manifest 引用已删
-     * hash, 静默缺块. 修复: 额外排除"当前仍登记在 state 里的 hash" (pending). 配合各
-     * 写入点 state.put 先于 writtenThisWindow.add 的顺序 (happens-before): 凡进入
-     * windowSnapshot 的 hash, 其 state.put 必已完成, 若该登记未被本次 drain 纳入则此刻
-     * 仍在 state 里, 必被 pending 捕获排除. 由此关闭 race.
+     * <p><b>并发安全 (沿用 GC 误删 pending 写入的修复推理)</b>: baseline 扫描线程与本
+     * create() 并发跑, drain 之后仍在往 writtenThisWindow.add + state.put 登记 chunk. 这些
+     * chunk 没进本份 manifest 却已在 writtenThisWindow 里 — 必须排除"仍登记在 state 里"的
+     * pending, 否则会把它们计入死对象 (其实下份 manifest 还要引用). pending 在 windowSnapshot
+     * 之后读: 写入点 state.put 先于 writtenThisWindow.add (happens-before), 故 windowSnapshot
+     * 里任一 hash 此刻若未被 drain 取走则必仍在 state 中, 必被 pending 捕获排除. 压实本身另用
+     * state.pendingHashes() 作 protect 集二次兜底, 且 PackStore.compact 跳过在写 pack
+     * (在途对象就在在写 pack 里), 三重保险绝不回收在途对象.
      */
     private void runIncrementalGc(SnapshotManifest manifest) {
         Set<Hash> referenced = new HashSet<>();
@@ -287,27 +304,32 @@ public final class SnapshotCreator implements SnapshotTrigger {
         }
 
         Set<Hash> windowSnapshot = new HashSet<>(writtenThisWindow);
-        // pending 必须在 windowSnapshot 之后读: 写入点 state.put 先于 writtenThisWindow.add,
-        // 故 windowSnapshot 里任一 hash 的 state.put 都已先行完成, 若其登记未被本次 drain
-        // 取走则此刻一定还在 state 中, 这次读必定捕获到, 不会漏排除而误删.
+        // pending 必须在 windowSnapshot 之后读 (见类注释 happens-before).
         Set<Hash> pending = state.pendingHashes();
-        // 只从 writtenThisWindow 移除本次确实纳入考量的 windowSnapshot, 保留 drain 之后
-        // 并发新增的 hash 给下一窗口; pending 留在窗口里, 下份 manifest 引用后自然不再是
-        // GC candidate (referenced 命中).
         windowSnapshot.removeAll(pending);
+        // 移除本次纳入考量的 windowSnapshot, 保留 drain 之后并发新增的 hash 给下一窗口.
         writtenThisWindow.removeAll(windowSnapshot);
 
+        // 死对象 = 本窗口写入 - 在途 - 本份引用 = 中间版本. 累计, 攒够阈值触发压实.
+        Set<Hash> deadThisWindow = new HashSet<>(windowSnapshot);
+        deadThisWindow.removeAll(referenced);
+        deadObjectsSinceCompaction += deadThisWindow.size();
+        if (deadObjectsSinceCompaction < COMPACT_TRIGGER_DEAD_OBJECTS) {
+            return;
+        }
+
         try {
-            StoreGc.GcResult result = gc.gcIncremental(windowSnapshot, referenced);
+            StoreGc.GcResult result = gc.compactAfterSnapshot(COMPACT_DEAD_RATIO_THRESHOLD, state.pendingHashes());
+            deadObjectsSinceCompaction = 0;
             if (result.deleted() > 0) {
-                LOGGER.info("[BetterBackup] incremental gc: deleted={} freed={}KiB",
+                LOGGER.info("[BetterBackup] pack compaction: reclaimed={} freed={}KiB",
                         result.deleted(), result.bytesFreed() / 1024);
                 metrics.recordGcRun();
                 metrics.recordGcDeleted(result.deleted());
                 metrics.recordGcBytesFreed(result.bytesFreed());
             }
         } catch (IOException e) {
-            LOGGER.error("[BetterBackup] incremental gc failed (snapshot already written, store may grow until next snapshot)", e);
+            LOGGER.error("[BetterBackup] pack compaction failed (snapshot already written, store may grow until next compaction)", e);
         }
     }
 
