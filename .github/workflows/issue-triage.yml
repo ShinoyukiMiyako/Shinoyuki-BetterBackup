@@ -1,10 +1,20 @@
 name: Issue 自动分诊
 
-# 新 issue 开启时自动跑: 只打标签 + 回一句中文 ack, 不下技术结论 (根因/修复留人工或 @claude)。
-# 鉴权走 Claude 订阅 OAuth token (CLAUDE_CODE_OAUTH_TOKEN secret), 不消耗 API 余额。
+# 维护者给 issue 手动打上 claude-triage 标签时触发: 只打标签 + 回一句中文 ack, 不下技术结论 (根因/修复留人工或 @claude)。
+# 例外: 正文带 spark profile 链接时, 额外跑一次自动预诊 (机器生成, 标注清楚供 @claude/维护者复核), 见 prompt 第 3 步。
+# 为何不在 issues opened 自动跑: claude-code-action 走 OIDC 换 GitHub App token 时会校验"触发者"对仓库的写权限,
+# 外部报告者开 issue 触发者无写权限, app token 换发必 401。改由维护者手动打标签触发, 触发者恒有写权限,
+# 既保留 claude[bot] 身份又把外部触发面清零。鉴权走 Claude 订阅 OAuth token (CLAUDE_CODE_OAUTH_TOKEN secret), 不消耗 API 余额。
+#
+# 上线前置 (本仓首次启用时务必先做, 否则触发会失败):
+#   1. 配 CLAUDE_CODE_OAUTH_TOKEN secret (没有则 action 无法鉴权)。
+#   2. 在仓库先建好下面 prompt 里用到的标签 (gh label list 只能用已有标签, 不会新建):
+#      claude-triage, needs-triage, needs-info, bug, performance, data-loss, enhancement, question, documentation,
+#      crash, area:store, area:snapshot, area:restore, area:schedule, area:baseline, area:io, area:compat。
+#   3. spark 预诊用到 scripts/spark/ 下的解析脚本 (已随仓库) + ubuntu runner 自带的 python3/curl, 无需额外装依赖。
 on:
   issues:
-    types: [opened]
+    types: [labeled]
 
 permissions:
   contents: read
@@ -13,6 +23,8 @@ permissions:
 
 jobs:
   triage:
+    # 只认维护者手动加的 claude-triage; 不能复用 needs-triage (issue 模板创建时自动加, 触发者=外部报告者会 401)。
+    if: github.event.label.name == 'claude-triage'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,11 +32,11 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           claude_args: |
-            --model claude-sonnet-4-6
-            --max-turns 6
-            --allowedTools "Bash(gh:*)"
+            --model claude-sonnet-5
+            --max-turns 30
+            --allowedTools "Bash(gh:*),Bash(curl:*),Bash(python3:*),Bash(head:*),Bash(tail:*),Bash(cat:*),Bash(grep:*)"
           prompt: |
-            你在给 Minecraft mod 仓库 Shinoyuki-BetterBackup (Forge 1.20.1 内容寻址增量备份 mod, 与 BetterAutoSave 异步管线集成) 做 issue 自动分诊。
+            你在给 Minecraft mod 仓库 Shinoyuki-BetterBackup (Forge 1.20.1 服务端增量备份 mod: chunk 级内容寻址, 全程后台 worker 线程主线程零开销, 跟 BetterAutoSave/BAS 深度集成) 做 issue 自动分诊。
             目标 issue: #${{ github.event.issue.number }} —— 「${{ github.event.issue.title }}」
 
             先了解现状 (用 gh 读取, 不要改代码):
@@ -32,32 +44,46 @@ jobs:
             - `gh label list` 看仓库有哪些标签 (只能用已有的, 不要新建)。
             - 正文里若有「你觉得可能是哪类问题」, 那是报告者的初步猜测, 仅供参考, 最终按正文实际内容判定。
 
-            只做以下两件事, 不要分析根因、不给修复方案 (技术结论留人工或 @claude 触发):
+            默认只做下面 1、2 两件事 (打标签 + 不含分析的 ack 评论), 不分析根因、不给修复方案 (技术结论留人工或 @claude 触发);
+            唯一例外: 正文带 spark profile 链接时, 额外做第 3 件事 —— spark 自动预诊 (见下)。
 
             1. 多维度打标签 (先 `gh label list` 确认, 只用已有标签、不要新建):
-               一次性把判定出来的标签用逗号加上, 例 `gh issue edit ${{ github.event.issue.number }} --add-label "bug,forge,area:snapshot,crash"`。
+               一次性把判定出来的标签用逗号加上, 例 `gh issue edit ${{ github.event.issue.number }} --add-label "bug,area:store,crash"`。
                按维度判定, 判不出的维度就不加、不要硬凑:
                - 类型 (必给且只给 1 个): 崩溃/报错/watchdog -> bug; 卡顿/掉TPS/性能 -> performance;
-                 丢存档/备份损坏/回退后数据错乱 -> data-loss; 功能请求 -> enhancement; 文档 -> documentation; 纯用法疑问 -> question。
-               - 加载器 (能判出才加): Forge / 1.20.1 -> forge。
-               - 子系统 (能判出才加, 最多 2 个): 定时/间隔快照、manifest 采集 -> area:snapshot;
-                 离线全量回退 (/betterbackup restore <id>, 停服重启执行)、在线单/区域区块回退 (restore-chunk-live) -> area:restore;
-                 content-addressed store / pack / 内容哈希去重 -> area:store; baseline 全量扫描 -> area:baseline;
-                 GC / 旧快照清理 -> area:gc; 离线 CLI (java -jar 跑 BackupCli) -> area:cli;
-                 跟 BetterAutoSave 或其它 mod 集成/冲突 -> area:compat。
+                 备份丢失/快照损坏/回滚出错 -> data-loss; 功能请求 -> enhancement; 文档 -> documentation; 纯用法疑问 -> question。
+               - 子系统 (能判出才加, 最多 2 个): 内容寻址存储/pack/去重/gc/fsck/store 损坏 -> area:store;
+                 快照创建/manifest/触发了却没出快照 -> area:snapshot; 回滚/恢复/chunk restore/offline restore -> area:restore;
+                 定时/interval/手动触发/调度 -> area:schedule; 全量基线扫描/首次备份 -> area:baseline;
+                 region file 读写/IO/torn read -> area:io; 跟 BAS 或其它备份 mod 集成/冲突 -> area:compat。
                - 现象 (有就加): 崩溃 / watchdog 强杀 -> crash。
-               - 待分诊标 needs-triage: 归类后去掉它; 若关键信息 (版本 / 日志或spark / 复现) 不全, 把它换成 needs-info
+               - 触发标 claude-triage: 这是维护者手动加来触发本次分诊的, 用完即弃, 分诊结束务必移除 (`--remove-label claude-triage`)。
+               - 待分诊标 needs-triage (若有): 归类后去掉它; 若关键信息 (版本 / 日志或spark / 复现) 不全, 把它换成 needs-info
                  (`--remove-label needs-triage --add-label needs-info`); 信息齐全则只 `--remove-label needs-triage`。
-               - 已有且正确的标签不重复加; 不删报告者/维护者手动加的标签, 与已有标签明显冲突时别删、在评论里点出留人工复核; 拿不准的维度宁可不打。
+               - 已有且正确的标签不重复加; 除 claude-triage 外不删报告者/维护者手动加的标签, 与已有标签明显冲突时别删、在评论里点出留人工复核; 拿不准的维度宁可不打。
 
             2. 回一条简短中文评论 (`gh issue comment ${{ github.event.issue.number }} --body "..."`):
-               硬性规则: 评论里**绝对不要**做任何技术分析或根因推测 —— 不要出现"问题可能出在X""跟Y有关""值得排查Z"
+               硬性规则: 这条 ack 评论里**绝对不要**做任何技术分析或根因推测 —— 不要出现"问题可能出在X""跟Y有关""值得排查Z"
                "是…导致的""…之间有时序/协调问题"这类判断, 哪怕信息很全、你心里已有想法, 也一个字都不要写。任何
-               根因或方向分析一律留给人工或 @claude。
+               根因或方向分析一律留给人工或 @claude。(唯一例外是第 3 步的 spark 预诊, 它必须单独成块、清楚标注为机器预诊; 本条 ack 评论本身仍然零分析。)
                评论**只允许**包含下面这些, 别的不要写:
                - 一句感谢 + 确认已记录正在排查;
                - (可选) 一句"已归类为 <这些标签>";
                - 关键信息缺失时, 礼貌索取缺的那几项 (崩溃类要 crash report 与崩溃前日志; 卡顿类要 spark profile 链接;
-                 外加 BetterBackup 版本与复现步骤); 信息齐全就别要、只道谢确认, 并对已给的表示收到;
+                 数据类要复现步骤与对应快照/store 状态; 外加 BetterBackup 与 BAS 版本); 信息齐全就别要、只道谢确认, 并对已给的表示收到;
                - (可选) 报告者选的「可能是」与你打的类型标不一致时, 一句"已按 X 归类, 若不对请补充", 但不要解释为什么。
                语气友好、不堆术语、不用 emoji 和颜文字。
+
+            3. (仅当正文含 spark profile 链接时才做; 没有就跳过, 当作不存在) spark 自动预诊:
+               spark 解析工具已随仓库 checkout 在 scripts/spark/ (纯 Python 标准库, ubuntu runner 自带 python3/curl, 无需装依赖)。
+               取数 + 解析:
+               - 从链接 `https://spark.lucko.me/<id>` 取出 <id> (域名后那段, 去掉末尾 / 和 ? 参数)。
+               - `curl -fsSL https://bytebin.lucko.me/<id> -o /tmp/profile.sparksampler` 拉原始 protobuf (bytebin 约存 60 天)。
+               - `python3 scripts/spark/spark_tree.py /tmp/profile.sparksampler "Server thread"` —— 主依据, 看 inclusive 调用树最热路径; BetterBackup 干活在后台 worker 线程, 必要时也看 worker 线程 (例 `python3 scripts/spark/spark_tree.py /tmp/profile.sparksampler backup`)。
+               - `python3 scripts/spark/spark_report.py /tmp/profile.sparksampler` —— 补充, 看 BY MOD SOURCE 归因和 SUBSYSTEM ROLLUP。
+               - curl 或解析失败 (链接过期 / 不是服务端 spark / 取不到数据) 就别硬来, 评论里如实说"spark 链接没能自动取到数据 (可能已过期), 已转人工/@claude", 不编造。
+               判读纪律 (踩过的坑, 必须守):
+               - 以 spark_tree.py 的 inclusive 调用树 + spark_report.py 的 BY MOD SOURCE 为准。
+               - **绝不**只看 self-time / SUBSYSTEM ROLLUP 下结论: spark 叶子 self-time 会把 mod 注入逻辑的成本误归到 fastutil / JDK collections, 只有 inclusive 树能把成本归回 mod 自己的注入帧 (handler$...betterbackup$... 或跟 BAS 集成的回调点)。
+               - 这是初判不是定论, 拿不准就说拿不准, 不硬给根因。
+               输出: 单独再发一条评论 (`gh issue comment`), 开头一行明确标注 "自动预诊 (机器生成, 供 @claude / 维护者复核, 可能有误, 不作结论)", 正文 3 行内: 最热 inclusive 路径 + 占比、初步指向哪个子系统、是否 BetterBackup 相关。中文、不堆术语、不用 emoji。
