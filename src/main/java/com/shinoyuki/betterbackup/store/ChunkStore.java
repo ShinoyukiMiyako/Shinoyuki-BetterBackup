@@ -67,6 +67,33 @@ public final class ChunkStore {
         return packStore;
     }
 
+    /**
+     * store 磁盘体积近似 = pack 目录字节 ({@link PackStore#totalPackBytes}, 廉价, store 主体)
+     * + 旧文件树 ({@code chunks/}) 求和. 迁移完成的新 store 旧树为空, 此项为 0; 迁移期旧树
+     * 还没排空则计入, 反映真实占用.
+     *
+     * <p><b>近似而非精确</b>: 不计 snapshots/manifest 与 index/ 元数据 (相对对象体积可忽略),
+     * 只量对象数据本体, 用于 maxStoreSizeGB 软阈值判定. 旧树 walk 是 O(旧树文件数), 迁移完成后
+     * 为一次空目录 walk (廉价); 迁移期旧树大时可能贵, 故调用方 (启动超阈值自检) 必须在后台线程跑,
+     * 绝不在主线程算.
+     */
+    public long approxStoreBytes() throws IOException {
+        long total = packStore.totalPackBytes();
+        if (!Files.isDirectory(chunksDir)) {
+            return total;
+        }
+        try (Stream<Path> walk = Files.walk(chunksDir)) {
+            // 旧树对象文件 (非 .tmp): 一对象一文件, 累加其字节. .tmp 是在途/孤儿, 不计入体积.
+            for (Path p : (Iterable<Path>) walk.filter(Files::isRegularFile)::iterator) {
+                if (p.getFileName().toString().endsWith(".tmp")) {
+                    continue;
+                }
+                total += Files.size(p);
+            }
+        }
+        return total;
+    }
+
     /** 旧布局二级分桶路径: chunks/<前2hex>/<前6hex>/<32hex全名>. 旧对象读 / GC 旧树删 / fsck 旧树扫用. */
     public Path pathFor(Hash hash) {
         String hex = hash.toHex();

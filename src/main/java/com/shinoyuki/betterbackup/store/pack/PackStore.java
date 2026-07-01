@@ -250,6 +250,26 @@ public final class PackStore {
     }
 
     /**
+     * 所有 pack 文件的磁盘字节总和 (含每对象内联帧头 + torn tail 残尾, 即 pack 目录实占). 这是
+     * store 体积的主体 —— 新写入一律进 pack, 旧文件树只读排空. 廉价: 只对每个 pack 做一次
+     * {@code Files.size} (stat), 不读内容, 与 {@link #objectCount} 的量级相当.
+     *
+     * <p>持读锁防压实 (compact 删/重写 pack) 与本统计并发导致 {@code Files.size} 命中已删 pack.
+     */
+    public long totalPackBytes() throws IOException {
+        storeLock.readLock().lock();
+        try {
+            long total = 0;
+            for (int packId : listPackIds()) {
+                total += Files.size(packPath(packId));
+            }
+            return total;
+        } finally {
+            storeLock.readLock().unlock();
+        }
+    }
+
+    /**
      * 顺序遍历所有 pack 的每个对象 (内联 storedHash + 原始字节). fsck 完整性校验用 ——
      * 按 pack 顺序读, 机械盘友好. 持读锁防压实并发改 pack.
      */

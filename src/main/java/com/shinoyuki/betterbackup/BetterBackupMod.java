@@ -12,6 +12,7 @@ import com.shinoyuki.betterbackup.config.ConfigSpec;
 import com.shinoyuki.betterbackup.diagnostic.BetterBackupMetrics;
 import com.shinoyuki.betterbackup.diagnostic.DiagnosticLogger;
 import com.shinoyuki.betterbackup.diagnostic.PrometheusExporter;
+import com.shinoyuki.betterbackup.gc.StoreSizeGuard;
 import com.shinoyuki.betterbackup.integration.BackupListenerBridge;
 import com.shinoyuki.betterbackup.integration.PipelineDegradedHandler;
 import com.shinoyuki.betterbackup.io.WorldPaths;
@@ -264,6 +265,15 @@ public final class BetterBackupMod {
                 LOGGER.info("[BetterBackup] orphan .tmp cleanup dispatched to background");
             }
 
+            // maxStoreSizeGB 软阈值自检: store 体积超阈值则先 retention 淘汰 (删超期 manifest) 再
+            // full GC 回收死对象. 与 .tmp 清扫同款后台 daemon 线程——算体积要 walk 整个 store, 大 store
+            // (百万对象 + 未排空旧树) 可达数十秒, 绝不能在 server 主线程同步跑, 否则推迟 ServerStarted /
+            // 登录门. 失败仅 warn 不中止启动 (自检不影响备份正确性). snapshotsDir 与 SnapshotCreator /
+            // StoreGc 用的同为 storeRoot/snapshots.
+            long maxStoreBytes = (long) BetterBackupConfig.maxStoreSizeGB() * 1024 * 1024 * 1024;
+            Path snapshotsDir = storeRoot.resolve("snapshots");
+            dispatchStoreSizeCheck(store, snapshotsDir, worldRoot, maxStoreBytes);
+
             CurrentSnapshotState snapshotState = new CurrentSnapshotState();
             WorldPaths paths = new WorldPaths(worldRoot);
             HashFunction hashFunction = new Xxh128HashFunction();
@@ -474,6 +484,50 @@ public final class BetterBackupMod {
 
         BetterBackupCore.uninstall();
         LOGGER.info("[BetterBackup] uninstalled");
+    }
+
+    /**
+     * 派后台 daemon 线程跑 maxStoreSizeGB 软阈值自检 ({@link StoreSizeGuard}). 未越阈值时纯读一次
+     * 体积即返回 (零副作用); 越阈值则先 retention 淘汰再 full GC, 并把 before / prune 份数 / 回收字节 /
+     * after 打进日志.
+     *
+     * <p><b>软阈值不是硬配额</b>: gcAll 回收量被"受保留策略保护的活数据"封顶. 若 after 仍超阈值,
+     * 显式 WARN 让服主看到"上限没兜住"的真相——要真控上限得调 retention / 缩短保留窗口 + 定期重启,
+     * 而非指望本自检把体积压到阈值以下.
+     *
+     * <p>daemon=true 且失败仅 warn: 自检不影响活跃备份路径, 崩了下次启动重试. 绝不阻塞启动.
+     */
+    private static void dispatchStoreSizeCheck(ChunkStore store, Path snapshotsDir, Path worldRoot,
+                                               long maxStoreBytes) {
+        StoreSizeGuard guard = new StoreSizeGuard(store, snapshotsDir, worldRoot, maxStoreBytes);
+        Thread thread = new Thread(() -> {
+            try {
+                StoreSizeGuard.Result r = guard.checkAndReclaim();
+                if (!r.triggered()) {
+                    LOGGER.info("[BetterBackup] store size check: {} bytes, under maxStoreSizeGB threshold ({} bytes); no GC",
+                            r.beforeBytes(), maxStoreBytes);
+                    return;
+                }
+                LOGGER.info("[BetterBackup] store size check: over threshold; before={} bytes, prune deleted {} manifest(s), "
+                                + "gcAll freed {} bytes, after={} bytes (threshold={} bytes)",
+                        r.beforeBytes(), r.prunedManifests(), r.gcBytesFreed(), r.afterBytes(), maxStoreBytes);
+                if (r.stillOver()) {
+                    // 软阈值兜不住: 回收量被活数据封顶. 如实告知, 别让服主误以为体积已降到阈值以下.
+                    LOGGER.warn("[BetterBackup] store still exceeds maxStoreSizeGB after GC: reclaimed {} bytes leaves {} bytes "
+                                    + "(threshold {} bytes). The remainder is live data protected by the retention policy. "
+                                    + "maxStoreSizeGB is a soft startup trigger, not a hard disk quota; to lower the ceiling, "
+                                    + "reduce retention (hourly/daily/weekly/monthly) or shorten the retention window and restart, "
+                                    + "or manually delete snapshots.",
+                            r.gcBytesFreed(), r.afterBytes(), maxStoreBytes);
+                }
+            } catch (IOException e) {
+                LOGGER.warn("[BetterBackup] store size check failed (non-fatal, retries next start)", e);
+            }
+        }, "BetterBackup-StoreSize-Check");
+        thread.setDaemon(true);
+        thread.start();
+        LOGGER.info("[BetterBackup] store size check dispatched to background (maxStoreSizeGB={})",
+                BetterBackupConfig.maxStoreSizeGB());
     }
 
     /**

@@ -245,6 +245,63 @@ class PackStoreTest {
         store.close();
     }
 
+    @Test
+    void total_pack_bytes_is_zero_for_empty_store(@TempDir Path root) throws IOException {
+        PackStore store = new PackStore(root, HASH_LEN, PackStore.DEFAULT_TARGET_PACK_SIZE_BYTES);
+        store.initialize();
+        assertEquals(0L, store.totalPackBytes(), "fresh store has no pack files, so zero bytes");
+        store.close();
+    }
+
+    @Test
+    void total_pack_bytes_equals_sum_of_pack_file_sizes(@TempDir Path root) throws IOException {
+        // 写若干对象后, totalPackBytes 必须精确等于 packs/ 下所有 .pack 的 Files.size 之和.
+        PackStore store = new PackStore(root, HASH_LEN, PackStore.DEFAULT_TARGET_PACK_SIZE_BYTES);
+        store.initialize();
+        for (int i = 0; i < 15; i++) {
+            byte[] o = randomBytes(300 + i * 7, 500 + i);
+            store.put(hashFn.hash(o), o);
+        }
+        store.flushAndSync();
+
+        long expected = sumPackFileSizes(root);
+        assertTrue(expected > 0, "precondition: some pack bytes were written");
+        assertEquals(expected, store.totalPackBytes(),
+                "totalPackBytes must equal the exact sum of Files.size over every .pack file");
+        store.close();
+    }
+
+    @Test
+    void total_pack_bytes_sums_across_multiple_rolled_packs(@TempDir Path root) throws IOException {
+        // 小封口 -> 多 pack; totalPackBytes 必须跨所有 pack 累加, 而非只算当前在写 pack.
+        PackStore store = new PackStore(root, HASH_LEN, 1200);
+        store.initialize();
+        for (int i = 0; i < 10; i++) {
+            byte[] o = randomBytes(500, 200 + i);
+            store.put(hashFn.hash(o), o);
+        }
+        store.flushAndSync();
+
+        long packCount;
+        try (Stream<Path> s = Files.list(root.resolve("packs"))) {
+            packCount = s.filter(p -> p.getFileName().toString().endsWith(".pack")).count();
+        }
+        assertTrue(packCount > 1, "precondition: multiple packs rolled, got " + packCount);
+        assertEquals(sumPackFileSizes(root), store.totalPackBytes(),
+                "totalPackBytes must sum every rolled pack, not just the active write pack");
+        store.close();
+    }
+
+    private static long sumPackFileSizes(Path root) throws IOException {
+        try (Stream<Path> s = Files.list(root.resolve("packs"))) {
+            long sum = 0;
+            for (Path p : (Iterable<Path>) s.filter(x -> x.getFileName().toString().endsWith(".pack"))::iterator) {
+                sum += Files.size(p);
+            }
+            return sum;
+        }
+    }
+
     private static byte[] randomBytes(int n, long seed) {
         byte[] b = new byte[n];
         new Random(seed).nextBytes(b);

@@ -95,8 +95,13 @@ public final class ConfigSpec {
                 .defineInRange("compressionLevel", 0, 0, 22);
 
         MAX_STORE_SIZE_GB = BUILDER
-                .comment("Soft upper bound on total store size in GB. When startup detects store > this value,",
-                         "an automatic full GC is triggered before any backup activity.")
+                .comment("Soft, one-shot startup trigger on total store size in GB -- NOT a real-time disk quota.",
+                         "When startup detects store > this value, it runs retention prune (drop expired manifests)",
+                         "then a full GC (reclaim the now-dead objects), once, in the background. Reclaimable bytes",
+                         "are capped by the live data your retention policy still protects, so the store may remain",
+                         "above this value after GC (you'll get a WARN when that happens). To actually bound the",
+                         "ceiling, tighten retention (hourly/daily/weekly/monthly) or shorten the retention window",
+                         "and restart periodically -- this is not a ring buffer or hard cap.")
                 .defineInRange("maxStoreSizeGB", 500, 1, 100_000);
 
         BUILDER.pop();
