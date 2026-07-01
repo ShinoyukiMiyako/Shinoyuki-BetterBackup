@@ -50,7 +50,6 @@ public final class ConfigSpec {
 
     public static final ForgeConfigSpec.BooleanValue VERIFY_ON_STARTUP;
     public static final ForgeConfigSpec.BooleanValue VERIFY_ON_SNAPSHOT;
-    public static final ForgeConfigSpec.BooleanValue PANIC_ON_HASH_MISMATCH;
 
     public static final ForgeConfigSpec.BooleanValue PROMETHEUS_ENABLED;
     public static final ForgeConfigSpec.ConfigValue<String> PROMETHEUS_BIND_ADDRESS;
@@ -169,19 +168,17 @@ public final class ConfigSpec {
         BUILDER.comment("Safety / integrity").push("safety");
 
         VERIFY_ON_STARTUP = BUILDER
-                .comment("On server start, scan the store directory: file size sanity + sample hash recomputation.",
-                         "Mismatches are quarantined to <storeDir>/quarantine/ and logged as ERROR.")
+                .comment("On server start, clean up orphan .tmp files left by a previous crash (kill -9 mid-write).",
+                         "Deep integrity checking (per-object rehash + reference completeness) is not done at",
+                         "startup; run it offline via the CLI: 'java -jar betterbackup.jar fsck|verify --store <dir>'.")
                 .define("verifyOnStartup", true);
 
         VERIFY_ON_SNAPSHOT = BUILDER
-                .comment("After each snapshot, recompute hashes for all entries written this snapshot.",
-                         "Slow; default off. Enable only on systems where silent disk corruption is a concern.")
+                .comment("After each snapshot, recompute hashes for the entries newly written this snapshot",
+                         "(write-path self-check). A mismatch marks only this snapshot failed (.incomplete);",
+                         "it does not trip degraded mode. Slow; default off. Covers this snapshot's writes only,",
+                         "not the whole store -- use the CLI fsck for a full-store integrity scan.")
                 .define("verifyOnSnapshot", false);
-
-        PANIC_ON_HASH_MISMATCH = BUILDER
-                .comment("When set true, hash mismatch (in either verify path) crashes the server.",
-                         "Default false: log ERROR + degraded mode.")
-                .define("panicOnHashMismatch", false);
 
         BUILDER.pop();
 

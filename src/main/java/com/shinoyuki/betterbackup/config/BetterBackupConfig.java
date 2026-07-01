@@ -35,7 +35,6 @@ public final class BetterBackupConfig {
 
     private static volatile boolean verifyOnStartup;
     private static volatile boolean verifyOnSnapshot;
-    private static volatile boolean panicOnHashMismatch;
 
     private static volatile boolean prometheusEnabled;
     private static volatile String prometheusBindAddress;
@@ -109,10 +108,6 @@ public final class BetterBackupConfig {
         return verifyOnSnapshot;
     }
 
-    public static boolean panicOnHashMismatch() {
-        return panicOnHashMismatch;
-    }
-
     public static boolean prometheusEnabled() {
         return prometheusEnabled;
     }
@@ -155,7 +150,6 @@ public final class BetterBackupConfig {
         baselineScanChunksPerSecond = ConfigSpec.BASELINE_SCAN_CHUNKS_PER_SECOND.get();
         verifyOnStartup = ConfigSpec.VERIFY_ON_STARTUP.get();
         verifyOnSnapshot = ConfigSpec.VERIFY_ON_SNAPSHOT.get();
-        panicOnHashMismatch = ConfigSpec.PANIC_ON_HASH_MISMATCH.get();
         prometheusEnabled = ConfigSpec.PROMETHEUS_ENABLED.get();
         prometheusBindAddress = ConfigSpec.PROMETHEUS_BIND_ADDRESS.get();
         prometheusPort = ConfigSpec.PROMETHEUS_PORT.get();
