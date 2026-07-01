@@ -5,6 +5,7 @@ import com.shinoyuki.betterbackup.baseline.BaselineProgress;
 import com.shinoyuki.betterbackup.diagnostic.BetterBackupMetrics;
 import com.shinoyuki.betterbackup.gc.StoreGc;
 import com.shinoyuki.betterbackup.io.WorldPaths;
+import com.shinoyuki.betterbackup.retention.RetentionPruner;
 import com.shinoyuki.betterbackup.safety.DiskSpaceCheck;
 import com.shinoyuki.betterbackup.safety.SnapshotFailureMarker;
 import com.shinoyuki.betterbackup.schedule.SnapshotTrigger;
@@ -245,6 +246,11 @@ public final class SnapshotCreator implements SnapshotTrigger {
             // 已落地数据不丢, 失败的 region 下次快照按 scanned 重扫一遍重新晋升 (幂等).
             promoteBaselineAfterWrite(scannedBeforeDrain);
 
+            // 滚动保留策略淘汰: 在 promote 之后、runIncrementalGc 之前跑, 这样接下来的 GC 收集
+            // 引用集时看到的已是淘汰后的 manifest 集, 被淘汰 manifest 独占的对象立即成死对象,
+            // 可被本轮 (或后续) 压实回收。淘汰只删 manifest 文件, 不同步跑重活 gcAll。
+            runRetentionPrune();
+
             runIncrementalGc(newManifest);
         } catch (IOException e) {
             LOGGER.error("[BetterBackup] snapshot write failed: {}", target, e);
@@ -271,6 +277,22 @@ public final class SnapshotCreator implements SnapshotTrigger {
         } catch (IOException e) {
             LOGGER.error("[BetterBackup] baseline progress promotion failed (snapshot already written, "
                     + "regions will be rescanned and re-promoted next snapshot)", e);
+        }
+    }
+
+    /**
+     * 滚动保留策略淘汰 (收尾 polish, 幂等). 只删被配额判 doomed 且未被 RetentionGuard 三门禁
+     * 保护的 manifest 文件。淘汰失败只 LOGGER.error 不抛: 快照已落盘, 淘汰是收尾, 下次快照重算
+     * doomed 补删 (天然幂等)。fail-fast abort (含非法 id / 损坏 manifest 时整次不删) 由
+     * {@link RetentionPruner} 内部保证, 抛出的异常在此统一收口成一条 error 日志。
+     */
+    private void runRetentionPrune() {
+        try {
+            RetentionPruner pruner = new RetentionPruner(snapshotsDir, paths.worldRoot());
+            pruner.prune();
+        } catch (IOException | RuntimeException e) {
+            LOGGER.error("[BetterBackup] retention prune failed (snapshot already written, "
+                    + "doomed snapshots will be recomputed and pruned next snapshot)", e);
         }
     }
 
