@@ -76,6 +76,11 @@ public final class PackStore {
     private FileChannel writeChannel;
     private long writeOffset;
 
+    // 在写 pack 的通道工厂. 生产用真 FileChannel.open; 测试可注入模拟写中途 IO 失败的假通道,
+    // 验证失败后 put 能恢复 position==writeOffset 不变量.
+    private volatile WriteChannelOpener writeChannelOpener =
+            p -> FileChannel.open(p, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+
     public PackStore(Path storeRoot, int hashLength, long targetPackSizeBytes) {
         if (hashLength <= 0) {
             throw new IllegalArgumentException("hashLength must be positive: " + hashLength);
@@ -198,7 +203,16 @@ public final class PackStore {
                 buf.putInt(data.length);
                 buf.put(data);
                 buf.flip();
-                writeFully(writeChannel, buf);
+                try {
+                    writeFully(writeChannel, buf);
+                } catch (IOException e) {
+                    // 部分写把通道位置推到 recordStart+k, 而 writeOffset 仍是 recordStart. 不修复则
+                    // 下次 put 从错误位置续写, 本会话此后所有对象索引偏移错位, get 读回混合垃圾字节.
+                    // 截断回 recordStart + 重开写通道定位 recordStart, 强制重建
+                    // channel.position()==writeOffset 不变量, 再让异常冒泡 (worker 记 ERROR).
+                    repairAfterFailedWrite(recordStart, e);
+                    throw e;
+                }
                 long dataOffset = recordStart + hashLength + LEN_FIELD_BYTES;
                 writeOffset += hashLength + LEN_FIELD_BYTES + data.length;
                 index.put(hash, new PackLocation(currentWritePackId, dataOffset, data.length));
@@ -495,10 +509,51 @@ public final class PackStore {
             writeChannel = null;
         }
         currentWritePackId = nextPackId++;
-        writeChannel = FileChannel.open(packPath(currentWritePackId),
-                StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+        writeChannel = writeChannelOpener.open(packPath(currentWritePackId));
         writeChannel.position(0);
         writeOffset = 0;
+    }
+
+    /**
+     * 写记录中途 IO 失败 (磁盘满 / 网络盘瞬断 / 杀软锁) 后恢复现场: 把在写 pack 物理截断回
+     * {@code recordStart} (= 本次失败记录的起点, writeOffset 尚未推进) 并重开写通道定位到
+     * {@code recordStart}, 使 {@code channel.position()==writeOffset} 不变量在失败后被强制重建.
+     * 调用方随后 rethrow 原始 IOException.
+     *
+     * <p>截断 / 重开自身再失败 (store 写侧彻底不可用) 时, 把写通道置空并将修复异常挂到原始
+     * {@code cause} 上一并冒泡: 下一次 put 的 {@link #ensureWriter} 见 null 会开一个全新 pack
+     * 从 offset 0 起写, 绝不复用已失步的通道继续追加.
+     */
+    private void repairAfterFailedWrite(long recordStart, IOException cause) {
+        if (writeChannel != null) {
+            try {
+                writeChannel.close();
+            } catch (IOException closeEx) {
+                cause.addSuppressed(closeEx);
+            }
+            writeChannel = null;
+        }
+        try {
+            FileChannel reopened = writeChannelOpener.open(packPath(currentWritePackId));
+            reopened.truncate(recordStart);
+            reopened.force(true);
+            reopened.position(recordStart);
+            writeChannel = reopened;
+        } catch (IOException repairEx) {
+            cause.addSuppressed(repairEx);
+            writeChannel = null;
+        }
+    }
+
+    /** 在写 pack 通道工厂. 生产恒为 {@code FileChannel.open(CREATE, WRITE)}; 测试注入模拟失败通道. */
+    @FunctionalInterface
+    interface WriteChannelOpener {
+        FileChannel open(Path path) throws IOException;
+    }
+
+    /** 测试注入点: 替换在写 pack 的通道工厂以模拟写中途 IO 失败. 仅测试调用. */
+    void setWriteChannelOpenerForTest(WriteChannelOpener opener) {
+        this.writeChannelOpener = opener;
     }
 
     private FileChannel readChannel(int packId) throws IOException {
