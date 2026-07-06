@@ -109,6 +109,10 @@ public final class BetterBackupMod {
     // 与 onServerStopping (server 线程) 之间隔着 daemon 线程的生命周期.
     private static volatile BaselineScanner activeBaselineScanner;
     private static volatile Thread activeBaselineThread;
+    // 降级窗口补采 (DegradedRescan) 的关服停止句柄. 与 baseline 同款: 后台 daemon 跑, 关服
+    // requestStop + join. 不进 BetterBackupCore (一次性启动期任务, 非常驻组件).
+    private static volatile DegradedRescan activeDegradedRescan;
+    private static volatile Thread activeDegradedThread;
 
     public BetterBackupMod() {
         // 游戏内: 把 BackupLog 门面桥回 slf4j, 让已迁到门面的 CLI 可达类 (ChunkStore 等)
@@ -410,6 +414,12 @@ public final class BetterBackupMod {
             baselineScanner.requestStop();
         }
 
+        // 降级窗口补采同样尽早请求停止, 与 baseline 并行收尾, join 在关服快照之前.
+        DegradedRescan degradedRescan = activeDegradedRescan;
+        if (degradedRescan != null) {
+            degradedRescan.requestStop();
+        }
+
         DiagnosticLogger diagnosticLogger = BetterBackupCore.diagnosticLogger();
         if (diagnosticLogger != null) {
             MinecraftForge.EVENT_BUS.unregister(diagnosticLogger);
@@ -479,6 +489,25 @@ public final class BetterBackupMod {
         }
         activeBaselineScanner = null;
         activeBaselineThread = null;
+
+        // 降级补采线程也必须在关服快照前停稳: 它对 state 的登记与快照 drain 竞争.
+        Thread degradedThread = activeDegradedThread;
+        if (degradedThread != null && degradedThread.isAlive()) {
+            try {
+                degradedThread.join(SHUTDOWN_JOIN_TIMEOUT_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                LOGGER.warn("[BetterBackup] interrupted joining degraded rescan thread");
+            }
+            if (degradedThread.isAlive()) {
+                LOGGER.warn("[BetterBackup] degraded rescan thread did not stop within {}ms",
+                        SHUTDOWN_JOIN_TIMEOUT_MS);
+            } else {
+                LOGGER.info("[BetterBackup] degraded rescan stopped for shutdown");
+            }
+        }
+        activeDegradedRescan = null;
+        activeDegradedThread = null;
 
         // 关服 final snapshot: 最后一次抓取本周期内 BAS fire 过的 chunk.
         // SnapshotCreator.create 用 synchronized 串行, 跟 scheduler 已停后无 race.
@@ -604,8 +633,11 @@ public final class BetterBackupMod {
      * region/entities 文件做增量重扫 ({@link DegradedRescan}), 把降级窗口内 vanilla 同步
      * 写盘但没进快照的 chunk 登记进 CurrentSnapshotState, 由下次快照纳入. 完成后清标志.
      *
-     * <p>同步跑 (非后台线程): 只扫 mtime 变化的子集, 远小于全量 baseline; 且必须在下次
-     * 快照前补完才有意义. 重扫失败保留标志 (下次启动重试), 不清, 不 throw 中止启动.
+     * <p>后台 daemon 线程跑 + ThrottlingRateLimiter 限速 (与 baseline 同款): cutoff=0 退化为
+     * 全量重扫, 若同步跑在 ServerStartingEvent 主线程会阻塞 ServerStarted / 登录门 (历史 62s
+     * 假启动同类症状), 且补采读盘量可能很大不该在玩家在线时打满磁盘. 补采本就是"下次快照前补齐"
+     * 语义, 异步跑不影响正确性. 关服路径 requestStop + join 防半扫与关服快照 drain 竞争; 被中断
+     * 或失败时保留 degraded-session 标志 (下次启动重试), 不清, 不 throw 中止启动.
      */
     private static void runDegradedRescanIfNeeded(ChunkStore store,
                                                   CurrentSnapshotState state,
@@ -622,15 +654,31 @@ public final class BetterBackupMod {
         LOGGER.warn("[BetterBackup] degraded-session flag present from a prior run; "
                 + "rescanning region files modified after lastCompleteSnapshotMillis={} to backfill the degraded window",
                 cutoff);
-        DegradedRescan rescan = new DegradedRescan(store, state, paths, hashFunction, writtenThisWindow);
-        try {
-            DegradedRescan.Result result = rescan.rescan(cutoff);
-            session.clear();
-            LOGGER.info("[BetterBackup] degraded-window backfill done: recovered={} deduped={} skipped(active)={} regions={}; flag cleared",
-                    result.recovered(), result.deduped(), result.skippedActive(), result.regionsScanned());
-        } catch (IOException e) {
-            LOGGER.error("[BetterBackup] degraded-window rescan failed, flag retained for retry next start", e);
-        }
+        int rate = BetterBackupConfig.baselineScanChunksPerSecond();
+        DegradedRescan rescan = new DegradedRescan(store, state, paths, hashFunction, writtenThisWindow,
+                new ThrottlingRateLimiter(rate));
+        Thread thread = new Thread(() -> {
+            try {
+                DegradedRescan.Result result = rescan.rescan(cutoff);
+                if (result.stopped()) {
+                    // 关服中断: backfill 未跑完, 保留标志下次启动重试, 不清.
+                    LOGGER.info("[BetterBackup] degraded-window backfill stopped for shutdown: recovered={} so far, "
+                            + "flag retained, resumes next start", result.recovered());
+                    return;
+                }
+                session.clear();
+                LOGGER.info("[BetterBackup] degraded-window backfill done: recovered={} deduped={} skipped(active)={} regions={}; flag cleared",
+                        result.recovered(), result.deduped(), result.skippedActive(), result.regionsScanned());
+            } catch (IOException e) {
+                LOGGER.error("[BetterBackup] degraded-window rescan failed, flag retained for retry next start", e);
+            }
+        }, "BetterBackup-Degraded-Rescan");
+        thread.setDaemon(true);
+        activeDegradedRescan = rescan;
+        activeDegradedThread = thread;
+        thread.start();
+        LOGGER.info("[BetterBackup] degraded-window backfill started in background (rate={} chunk/s, cutoffMillis={})",
+                rate, cutoff);
     }
 
     /**
