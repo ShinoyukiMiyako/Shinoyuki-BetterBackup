@@ -7,6 +7,8 @@
 | 目标版本 | Minecraft 1.20.1 / Forge 47.3+ / Java 17 |
 | 第一个 minor | v0.1 (MVP), 时间表见 §10 |
 
+> 存储层已迭代提示: 本文 §2.2 (Backup Store 目录结构) 与 §5.2 (GC dedup store) 原先描述的"一对象一文件 SHA256 两级分桶 + ls chunks/ 全扫删"是旧模型, 已被 pack append-only 大文件 + off-heap mmap 索引 + XXH128 默认哈希 + 延迟压实 GC 取代。这两节已按当前实现改写, 权威口径以 PackStore / MmapPackIndex / StoreGc / ChunkStore 类注释为准; 其余小节 (数据流 §2.1 已用 xxh128, manifest §2.3, 增量语义 §2.4 等) 仍有效。
+
 ## 0. 目标 / 非目标
 
 ### 目标
@@ -92,31 +94,39 @@ BAS chunk IO 完成 (BAS worker 线程, future.whenComplete callback):
 
 ### 2.2 Backup Store 目录结构
 
+存储层已从"一对象一文件的 SHA256 两级分桶"迭代为 pack append-only + off-heap mmap 索引。以下为当前实现 (见 PackStore / MmapPackIndex / ChunkStore 类注释):
+
 ```
-<world>/.shinoyuki-backup/
-├── chunks/
-│   ├── 00/             (sha256 前 2 hex char 分桶, 防单目录文件过多)
-│   │   ├── 0012ab.../  (前 6 hex char 子桶)
-│   │   │   ├── 0012ab34cdef...   (chunk 压缩字节, 文件名 = sha256 全 hex)
-│   │   │   ├── ...
-│   │   ├── ...
-│   ├── ff/
-│   │   └── ...
-├── snapshots/
-│   ├── 2026-05-08T19-00-00.manifest        (per-snapshot manifest, 见 §2.3)
-│   ├── 2026-05-08T19-00-00.meta            (元数据: 创建时间 / chunk 总数 / dedup store 大小等)
-│   ├── 2026-05-08T20-00-00.manifest
-│   ├── ...
-├── snapshots.idx                            (snapshots 索引文件, 用于快速列出)
-├── store.lock                               (启动时持有, 防多 instance 同写)
-└── version.txt                              (BetterBackup 版本号 + store schema 版本)
+<store-root>/                                 (默认 backup-store, 见 §7 backupDirectory)
+├── packs/
+│   ├── store.meta                            (魔数 BBPACK1 + hashLength; put 前校验算法一致, 防换算法毁 dedup)
+│   ├── 0000000000.pack                       (append-only 大文件, 内联自描述记录顺序追加)
+│   ├── 0000000001.pack                       (超 targetPackSizeBytes 默认 256 MiB 即封口换下一个, 封口不可变)
+│   └── ...
+├── index/
+│   ├── base.idx                              (排序后的 off-heap 内容寻址索引, checkpoint 归并产物)
+│   └── base.idx.tmp                          (checkpoint 原子替换用临时文件)
+├── chunks/                                   (旧 SHA256 两级文件树, 迁移前残留; 只读 + 惰性排空, 见 §5.2)
+│   └── <前2hex>/<前6hex>/<32hex 全名>         (一对象一文件, 不再有新写入)
+└── snapshots/
+    ├── 2026-05-08T19-00-00.manifest          (per-snapshot manifest, 见 §2.3)
+    ├── 2026-05-08T20-00-00.manifest
+    └── ...
+```
+
+pack 记录格式 (自描述, 内联 hash 让 fsck 顺序扫即可重建索引):
+
+```
+[hashLength 字节: 内容 hash][4 字节 BE: 数据长度 L][L 字节: 原始对象字节]
 ```
 
 **设计理由**:
-- **两级分桶 (00/0012ab.../...)**: sha256 前 2 hex 第一级 = 256 子目录, 前 6 hex 第二级 = 16M 子目录。3 千万 chunk 分布到 16M 桶 = 平均每桶 ≤2 文件, 文件系统友好
-- **chunks/ 跟 snapshots/ 分离**: dedup store 跨快照共享, snapshot manifest 是轻量索引
-- **store.lock**: 文件锁避免两个 server 同时写一个 store 目录
-- **version.txt**: schema 升级时知道兼容性
+- **pack append-only (取代两级分桶文件树)**: 众多内容寻址对象顺序追加进少量大 pack, 根治机械盘上百万小文件的随机寻道与每对象 fsync。pack 超 `targetPackSizeBytes` (默认 256 MiB) 即封口, 封口 pack 不可变
+- **fsync 一次每快照**: `put` 只顺序追加 (字节进 OS page cache, reader 即时可见), 不每对象 fsync; 持久化由 `flushAndSync` 屏障在写 manifest 前一次性完成, 把"manifest 落盘即其引用对象落盘"的不变量压成每快照 1 次 force。窗口中途崩溃丢失的只是尚未被任何 manifest 引用的对象, 安全
+- **off-heap mmap 索引 (index/)**: `MmapPackIndex` 把排序索引整读进 direct ByteBuffer (零 JVM 堆, 不给 GC 施压, OS 仍缓存底层文件), 查询走二分; 会话内新写入落内存 delta, 压实回收记 tombstone, `checkpoint` 归并成新 `base.idx`。base 头记录 pack 集指纹, 指纹失配 (崩溃 / pack 变化) 时 PackStore 顺序扫 pack 重建, 绝不用过期索引
+- **崩溃恢复**: 内存索引不持久, 每次 `load` 顺序扫所有 pack 重建; 遇写一半的尾部记录 (torn tail) 截断到上一条完整记录边界 (只有最后一个 pack 可能出现)
+- **默认哈希 XXH128**: OpenHFT zero-allocation-hashing 纯 Java 实现 (`LongTupleHashFunction.xx128`), 16 字节, 跨 JVM 字节恒等, 比 SHA256 快约 5-10 倍 (ConfigSpec 默认 `hashAlgorithm = XXH128`)。SHA256 / BLAKE3 是 `hashAlgorithm` 配置项的保留枚举值, 当前尚未落地
+- **chunks/ 跟 snapshots/ 分离**: dedup store (pack + 旧树) 跨快照共享, snapshot manifest 是轻量索引
 
 ### 2.3 Manifest 格式
 
@@ -480,25 +490,31 @@ monthly = 12     # 保留最近 12 份每月备份 (1 号 00:00)
 
 ### 5.2 GC dedup store
 
-manifest 删除后, 它引用的 chunk hash 可能仍被其他 manifest 引用, 也可能成为孤儿. GC 流程:
+store 是内容寻址 append-only, 存活集 = 所有存活 manifest 引用的 hash ∪ 在途保护集; 不在其中的对象即死。因 pack 无法删单对象, GC 走延迟压实 (restic/borg 模型), 且横跨两种布局 (见 StoreGc 类注释):
 
 ```
-1. 扫描所有 surviving manifest 的 chunk hash, 累成 referencedHashes set
-2. ls chunks/ 下所有文件, 不在 referencedHashes 的 → 删除
+1. 收集所有存活 manifest 的引用 hash 累成存活集 live (∪ protect 在途集)
+   任意 manifest 读失败 → 在动任何对象前直接 abort, 绝不静默跳过
+2. 旧文件树 (chunks/<2>/<6>/<full>, 迁移前残留): 一对象一文件, drainLegacy 直接删不在 live 的对象
+3. pack 延迟压实 (PackStore.compact):
+   - 全死 pack (无任何存活对象) → 整个删除
+   - 死字节占比超阈值的 pack → 重打包存活对象到新 pack 回收死字节; 在写 pack 跳过
 ```
+
+**两档 GC**:
+- **全量 GC (`StoreGc.gcAll`)**: 排空旧树未引用对象 + 阈值 0 压实所有 pack (回收全部死字节)。重活, 给手动 `/betterbackup gc`、启动超阈值自检、周期触发用
+- **阈值压实 (`StoreGc.compactAfterSnapshot`)**: 只重写死字节占比超阈值的 pack (有界), 给 SnapshotCreator 攒够死对象后的自动压实用
 
 **触发时机**:
 - 手动 `/betterbackup gc`
-- 自动: 每次删除 manifest 后异步触发 (worker 线程, 不阻塞 BAS)
-- 启动时: 如果 store 大小 > 配置阈值 (例如 500GB), 自动 GC
-- **每次创建 snapshot 后立即增量 GC** (新增, 见 §2.6): 仅扫本次 BackupWorker 写入但未被 manifest 引用的 hash. scope 远小于全量 GC, 秒级完成. 防止 store 在两次 snapshot 间膨胀 (大服可达几 GB / 2h)
+- 保留策略淘汰: `RetentionPruner` 只删超期 manifest (release reference, O(份数) 轻操作), 不在此路径同步跑重活压实; 被独占引用的对象随后由攒够阈值的渐进压实 / 手动 gc 物理回收
+- 启动超阈值自检: `StoreSizeGuard` 后台线程在 store 体积超 `maxStoreSizeGB` 软阈值时, 先 prune 删超期 manifest 再 gcAll 回收死对象 (顺序不可颠倒: 不先淘汰 manifest 则无对象变死, gcAll 纯空转)
 
-**GC 安全性**:
-- GC 期间持有 `store.lock`
-- 如果备份正在写 store, GC 等其完成
-- GC 跟 dedup write 之间有 race window: GC 检测 hash 没被引用 → 此时一个新 backup 引用该 hash → GC 删了 → 新 backup 失败 → 重新计算 + 写入。该 race 用 GC 阶段 lock 解决, 或新 backup 写 hash 前持有 GC 互斥锁.
+**软阈值, 非硬配额**: 回收量被受保留策略保护的活数据封顶。即便 gcAll 跑完, retention 窗口内的活快照仍可能撑住体积高于阈值, 此时如实 WARN 提示用户调 retention, 不做环形覆盖或磁盘 quota。
 
-**实现复杂度**: 1 周, 并发正确性是大头.
+**在途安全**: 活服调用必须传 `protect = 在途 hash 集` 且不封口在写 pack。在途对象 (已 put 入库、已登记 state, 但尚未随任何 manifest 落盘) 不在 manifest 引用集内, 不保护就会被判死物理回收, 下一份快照 drain 出这些 hash 即成悬空引用, 静默丢数据。protect 挡已落入封口 pack 的在途对象, 跳过在写 pack 挡"已 put 但登记尚未可见"的时序窗口, 两层各挡一类。
+
+**损坏 manifest 一律 abort**: 收集引用集期间任一 manifest 读失败 → 在动对象前直接 abort, 不删不压。跳过等于把损坏 manifest 引用的 hash 误判 unreferenced 而误删, 那些 hash 可能仍被其他存活 manifest 引用。用户应先离线修复 / 删损坏 manifest 再 GC。
 
 ### 5.3 自动 / 手动触发
 
