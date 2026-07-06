@@ -198,7 +198,7 @@ cd Shinoyuki-BetterBackup
 #   shinoyuki_betterbackup-0.1.0.jar         <- lacks the hashing library, do not use
 ```
 
-Tests: `./gradlew test` (store / snapshot / GC / torn read / baseline / player data / CLI / degraded re-capture, etc. -- 265 unit tests in total).
+Tests: `./gradlew test` (store / snapshot / GC / torn read / baseline / player data / CLI / degraded re-capture, etc. -- 266 unit tests in total).
 
 Dev server testing (no client install needed): `./gradlew runServer`, then in the server console run `/op <your name>` and connect a client to localhost.
 

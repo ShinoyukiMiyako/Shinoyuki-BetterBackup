@@ -196,7 +196,7 @@ cd Shinoyuki-BetterBackup
 #   shinoyuki_betterbackup-0.1.0.jar         <- 缺哈希库, 别用
 ```
 
-测试：`./gradlew test`（store / 快照 / GC / 撕裂读 / baseline / 玩家数据 / CLI / 降级补采等共 265 个单元测试）。
+测试：`./gradlew test`（store / 快照 / GC / 撕裂读 / baseline / 玩家数据 / CLI / 降级补采等共 266 个单元测试）。
 
 dev server 测试（不需要装 client）：`./gradlew runServer`，进 server console 跑 `/op <你的名字>` 然后用 client 连 localhost。
 
