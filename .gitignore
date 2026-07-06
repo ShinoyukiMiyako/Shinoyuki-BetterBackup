@@ -25,6 +25,10 @@
 .DS_Store
 Thumbs.db
 
+# Python 字节码缓存 (scripts/spark 等分析脚本编译产物)
+__pycache__/
+*.pyc
+
 *.log
 /logs/
 /crash-reports/
