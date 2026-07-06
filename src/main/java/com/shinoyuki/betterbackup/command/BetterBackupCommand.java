@@ -797,10 +797,11 @@ public final class BetterBackupCommand {
             long t0 = System.currentTimeMillis();
             try {
                 // 活服手动 GC: 传在途保护集 (pendingHashes ∪ writtenThisWindow) 且不封口在写 pack,
-                // 玩家在线 / chunk 正存盘时执行不会误删尚未进 manifest 的在途对象.
+                // 玩家在线 / chunk 正存盘时执行不会误删尚未进 manifest 的在途对象. 阈值 0 = 运营
+                // 择时的彻底回收 (任何含死字节的 pack 都重打包), 与启动自检的有界阈值区分.
                 Set<Hash> protect = new HashSet<>(snapshotState.pendingHashes());
                 protect.addAll(writtenThisWindow);
-                StoreGc.GcResult r = gc.gcAll(protect, false);
+                StoreGc.GcResult r = gc.gcAll(protect, false, 0.0);
                 long elapsed = System.currentTimeMillis() - t0;
                 server.execute(() -> source.sendSuccess(() -> Component.literal(
                         "GC done in " + elapsed + "ms: scanned=" + r.scanned()

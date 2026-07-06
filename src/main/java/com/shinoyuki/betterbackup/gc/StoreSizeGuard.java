@@ -31,6 +31,15 @@ import java.util.function.Supplier;
  */
 public final class StoreSizeGuard {
 
+    /**
+     * 启动自检的 pack 重写阈值: 只重写死字节占比过半的 pack. 自检是每次越阈值启动都会跑的无人值守
+     * 后台任务, 阈值 0 会把任何含一丝死字节的 pack 全部重写 (数百 GB store 的读写风暴, 与启动期
+     * 写入争用磁盘, 且仍越阈值的每次启动都重来); 压到"回收划算"的子集后重写 I/O 有界. 全死 pack
+     * (retention 淘汰后的主要回收来源) 无视阈值一律直接删除, 不受影响. 阈值 0 的彻底回收保留给
+     * 运营手动 {@code /betterbackup gc} 择时执行.
+     */
+    static final double STARTUP_COMPACT_DEAD_RATIO_THRESHOLD = 0.5;
+
     private final ChunkStore store;
     private final Path snapshotsDir;
     private final RetentionPruner pruner;
@@ -92,9 +101,9 @@ public final class StoreSizeGuard {
         int prunedManifests = pruneResult.deleted().size();
 
         // 活服自检: 传在途保护集 (求值于此刻) 且不封口在写 pack, 与增量压实同源防并发误删——
-        // 启动期 worker / baseline 正并发写入尚未进 manifest 的对象.
+        // 启动期 worker / baseline 正并发写入尚未进 manifest 的对象. pack 重写用有界阈值 (见常量注释).
         StoreGc gc = new StoreGc(store, snapshotsDir);
-        StoreGc.GcResult gcResult = gc.gcAll(inFlightProtect.get(), false);
+        StoreGc.GcResult gcResult = gc.gcAll(inFlightProtect.get(), false, STARTUP_COMPACT_DEAD_RATIO_THRESHOLD);
 
         long after = store.approxStoreBytes();
         boolean stillOver = after > maxBytes;

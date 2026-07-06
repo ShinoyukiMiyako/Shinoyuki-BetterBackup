@@ -314,8 +314,8 @@ class StoreGcTest {
         reopened.put(hash(6), payload(6));
 
         StoreGc gc = new StoreGc(reopened, snapshotsDir);
-        // 活服语义: protect={4} (在途待引用), 不封口在写 pack.
-        StoreGc.GcResult r = gc.gcAll(Set.of(hash(4)), false);
+        // 活服语义: protect={4} (在途待引用), 不封口在写 pack. 阈值 0 = 任何死字节都回收.
+        StoreGc.GcResult r = gc.gcAll(Set.of(hash(4)), false, 0.0);
 
         // 4 受 protect 保护存活 (在封口 pack 内), 5 未保护未引用被回收 -> 删 protect 逻辑此断言必挂.
         assertTrue(reopened.has(hash(4)), "in-flight object 4 in protect set must survive");

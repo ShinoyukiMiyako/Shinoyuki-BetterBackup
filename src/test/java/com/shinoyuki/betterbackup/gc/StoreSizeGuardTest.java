@@ -124,15 +124,17 @@ class StoreSizeGuardTest {
         ChunkStore store = new ChunkStore(storeRoot);
         store.initialize();
 
-        // snap-A (较早, incomplete) 独占引用 1..3; snap-B (最新, baselineComplete) 引用 4..10.
-        // hourly=1 -> 只留最新 B, A 被 doom 且无门禁保护 -> prune 删 A -> A 独占 1,2,3 变死.
+        // snap-A (较早, incomplete) 独占引用 1..7; snap-B (最新, baselineComplete) 引用 8..10.
+        // hourly=1 -> 只留最新 B, A 被 doom 且无门禁保护 -> prune 删 A -> A 独占 1..7 变死.
+        // 死字节占比 ~69% > 启动自检重写阈值 0.5, pack 被重打包回收 (阈值以下的 pack 不重写,
+        // 见 trigger_protects_in_flight 对反向情形的隐含覆盖).
         for (int i = 1; i <= 10; i++) {
             store.put(hash(i), payload(i));
         }
         Set<Hash> setA = new HashSet<>();
-        for (int i = 1; i <= 3; i++) setA.add(hash(i));
+        for (int i = 1; i <= 7; i++) setA.add(hash(i));
         Set<Hash> setB = new HashSet<>();
-        for (int i = 4; i <= 10; i++) setB.add(hash(i));
+        for (int i = 8; i <= 10; i++) setB.add(hash(i));
         writeManifest(snapshotsDir, "2026-05-09T12-00-00Z", setA, false);   // snap-A
         writeManifest(snapshotsDir, "2026-05-10T12-00-00Z", setB, true);    // snap-B
 
@@ -143,9 +145,9 @@ class StoreSizeGuardTest {
         store.initialize();
 
         long before = store.approxStoreBytes();
-        // gcAll 回收 1,2,3 的 pack 帧: 每对象 16B hash + 4B len + 数据. 精确期望值.
+        // gcAll 回收 1..7 的 pack 帧: 每对象 16B hash + 4B len + 数据. 精确期望值.
         long expectedReclaimed = 0;
-        for (int i = 1; i <= 3; i++) {
+        for (int i = 1; i <= 7; i++) {
             expectedReclaimed += 16 + 4 + payload(i).length;
         }
 
@@ -158,21 +160,21 @@ class StoreSizeGuardTest {
 
         assertTrue(r.triggered(), "over threshold must trigger");
         assertEquals(1, r.prunedManifests(), "prune must delete exactly snap-A (1 manifest)");
-        // gcAll 回收字节 = 精确的 A 独占三对象帧字节 (强断言, 非 >0 弱校验).
+        // gcAll 回收字节 = 精确的 A 独占七对象帧字节 (强断言, 非 >0 弱校验).
         assertEquals(expectedReclaimed, r.gcBytesFreed(),
-                "gcAll must reclaim exactly the frame bytes of A's 3 exclusive objects");
+                "gcAll must reclaim exactly the frame bytes of A's 7 exclusive objects");
         assertEquals(before, r.beforeBytes());
         assertTrue(r.afterBytes() < before, "store must shrink after reclamation");
         // approxStoreBytes 下降量 == 回收字节 (体积主体是 pack).
         assertEquals(before - expectedReclaimed, r.afterBytes(),
                 "after == before minus reclaimed frame bytes");
-        // 物理验证: snap-A manifest 删了; A 独占 1,2,3 死对象回收; B 的 4..10 存活.
+        // 物理验证: snap-A manifest 删了; A 独占 1..7 死对象回收; B 的 8..10 存活.
         assertFalse(Files.exists(snapshotsDir.resolve("2026-05-09T12-00-00Z.manifest")));
         assertTrue(Files.exists(snapshotsDir.resolve("2026-05-10T12-00-00Z.manifest")));
-        for (int i = 1; i <= 3; i++) {
+        for (int i = 1; i <= 7; i++) {
             assertFalse(store.has(hash(i)), "A-exclusive object " + i + " reclaimed");
         }
-        for (int i = 4; i <= 10; i++) {
+        for (int i = 8; i <= 10; i++) {
             assertTrue(store.has(hash(i)), "B object " + i + " survives");
         }
         store.close();
@@ -237,13 +239,14 @@ class StoreSizeGuardTest {
         ChunkStore store = new ChunkStore(storeRoot);
         store.initialize();
 
+        // A 独占 1..7 (死字节过半, 越过启动自检 0.5 重写阈值), B 引用 8..10.
         for (int i = 1; i <= 10; i++) {
             store.put(hash(i), payload(i));
         }
         Set<Hash> setA = new HashSet<>();
-        for (int i = 1; i <= 3; i++) setA.add(hash(i));
+        for (int i = 1; i <= 7; i++) setA.add(hash(i));
         Set<Hash> setB = new HashSet<>();
-        for (int i = 4; i <= 10; i++) setB.add(hash(i));
+        for (int i = 8; i <= 10; i++) setB.add(hash(i));
         writeManifest(snapshotsDir, "2026-05-09T12-00-00Z", setA, false);
         writeManifest(snapshotsDir, "2026-05-10T12-00-00Z", setB, true);
 
@@ -254,7 +257,7 @@ class StoreSizeGuardTest {
 
         long before = store.approxStoreBytes();
         long expectedReclaimed = 0;
-        for (int i = 1; i <= 3; i++) {
+        for (int i = 1; i <= 7; i++) {
             expectedReclaimed += 16 + 4 + payload(i).length;
         }
         long afterExpected = before - expectedReclaimed;
@@ -280,7 +283,7 @@ class StoreSizeGuardTest {
     void trigger_protects_in_flight_objects_from_gcall(@TempDir Path tempDir) throws IOException {
         // 启动自检与 worker/baseline 写入并发: 已 put 入库但尚未进任何 manifest 的在途对象必须被
         // gcAll 的 protect 集保护, 否则下一份快照 drain 出这些 hash 即成悬空引用, 备份静默丢数据.
-        // 删掉 protect 接线 (guard 改回无参 gcAll) 时, 7/8 会被物理删, store.has(7/8) 断言必挂.
+        // 删掉 protect 接线 (guard 不传 protect) 时, 8/9 会被物理删, store.has(8/9) 断言必挂.
         Path storeRoot = tempDir.resolve("backup-store");
         Path snapshotsDir = tempDir.resolve("snapshots");
         Files.createDirectories(snapshotsDir);
@@ -289,15 +292,16 @@ class StoreSizeGuardTest {
         ChunkStore store = new ChunkStore(storeRoot);
         store.initialize();
 
-        // 1..9 全部入库; 1..3 被 doomed 的 snap-A 独占, 4..6 被保留的 snap-B 引用,
-        // 7..8 在途 (protect 集), 9 死对象 (无引用无保护) —— 用于反证 protect 是选择性的.
-        for (int i = 1; i <= 9; i++) {
+        // 1..10 全部入库; 1..5 被 doomed 的 snap-A 独占, 6..7 被保留的 snap-B 引用,
+        // 8..9 在途 (protect 集), 10 死对象 (无引用无保护) —— 用于反证 protect 是选择性的.
+        // 死字节 (1..5 + 10) 占比 ~59% > 启动自检 0.5 重写阈值, pack 参与重打包.
+        for (int i = 1; i <= 10; i++) {
             store.put(hash(i), payload(i));
         }
         Set<Hash> setA = new HashSet<>();
-        for (int i = 1; i <= 3; i++) setA.add(hash(i));
+        for (int i = 1; i <= 5; i++) setA.add(hash(i));
         Set<Hash> setB = new HashSet<>();
-        for (int i = 4; i <= 6; i++) setB.add(hash(i));
+        for (int i = 6; i <= 7; i++) setB.add(hash(i));
         writeManifest(snapshotsDir, "2026-05-09T12-00-00Z", setA, false);
         writeManifest(snapshotsDir, "2026-05-10T12-00-00Z", setB, true);
 
@@ -308,12 +312,12 @@ class StoreSizeGuardTest {
 
         long before = store.approxStoreBytes();
         long expectedReclaimed = 0;
-        for (int i : new int[]{1, 2, 3, 9}) {
+        for (int i : new int[]{1, 2, 3, 4, 5, 10}) {
             expectedReclaimed += 16 + 4 + payload(i).length;
         }
         long maxBytes = before - 1;
 
-        Set<Hash> inFlight = Set.of(hash(7), hash(8));
+        Set<Hash> inFlight = Set.of(hash(8), hash(9));
         StoreSizeGuard guard = new StoreSizeGuard(store, snapshotsDir,
                 RetentionPrunerTestFactory.withPolicy(snapshotsDir, worldRoot, new RetentionPolicy(1, 0, 0, 0)), maxBytes,
                 () -> inFlight);
@@ -322,16 +326,68 @@ class StoreSizeGuardTest {
         assertTrue(r.triggered());
         assertEquals(1, r.prunedManifests(), "prune deletes snap-A only");
         assertEquals(expectedReclaimed, r.gcBytesFreed(),
-                "reclaims exactly A-exclusive {1,2,3} + orphan {9}, never protected {7,8}");
+                "reclaims exactly A-exclusive {1..5} + orphan {10}, never protected {8,9}");
         // 在途对象存活 (protect 生效): Critical 修复的核心断言.
-        assertTrue(store.has(hash(7)), "in-flight object 7 must survive gcAll");
         assertTrue(store.has(hash(8)), "in-flight object 8 must survive gcAll");
+        assertTrue(store.has(hash(9)), "in-flight object 9 must survive gcAll");
         // A 独占 + 孤儿死对象被回收 (证明 protect 是选择性的, 非一律不删).
-        for (int i : new int[]{1, 2, 3, 9}) {
+        for (int i : new int[]{1, 2, 3, 4, 5, 10}) {
             assertFalse(store.has(hash(i)), "dead object " + i + " reclaimed");
         }
-        for (int i = 4; i <= 6; i++) {
+        for (int i = 6; i <= 7; i++) {
             assertTrue(store.has(hash(i)), "referenced object " + i + " survives");
+        }
+        store.close();
+    }
+
+    // ---- 有界重写: 死字节占比不过半的 pack 不重写 (启动自检 I/O 有界) ------------------
+
+    @Test
+    void minority_dead_pack_is_not_rewritten_by_startup_check(@TempDir Path tempDir) throws IOException {
+        // 启动自检是每次越阈值启动都会跑的无人值守任务, pack 重写必须有界: 死字节占比不过
+        // STARTUP_COMPACT_DEAD_RATIO_THRESHOLD 的 pack 不重打包 (回收不划算, 重写整个 pack 只
+        // 摘掉一小截死字节). 把 guard 的阈值改回 0.0 (无界重写) 时本测试必挂 —— 少数死字节也会
+        // 被回收, gcBytesFreed 不再是 0. 彻底回收走运营手动 /betterbackup gc (阈值 0).
+        Path storeRoot = tempDir.resolve("backup-store");
+        Path snapshotsDir = tempDir.resolve("snapshots");
+        Files.createDirectories(snapshotsDir);
+        Path worldRoot = tempDir.resolve("world");
+        Files.createDirectories(worldRoot);
+        ChunkStore store = new ChunkStore(storeRoot);
+        store.initialize();
+
+        // A 独占 1..2 (死字节 ~20%, 低于 0.5 阈值), B 引用 3..10.
+        for (int i = 1; i <= 10; i++) {
+            store.put(hash(i), payload(i));
+        }
+        Set<Hash> setA = new HashSet<>();
+        for (int i = 1; i <= 2; i++) setA.add(hash(i));
+        Set<Hash> setB = new HashSet<>();
+        for (int i = 3; i <= 10; i++) setB.add(hash(i));
+        writeManifest(snapshotsDir, "2026-05-09T12-00-00Z", setA, false);
+        writeManifest(snapshotsDir, "2026-05-10T12-00-00Z", setB, true);
+
+        store.close();
+        store = new ChunkStore(storeRoot);
+        store.initialize();
+
+        long before = store.approxStoreBytes();
+        long maxBytes = before - 1;
+        StoreSizeGuard guard = new StoreSizeGuard(store, snapshotsDir,
+                RetentionPrunerTestFactory.withPolicy(snapshotsDir, worldRoot, new RetentionPolicy(1, 0, 0, 0)), maxBytes,
+                HashSet::new);
+        StoreSizeGuard.Result r = guard.checkAndReclaim();
+
+        assertTrue(r.triggered());
+        assertEquals(1, r.prunedManifests(), "prune still deletes the expired snap-A manifest");
+        // 核心断言: 死字节占比 ~20% < 0.5, pack 不被重写, 零回收 (阈值改回 0.0 时此断言必挂).
+        assertEquals(0L, r.gcBytesFreed(),
+                "minority-dead pack must not be rewritten by the bounded startup check");
+        assertEquals(before, r.afterBytes(), "store size unchanged when nothing is rewritten");
+        assertTrue(r.stillOver(), "reclaim skipped -> still over threshold, reported honestly");
+        // 死对象仍在 (留给手动 gc / 后续攒够阈值的压实), 活对象自然也在.
+        for (int i = 1; i <= 10; i++) {
+            assertTrue(store.has(hash(i)), "object " + i + " remains (no rewrite happened)");
         }
         store.close();
     }
