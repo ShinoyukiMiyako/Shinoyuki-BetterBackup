@@ -1,5 +1,5 @@
 blank_issues_enabled: false
 contact_links:
-  - name: 反馈前请先确认版本 / Check your version first
-    url: https://github.com/xiaoxiao-cvs/Shinoyuki-BetterBackup/releases/latest
-    about: 很多问题在最新正式版已修复，请先升级到最新版再反馈。
+  - name: 反馈前请先看 README / Read the README first
+    url: https://github.com/xiaoxiao-cvs/Shinoyuki-BetterBackup#readme
+    about: 先确认你的 BetterBackup 与依赖的 BetterAutoSave 版本符合要求（安装段有下限说明）；很多问题在较新版本已修复，升级后仍存在再反馈。

@@ -13,7 +13,6 @@ import java.io.IOException;
 import java.io.PrintStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -65,7 +64,7 @@ public final class OfflineRestore {
 
         verifyStoreCompleteness(manifest);
 
-        Path backupDir = moveCurrentWorldToBackup();
+        Path backupDir = new com.shinoyuki.betterbackup.restore.WorldBackupMover().moveToBackup(paths.worldRoot());
 
         long chunkSlots = rebuildChunkPath(manifest.chunks(), false);
         long entitySlots = rebuildChunkPath(manifest.entityChunks(), true);
@@ -234,34 +233,6 @@ public final class OfflineRestore {
         if (!missing.isEmpty()) {
             throw new IOException("store incomplete: " + missing.size() + " hash(es) missing, first="
                     + missing.get(0).toHex());
-        }
-    }
-
-    private Path moveCurrentWorldToBackup() throws IOException {
-        Path worldRoot = paths.worldRoot();
-        String backupName = worldRoot.getFileName() + ".bak-" + System.currentTimeMillis();
-        Path backupDir = worldRoot.resolveSibling(backupName);
-        Files.createDirectories(backupDir);
-
-        moveIfExists(worldRoot.resolve("region"), backupDir.resolve("region"));
-        moveIfExists(worldRoot.resolve("entities"), backupDir.resolve("entities"));
-        moveIfExists(worldRoot.resolve("data"), backupDir.resolve("data"));
-        moveIfExists(worldRoot.resolve("playerdata"), backupDir.resolve("playerdata"));
-        moveIfExists(worldRoot.resolve("stats"), backupDir.resolve("stats"));
-        moveIfExists(worldRoot.resolve("advancements"), backupDir.resolve("advancements"));
-        moveIfExists(worldRoot.resolve("poi"), backupDir.resolve("poi"));
-        moveIfExists(worldRoot.resolve("DIM-1"), backupDir.resolve("DIM-1"));
-        moveIfExists(worldRoot.resolve("DIM1"), backupDir.resolve("DIM1"));
-        moveIfExists(worldRoot.resolve("dimensions"), backupDir.resolve("dimensions"));
-        moveIfExists(worldRoot.resolve("level.dat"), backupDir.resolve("level.dat"));
-        moveIfExists(worldRoot.resolve("level.dat_old"), backupDir.resolve("level.dat_old"));
-        return backupDir;
-    }
-
-    private static void moveIfExists(Path src, Path dst) throws IOException {
-        if (Files.exists(src)) {
-            Files.createDirectories(dst.getParent());
-            Files.move(src, dst, StandardCopyOption.ATOMIC_MOVE);
         }
     }
 

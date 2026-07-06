@@ -14,11 +14,6 @@ public final class ConfigSpec {
         BLAKE3
     }
 
-    public enum CompressionAlgorithm {
-        NONE,
-        ZSTD
-    }
-
     public enum ScheduleMode {
         INTERVAL,
         AFTER_AUTOSAVE,
@@ -31,14 +26,13 @@ public final class ConfigSpec {
     public static final ForgeConfigSpec.ConfigValue<String> BACKUP_DIRECTORY;
 
     public static final ForgeConfigSpec.EnumValue<HashAlgorithm> HASH_ALGORITHM;
-    public static final ForgeConfigSpec.EnumValue<CompressionAlgorithm> COMPRESSION_ALGORITHM;
-    public static final ForgeConfigSpec.IntValue COMPRESSION_LEVEL;
     public static final ForgeConfigSpec.IntValue MAX_STORE_SIZE_GB;
 
     public static final ForgeConfigSpec.EnumValue<ScheduleMode> SCHEDULE_MODE;
     public static final ForgeConfigSpec.IntValue INTERVAL_MINUTES;
     public static final ForgeConfigSpec.IntValue DIRTY_CHUNK_THRESHOLD;
 
+    public static final ForgeConfigSpec.BooleanValue RETENTION_ENABLED;
     public static final ForgeConfigSpec.IntValue RETENTION_HOURLY;
     public static final ForgeConfigSpec.IntValue RETENTION_DAILY;
     public static final ForgeConfigSpec.IntValue RETENTION_WEEKLY;
@@ -50,7 +44,6 @@ public final class ConfigSpec {
 
     public static final ForgeConfigSpec.BooleanValue VERIFY_ON_STARTUP;
     public static final ForgeConfigSpec.BooleanValue VERIFY_ON_SNAPSHOT;
-    public static final ForgeConfigSpec.BooleanValue PANIC_ON_HASH_MISMATCH;
 
     public static final ForgeConfigSpec.BooleanValue PROMETHEUS_ENABLED;
     public static final ForgeConfigSpec.ConfigValue<String> PROMETHEUS_BIND_ADDRESS;
@@ -73,7 +66,7 @@ public final class ConfigSpec {
 
         BUILDER.pop();
 
-        BUILDER.comment("Content-addressed store: hash + compression").push("storage");
+        BUILDER.comment("Content-addressed store: hash").push("storage");
 
         HASH_ALGORITHM = BUILDER
                 .comment("Hash algorithm for chunk slot raw bytes.",
@@ -83,21 +76,14 @@ public final class ConfigSpec {
                          "BLAKE3: future option (not implemented in MVP).")
                 .defineEnum("hashAlgorithm", HashAlgorithm.XXH128);
 
-        COMPRESSION_ALGORITHM = BUILDER
-                .comment("Compression for store entries.",
-                         "NONE (default, recommended for chunk path): chunk slots in .mca are already vanilla zlib",
-                         "  compressed. Wrapping with zstd is double compression for marginal gain and waste of CPU.",
-                         "ZSTD: useful for SavedData / level.dat which are uncompressed.",
-                         "MVP applies this setting uniformly; v0.2+ may split per-payload-type.")
-                .defineEnum("compressionAlgorithm", CompressionAlgorithm.NONE);
-
-        COMPRESSION_LEVEL = BUILDER
-                .comment("Compression level for ZSTD (1=fast, 22=max). Ignored when compressionAlgorithm=NONE.")
-                .defineInRange("compressionLevel", 0, 0, 22);
-
         MAX_STORE_SIZE_GB = BUILDER
-                .comment("Soft upper bound on total store size in GB. When startup detects store > this value,",
-                         "an automatic full GC is triggered before any backup activity.")
+                .comment("Soft, one-shot startup trigger on total store size in GB -- NOT a real-time disk quota.",
+                         "When startup detects store > this value, it runs retention prune (drop expired manifests)",
+                         "then a full GC (reclaim the now-dead objects), once, in the background. Reclaimable bytes",
+                         "are capped by the live data your retention policy still protects, so the store may remain",
+                         "above this value after GC (you'll get a WARN when that happens). To actually bound the",
+                         "ceiling, tighten retention (hourly/daily/weekly/monthly) or shorten the retention window",
+                         "and restart periodically -- this is not a ring buffer or hard cap.")
                 .defineInRange("maxStoreSizeGB", 500, 1, 100_000);
 
         BUILDER.pop();
@@ -123,22 +109,32 @@ public final class ConfigSpec {
 
         BUILDER.comment("Retention policy: how many of each rolling category to keep").push("retention");
 
+        RETENTION_ENABLED = BUILDER
+                .comment("Master opt-in switch for rolling retention pruning. Default false: every snapshot is",
+                         "kept forever, so upgrading never starts deleting history implicitly. When false the",
+                         "hourly/daily/weekly/monthly quotas below are ignored. Pruning is irreversible; before",
+                         "turning this on for an existing store run '/betterbackup retention preview' to see",
+                         "exactly which snapshots the policy would delete.")
+                .define("enabled", false);
+
         RETENTION_HOURLY = BUILDER
-                .comment("Hourly snapshots to retain (most recent N).",
+                .comment("Hourly snapshots to retain (most recent N). Applied only when retention.enabled=true.",
                          "336 = full hourly coverage for 14 days; manifest overhead grows ~30MB per retained",
                          "snapshot on 1M+ chunk worlds until manifest delta encoding lands (v0.2).")
                 .defineInRange("hourly", 24, 0, 2000);
 
         RETENTION_DAILY = BUILDER
-                .comment("Daily snapshots to retain (the 00:00 snapshot of each day).")
+                .comment("Daily snapshots to retain (the 00:00 snapshot of each day). Applied only when",
+                         "retention.enabled=true.")
                 .defineInRange("daily", 7, 0, 90);
 
         RETENTION_WEEKLY = BUILDER
-                .comment("Weekly snapshots to retain (Monday 00:00).")
+                .comment("Weekly snapshots to retain (Monday 00:00). Applied only when retention.enabled=true.")
                 .defineInRange("weekly", 4, 0, 52);
 
         RETENTION_MONTHLY = BUILDER
-                .comment("Monthly snapshots to retain (1st of month 00:00).")
+                .comment("Monthly snapshots to retain (1st of month 00:00). Applied only when",
+                         "retention.enabled=true.")
                 .defineInRange("monthly", 12, 0, 120);
 
         BUILDER.pop();
@@ -169,19 +165,20 @@ public final class ConfigSpec {
         BUILDER.comment("Safety / integrity").push("safety");
 
         VERIFY_ON_STARTUP = BUILDER
-                .comment("On server start, scan the store directory: file size sanity + sample hash recomputation.",
-                         "Mismatches are quarantined to <storeDir>/quarantine/ and logged as ERROR.")
+                .comment("On server start, clean up orphan .tmp files left by a previous crash (kill -9 mid-write).",
+                         "Deep integrity checking (per-object rehash + reference completeness) is not done at",
+                         "startup; run it offline via the CLI: 'java -jar betterbackup.jar fsck|verify --store <dir>'.")
                 .define("verifyOnStartup", true);
 
         VERIFY_ON_SNAPSHOT = BUILDER
-                .comment("After each snapshot, recompute hashes for all entries written this snapshot.",
-                         "Slow; default off. Enable only on systems where silent disk corruption is a concern.")
+                .comment("After each snapshot, recompute hashes for the entries newly written this snapshot",
+                         "(write-path self-check). A mismatch marks only this snapshot failed (.incomplete);",
+                         "it does not trip degraded mode. Slow; default off. Covers this snapshot's writes only,",
+                         "not the whole store -- use the CLI fsck for a full-store integrity scan.",
+                         "During the initial baseline full scan a single snapshot window can accumulate a very",
+                         "large set of newly written objects, so this re-read + rehash can take minutes on the",
+                         "scheduler thread until the baseline completes; steady-state increments are small.")
                 .define("verifyOnSnapshot", false);
-
-        PANIC_ON_HASH_MISMATCH = BUILDER
-                .comment("When set true, hash mismatch (in either verify path) crashes the server.",
-                         "Default false: log ERROR + degraded mode.")
-                .define("panicOnHashMismatch", false);
 
         BUILDER.pop();
 

@@ -56,17 +56,29 @@ public final class DegradedRescan {
     private final WorldPaths paths;
     private final HashFunction hashFunction;
     private final Set<Hash> writtenThisWindow;
+    private final BaselineScanner.RateLimiter rateLimiter;
+    private volatile boolean stopRequested;
 
     public DegradedRescan(ChunkStore store,
                           CurrentSnapshotState state,
                           WorldPaths paths,
                           HashFunction hashFunction,
-                          Set<Hash> writtenThisWindow) {
+                          Set<Hash> writtenThisWindow,
+                          BaselineScanner.RateLimiter rateLimiter) {
         this.store = store;
         this.state = state;
         this.paths = paths;
         this.hashFunction = hashFunction;
         this.writtenThisWindow = writtenThisWindow;
+        this.rateLimiter = rateLimiter;
+    }
+
+    /**
+     * 请求停止补采 (关服路径调用). 在下一个 region / slot 边界退出并返回 {@code stopped=true} 的
+     * 部分结果; 调用方据此保留 degraded-session 标志 (backfill 未完成, 下次启动重试)。
+     */
+    public void requestStop() {
+        stopRequested = true;
     }
 
     /**
@@ -93,6 +105,9 @@ public final class DegradedRescan {
                     continue;
                 }
                 for (Path mca : listRegionFiles(dir)) {
+                    if (stopRequested) {
+                        return stoppedResult(recovered, deduped, skipped, regionsScanned);
+                    }
                     if (Files.getLastModifiedTime(mca).toMillis() <= cutoffMillis) {
                         continue;
                     }
@@ -101,13 +116,22 @@ public final class DegradedRescan {
                     recovered += rr.recovered();
                     deduped += rr.deduped();
                     skipped += rr.skipped();
+                    if (stopRequested) {
+                        return stoppedResult(recovered, deduped, skipped, regionsScanned);
+                    }
                 }
             }
         }
 
         LOGGER.info("[BetterBackup] degraded-window rescan complete: regions={} recovered={} deduped={} skipped(active)={}",
                 regionsScanned, recovered, deduped, skipped);
-        return new Result(recovered, deduped, skipped, regionsScanned);
+        return new Result(recovered, deduped, skipped, regionsScanned, false);
+    }
+
+    private Result stoppedResult(long recovered, long deduped, long skipped, int regionsScanned) {
+        LOGGER.info("[BetterBackup] degraded-window rescan stopped: regions={} recovered={} deduped={} skipped(active)={}",
+                regionsScanned, recovered, deduped, skipped);
+        return new Result(recovered, deduped, skipped, regionsScanned, true);
     }
 
     private RegionResult rescanRegionFile(String dim, boolean entityChannel, Path mca) throws IOException {
@@ -117,6 +141,9 @@ public final class DegradedRescan {
         long skipped = 0;
 
         for (int slot = 0; slot < SLOTS_PER_REGION; slot++) {
+            if (stopRequested) {
+                return new RegionResult(recovered, deduped, skipped);
+            }
             int localX = slot & (REGION_SIZE - 1);
             int localZ = (slot >> REGION_SHIFT) & (REGION_SIZE - 1);
             int chunkX = (rc.rx() << REGION_SHIFT) + localX;
@@ -151,6 +178,9 @@ public final class DegradedRescan {
                 continue; // 空 slot, 跳过
             }
 
+            // 限速 (与 baseline 同源): 每读一个非空 chunk slot 节流一次, 避免补采打满磁盘 IO.
+            rateLimiter.acquire();
+
             Hash hash = hashFunction.hash(rawBytes);
             boolean wrote = store.put(hash, rawBytes);
             // 先登记 state 再 add writtenThisWindow (GC 并发安全, 见 BaselineScanner 同址注释).
@@ -182,8 +212,11 @@ public final class DegradedRescan {
         }
     }
 
-    /** 补采结果. recovered=本次新入库 chunk 数, deduped=已在 store, skipped=活跃路径已采. */
-    public record Result(long recovered, long deduped, long skippedActive, int regionsScanned) {
+    /**
+     * 补采结果. recovered=本次新入库 chunk 数, deduped=已在 store, skippedActive=活跃路径已采,
+     * stopped=被 {@link #requestStop} 中断未跑完 (调用方据此保留 degraded-session 标志重试).
+     */
+    public record Result(long recovered, long deduped, long skippedActive, int regionsScanned, boolean stopped) {
     }
 
     private record RegionResult(long recovered, long deduped, long skipped) {

@@ -45,7 +45,7 @@ BetterBackup 的解法：
 - Minecraft 1.20.1
 - Minecraft Forge 47.3.22+
 - Java 17 (Eclipse Temurin)
-- **必装**：[Shinoyuki-BetterAutoSave](https://github.com/xiaoxiao-cvs/Shinoyuki-BetterAutoSave) v0.10.0+（BetterBackup 通过 BAS Listener API 接收 chunk save 事件，并依赖 v0.10.0 新增的管线降级通知）
+- **必装**：[Shinoyuki-BetterAutoSave](https://github.com/xiaoxiao-cvs/Shinoyuki-BetterAutoSave) v0.16.2+（版本下限与 mods.toml 的依赖 versionRange 一致，低于此版本 Forge 会拒绝加载 BetterBackup）。BetterBackup 通过 BAS Listener API 接收 chunk save 事件；在线单 chunk 回退（`restore-chunk-live`）还依赖 BAS v0.16.2 才具备的 `SaveCoordination` / `ChunkRestoreOutcome` / `ChunkRestoreResult` API，装更低版本 BAS 时该功能所需接口不存在
 
 把 `shinoyuki_betterbackup-0.1.0-all.jar`（带 `-all` 后缀的，包内嵌了哈希库）放进 `mods/`，启动后配置文件生成在 `config/Shinoyuki-Optimize/shinoyuki_betterbackup/common.toml`。
 
@@ -60,14 +60,14 @@ BetterBackup 的解法：
 | general.enabled | true | 总开关。改 false 后 mod 仍加载但不再备份 |
 | general.backupDirectory | "backup-store" | 备份目录，相对 server root（跟 world/ 同级）。绝对路径也支持 |
 | storage.hashAlgorithm | XXH128 | 哈希算法。XXH128 比 SHA256 快 5-10 倍，碰撞概率仍低于硬盘位翻转。完整性敏感场景可切 SHA256 |
-| storage.compressionAlgorithm | NONE | chunk 字节已经被 vanilla zlib 压缩过，再压一次是浪费 CPU |
 | storage.maxStoreSizeGB | 500 | 超过此阈值启动时自动跑全量 GC |
 | schedule.mode | INTERVAL | 备份模式：INTERVAL（定时）/ MANUAL（仅命令） |
 | schedule.intervalMinutes | 120 | INTERVAL 模式下的备份间隔 |
-| retention.hourly | 24 | 保留最近 24 份每小时备份 |
-| retention.daily | 7 | 每日 |
-| retention.weekly | 4 | 每周 |
-| retention.monthly | 12 | 每月 |
+| retention.enabled | false | 滚动保留淘汰总开关。默认关闭，所有快照永久保留、不淘汰任何历史。关闭时下面四个配额被忽略。开启前建议先跑 `/betterbackup retention preview` 看清一次淘汰会删哪些快照 |
+| retention.hourly | 24 | 保留最近 24 份每小时备份（仅在 retention.enabled=true 时生效） |
+| retention.daily | 7 | 每日（仅在 retention.enabled=true 时生效） |
+| retention.weekly | 4 | 每周（仅在 retention.enabled=true 时生效） |
+| retention.monthly | 12 | 每月（仅在 retention.enabled=true 时生效） |
 | workers.backupWorkerThreads | 2 | 备份 worker 线程数。CPU 密集（哈希计算），大服可调到 4 |
 | safety.verifyOnStartup | true | 启动时清理孤儿 .tmp 文件（kill -9 后残留） |
 | prometheus.enabled | false | 开启 Prometheus 监控 HTTP 接口 |
@@ -84,9 +84,12 @@ BetterBackup 的解法：
 | `/betterbackup snapshot create [name]` | 立即创建一份备份（异步），name 可选 |
 | `/betterbackup snapshot list` | 列出最近 20 份备份 |
 | `/betterbackup snapshot info <id>` | 看某份备份的详细信息（chunk 数 / 维度 / level.dat 状态等） |
-| `/betterbackup snapshot delete <id>` | 删除一份备份的引用（不立即清磁盘，跑 gc 才清） |
+| `/betterbackup snapshot delete <id>` | 删除一份备份的引用（不立即清磁盘，跑 gc 才清）。命中"最新一份 / 最新 baseline 完整快照 / 待恢复目标"三门禁时拒绝，防误删唯一恢复点 |
 | `/betterbackup restore <id>` | 准备恢复（写 flag 文件 + 提示停服）。**重启后自动恢复** |
+| `/betterbackup restore-chunk-live [<id>] [<radius>]` | **在线**单 chunk / 区域回退，不停服即时执行。玩家执行时省略参数即回退站位所在区块；`<id>` 可填快照 id 或 `latest`（默认最新）；`<radius>` 0-8，以站位为中心 (2r+1)² 块。控制台 / RCON 用显式形态 `restore-chunk-live <id> <dim> <x> <z> [radius]`。超过 9 块（radius≥2）需 30 秒内 `confirm` 二次确认 |
+| `/betterbackup confirm` | 确认上一条待确认的区域在线回退（30 秒内有效） |
 | `/betterbackup gc` | 全量 GC：扫所有 hash 文件，删没被任何备份引用的孤儿 |
+| `/betterbackup retention preview` | dry-run 预览：按当前配额 + 三门禁算出滚动淘汰"将删 / 将留"清单，不真删。启用 retention 前先看一眼 |
 
 **自动 GC**：每次 snapshot 创建后会自动跑增量 GC，清掉本周期内 worker 写入但 manifest 没引用的中间版本 hash。store 大小稳态 ≈ 当前所有 manifest 引用的 unique hash × 平均字节，**不会随时间线性增长**。
 
@@ -126,7 +129,18 @@ java -jar shinoyuki_betterbackup-0.1.0-all.jar restore --store <备份目录> --
 java -jar shinoyuki_betterbackup-0.1.0-all.jar fsck    --store <备份目录> [--rebuild-index]
 ```
 
-CLI restore 只能在服务端**已停止**时使用：先把现有 world 移到 `.bak-<时间戳>/` 再按备份重建。`fsck --rebuild-index` 用于快照索引损坏时从 store 重建。
+`restore` 默认整份快照全量回退；也支持只回地形的**部分回退**（其余数据不动）：
+
+```bash
+# 单 chunk（显式点名，未采集会报错）
+java -jar shinoyuki_betterbackup-0.1.0-all.jar restore --store <备份目录> --id <快照ID> --world <world目录> \
+    --dim <维度ID> --chunk <x>,<z>
+# 矩形区域（以 center 为中心，边长 2r+1，区域内未采集的 chunk 自动跳过）
+java -jar shinoyuki_betterbackup-0.1.0-all.jar restore --store <备份目录> --id <快照ID> --world <world目录> \
+    --dim <维度ID> --center <x>,<z> --radius <r>
+```
+
+`--dim` 是维度 id（形如 `minecraft:overworld`），`--chunk` / `--center` 是 chunk 坐标。CLI restore 只能在服务端**已停止**时使用：全量回退先把现有 world 移到 `.bak-<时间戳>/` 再按备份重建。`fsck --rebuild-index` 用于快照索引损坏时从 store 重建。
 
 ## 性能预期
 
@@ -160,7 +174,7 @@ dedup 率取决于"已加载 chunk / 总世界"比例：
 
 - **必须装 BAS**：BetterBackup 通过 BAS 的 Listener API 接收 chunk save 事件。卸载 BAS 后 BetterBackup 启动失败
 - **跟其他备份 mod 共存浪费空间**：理论上能并行跑，但 backup-store 跟 zip 备份会同时占用，建议二选一
-- **MVP 阶段 SavedData 假设在 overworld**：BAS Listener 不带 dimension 信息（API 限制），目前 SavedData 备份只看 `world/data/`。多维度自定义 SavedData 的 mod (极少见) 不完全覆盖，v0.2 跟随 BAS API 升级修复
+- **modded 自定义维度的 SavedData 覆盖不全**：BAS Listener 不带 dimension 信息（API 限制），BetterBackup 按 overworld → nether → end 顺序探测每个 `.dat` 实际落在哪个维度的 `data/`，并记录维度限定路径，restore 时按维度落回原维度的 `data/`。vanilla 三维度已覆盖；把 SavedData 写进自定义维度 `data/` 的 mod（极少见）目前不完全覆盖
 - **已加载 chunk 没有跨备份去重**：活跃区域的 chunk 每次保存字节都会变（vanilla 会更新时间戳字段），每份快照都会存一个新版本。节省空间的大头来自未加载区域——这就是上面性能表按服务器规模分档的原因
 - **绕过 vanilla 保存路径的 mod 不被感知**：极少数直接写 region 文件的 mod，其改动不会进备份
 - **非主世界的 poi 不在备份范围**：下界/末地的 `poi/`（村民工作点位缓存）恢复后由 vanilla 自动重建，不影响玩法数据
@@ -182,7 +196,7 @@ cd Shinoyuki-BetterBackup
 #   shinoyuki_betterbackup-0.1.0.jar         <- 缺哈希库, 别用
 ```
 
-测试：`./gradlew test`（store / 快照 / GC / 撕裂读 / baseline / 玩家数据 / CLI / 降级补采等共 155 个单元测试）。
+测试：`./gradlew test`（store / 快照 / GC / 撕裂读 / baseline / 玩家数据 / CLI / 降级补采等共 266 个单元测试）。
 
 dev server 测试（不需要装 client）：`./gradlew runServer`，进 server console 跑 `/op <你的名字>` 然后用 client 连 localhost。
 
@@ -194,4 +208,4 @@ BetterBackup 的核心 dedup 算法 — 直接对 region file (`.mca`) 里的 ch
 
 ## 许可
 
-见 LICENSE 文件。
+AGPL-3.0-or-later，附整合包分发例外（[LICENSE-EXCEPTION.md](LICENSE-EXCEPTION.md)）：官方发布的未修改 jar 可原样收录进整合包 / 服务端包，保留项目名与仓库链接即可，无额外义务。修改后的版本不适用例外，仍受 AGPL 全部条款约束（含第 13 条网络条款）。

@@ -6,14 +6,22 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.MappedByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.nio.channels.ReadableByteChannel;
+import java.nio.channels.WritableByteChannel;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Random;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -243,6 +251,156 @@ class PackStoreTest {
         assertArrayEquals(objs.get(3), store.get(hashes.get(3)),
                 "object in the active write pack must survive compaction (pack still being appended)");
         store.close();
+    }
+
+    @Test
+    void total_pack_bytes_is_zero_for_empty_store(@TempDir Path root) throws IOException {
+        PackStore store = new PackStore(root, HASH_LEN, PackStore.DEFAULT_TARGET_PACK_SIZE_BYTES);
+        store.initialize();
+        assertEquals(0L, store.totalPackBytes(), "fresh store has no pack files, so zero bytes");
+        store.close();
+    }
+
+    @Test
+    void total_pack_bytes_equals_sum_of_pack_file_sizes(@TempDir Path root) throws IOException {
+        // 写若干对象后, totalPackBytes 必须精确等于 packs/ 下所有 .pack 的 Files.size 之和.
+        PackStore store = new PackStore(root, HASH_LEN, PackStore.DEFAULT_TARGET_PACK_SIZE_BYTES);
+        store.initialize();
+        for (int i = 0; i < 15; i++) {
+            byte[] o = randomBytes(300 + i * 7, 500 + i);
+            store.put(hashFn.hash(o), o);
+        }
+        store.flushAndSync();
+
+        long expected = sumPackFileSizes(root);
+        assertTrue(expected > 0, "precondition: some pack bytes were written");
+        assertEquals(expected, store.totalPackBytes(),
+                "totalPackBytes must equal the exact sum of Files.size over every .pack file");
+        store.close();
+    }
+
+    @Test
+    void total_pack_bytes_sums_across_multiple_rolled_packs(@TempDir Path root) throws IOException {
+        // 小封口 -> 多 pack; totalPackBytes 必须跨所有 pack 累加, 而非只算当前在写 pack.
+        PackStore store = new PackStore(root, HASH_LEN, 1200);
+        store.initialize();
+        for (int i = 0; i < 10; i++) {
+            byte[] o = randomBytes(500, 200 + i);
+            store.put(hashFn.hash(o), o);
+        }
+        store.flushAndSync();
+
+        long packCount;
+        try (Stream<Path> s = Files.list(root.resolve("packs"))) {
+            packCount = s.filter(p -> p.getFileName().toString().endsWith(".pack")).count();
+        }
+        assertTrue(packCount > 1, "precondition: multiple packs rolled, got " + packCount);
+        assertEquals(sumPackFileSizes(root), store.totalPackBytes(),
+                "totalPackBytes must sum every rolled pack, not just the active write pack");
+        store.close();
+    }
+
+    @Test
+    void put_recovers_index_alignment_after_mid_write_io_failure(@TempDir Path root) throws IOException {
+        PackStore store = new PackStore(root, HASH_LEN, PackStore.DEFAULT_TARGET_PACK_SIZE_BYTES);
+        store.initialize();
+
+        byte[] a = randomBytes(100, 11);
+        byte[] b = randomBytes(200, 22);
+        byte[] c = randomBytes(150, 33);
+        Hash ha = hashFn.hash(a);
+        Hash hb = hashFn.hash(b);
+        Hash hc = hashFn.hash(c);
+
+        // A 记录整长 = 16 + 4 + 100 = 120; 让写在 B 记录中途 (120 + 50 字节处) 抛 IOException.
+        long failAt = (HASH_LEN + 4 + a.length) + 50;
+        AtomicInteger opens = new AtomicInteger();
+        store.setWriteChannelOpenerForTest(p -> {
+            FileChannel real = FileChannel.open(p, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+            return opens.getAndIncrement() == 0 ? new FailAfterNBytesChannel(real, failAt) : real;
+        });
+
+        assertTrue(store.put(ha, a), "A writes fully");
+        assertThrows(IOException.class, () -> store.put(hb, b), "B fails mid-write");
+        assertFalse(store.has(hb), "failed put must not leave B in the index");
+
+        // C 写在恢复后的通道: 若 position/writeOffset 失步, C 落错位, get 读回混合垃圾 -> 断言必挂.
+        assertTrue(store.put(hc, c), "C writes after recovery");
+        assertArrayEquals(c, store.get(hc), "C round-trips byte-exact after recovery");
+        assertArrayEquals(a, store.get(ha), "A survives intact");
+        store.close();
+
+        // 重开顺序扫: 索引一致, A/C 在, B 的 torn 部分被截断不留幻影.
+        PackStore reopened = new PackStore(root, HASH_LEN, PackStore.DEFAULT_TARGET_PACK_SIZE_BYTES);
+        reopened.initialize();
+        assertEquals(2, reopened.objectCount(), "only A and C survive; no phantom B");
+        assertArrayEquals(a, reopened.get(ha));
+        assertArrayEquals(c, reopened.get(hc));
+        assertFalse(reopened.has(hb));
+        reopened.close();
+    }
+
+    /**
+     * 委托真 FileChannel, 但累计写满 failAtByte 字节后, 在下一次 write 里先写完剩余额度再抛
+     * IOException, 模拟磁盘满 / 网络盘瞬断的写中途失败 (部分写). 失败一次后不再拦截.
+     */
+    private static final class FailAfterNBytesChannel extends FileChannel {
+        private final FileChannel real;
+        private final long failAtByte;
+        private long written;
+        private boolean failed;
+
+        FailAfterNBytesChannel(FileChannel real, long failAtByte) {
+            this.real = real;
+            this.failAtByte = failAtByte;
+        }
+
+        @Override
+        public int write(ByteBuffer src) throws IOException {
+            if (failed) {
+                return real.write(src);
+            }
+            long allowance = failAtByte - written;
+            if (src.remaining() <= allowance) {
+                int n = real.write(src);
+                written += n;
+                return n;
+            }
+            int savedLimit = src.limit();
+            src.limit(src.position() + (int) allowance);
+            int n = real.write(src);
+            written += n;
+            src.limit(savedLimit);
+            failed = true;
+            throw new IOException("simulated disk-full after " + written + " bytes");
+        }
+
+        @Override public int read(ByteBuffer dst) throws IOException { return real.read(dst); }
+        @Override public long read(ByteBuffer[] dsts, int off, int len) throws IOException { return real.read(dsts, off, len); }
+        @Override public long write(ByteBuffer[] srcs, int off, int len) throws IOException { return real.write(srcs, off, len); }
+        @Override public long position() throws IOException { return real.position(); }
+        @Override public FileChannel position(long p) throws IOException { real.position(p); return this; }
+        @Override public long size() throws IOException { return real.size(); }
+        @Override public FileChannel truncate(long s) throws IOException { real.truncate(s); return this; }
+        @Override public void force(boolean metaData) throws IOException { real.force(metaData); }
+        @Override public long transferTo(long p, long count, WritableByteChannel target) throws IOException { return real.transferTo(p, count, target); }
+        @Override public long transferFrom(ReadableByteChannel src, long p, long count) throws IOException { return real.transferFrom(src, p, count); }
+        @Override public int read(ByteBuffer dst, long p) throws IOException { return real.read(dst, p); }
+        @Override public int write(ByteBuffer src, long p) throws IOException { return real.write(src, p); }
+        @Override public MappedByteBuffer map(MapMode mode, long p, long s) throws IOException { return real.map(mode, p, s); }
+        @Override public FileLock lock(long p, long s, boolean shared) throws IOException { return real.lock(p, s, shared); }
+        @Override public FileLock tryLock(long p, long s, boolean shared) throws IOException { return real.tryLock(p, s, shared); }
+        @Override protected void implCloseChannel() throws IOException { real.close(); }
+    }
+
+    private static long sumPackFileSizes(Path root) throws IOException {
+        try (Stream<Path> s = Files.list(root.resolve("packs"))) {
+            long sum = 0;
+            for (Path p : (Iterable<Path>) s.filter(x -> x.getFileName().toString().endsWith(".pack"))::iterator) {
+                sum += Files.size(p);
+            }
+            return sum;
+        }
     }
 
     private static byte[] randomBytes(int n, long seed) {

@@ -16,14 +16,13 @@ public final class BetterBackupConfig {
     private static volatile String backupDirectory;
 
     private static volatile ConfigSpec.HashAlgorithm hashAlgorithm;
-    private static volatile ConfigSpec.CompressionAlgorithm compressionAlgorithm;
-    private static volatile int compressionLevel;
     private static volatile int maxStoreSizeGB;
 
     private static volatile ConfigSpec.ScheduleMode scheduleMode;
     private static volatile int intervalMinutes;
     private static volatile int dirtyChunkThreshold;
 
+    private static volatile boolean retentionEnabled;
     private static volatile int retentionHourly;
     private static volatile int retentionDaily;
     private static volatile int retentionWeekly;
@@ -35,7 +34,6 @@ public final class BetterBackupConfig {
 
     private static volatile boolean verifyOnStartup;
     private static volatile boolean verifyOnSnapshot;
-    private static volatile boolean panicOnHashMismatch;
 
     private static volatile boolean prometheusEnabled;
     private static volatile String prometheusBindAddress;
@@ -53,14 +51,6 @@ public final class BetterBackupConfig {
         return hashAlgorithm;
     }
 
-    public static ConfigSpec.CompressionAlgorithm compressionAlgorithm() {
-        return compressionAlgorithm;
-    }
-
-    public static int compressionLevel() {
-        return compressionLevel;
-    }
-
     public static int maxStoreSizeGB() {
         return maxStoreSizeGB;
     }
@@ -75,6 +65,10 @@ public final class BetterBackupConfig {
 
     public static int dirtyChunkThreshold() {
         return dirtyChunkThreshold;
+    }
+
+    public static boolean retentionEnabled() {
+        return retentionEnabled;
     }
 
     public static int retentionHourly() {
@@ -109,10 +103,6 @@ public final class BetterBackupConfig {
         return verifyOnSnapshot;
     }
 
-    public static boolean panicOnHashMismatch() {
-        return panicOnHashMismatch;
-    }
-
     public static boolean prometheusEnabled() {
         return prometheusEnabled;
     }
@@ -141,12 +131,11 @@ public final class BetterBackupConfig {
         enabled = ConfigSpec.ENABLED.get();
         backupDirectory = ConfigSpec.BACKUP_DIRECTORY.get();
         hashAlgorithm = ConfigSpec.HASH_ALGORITHM.get();
-        compressionAlgorithm = ConfigSpec.COMPRESSION_ALGORITHM.get();
-        compressionLevel = ConfigSpec.COMPRESSION_LEVEL.get();
         maxStoreSizeGB = ConfigSpec.MAX_STORE_SIZE_GB.get();
         scheduleMode = ConfigSpec.SCHEDULE_MODE.get();
         intervalMinutes = ConfigSpec.INTERVAL_MINUTES.get();
         dirtyChunkThreshold = ConfigSpec.DIRTY_CHUNK_THRESHOLD.get();
+        retentionEnabled = ConfigSpec.RETENTION_ENABLED.get();
         retentionHourly = ConfigSpec.RETENTION_HOURLY.get();
         retentionDaily = ConfigSpec.RETENTION_DAILY.get();
         retentionWeekly = ConfigSpec.RETENTION_WEEKLY.get();
@@ -155,7 +144,6 @@ public final class BetterBackupConfig {
         baselineScanChunksPerSecond = ConfigSpec.BASELINE_SCAN_CHUNKS_PER_SECOND.get();
         verifyOnStartup = ConfigSpec.VERIFY_ON_STARTUP.get();
         verifyOnSnapshot = ConfigSpec.VERIFY_ON_SNAPSHOT.get();
-        panicOnHashMismatch = ConfigSpec.PANIC_ON_HASH_MISMATCH.get();
         prometheusEnabled = ConfigSpec.PROMETHEUS_ENABLED.get();
         prometheusBindAddress = ConfigSpec.PROMETHEUS_BIND_ADDRESS.get();
         prometheusPort = ConfigSpec.PROMETHEUS_PORT.get();

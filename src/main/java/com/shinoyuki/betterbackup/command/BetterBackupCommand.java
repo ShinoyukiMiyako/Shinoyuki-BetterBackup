@@ -16,10 +16,13 @@ import com.shinoyuki.betterbackup.gc.StoreGc;
 import com.shinoyuki.betterbackup.restore.ChunkRestoreFlow;
 import com.shinoyuki.betterbackup.restore.ChunkRestoreMessages;
 import com.shinoyuki.betterbackup.restore.PendingRestoreFlag;
+import com.shinoyuki.betterbackup.retention.RetentionGuard;
+import com.shinoyuki.betterbackup.retention.RetentionPruner;
 import com.shinoyuki.betterbackup.snapshot.CurrentSnapshotState;
 import com.shinoyuki.betterbackup.snapshot.SnapshotCreator;
 import com.shinoyuki.betterbackup.snapshot.SnapshotManifest;
 import com.shinoyuki.betterbackup.store.ChunkStore;
+import com.shinoyuki.betterbackup.store.Hash;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.core.registries.Registries;
@@ -40,8 +43,10 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.EnumMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Stream;
@@ -126,6 +131,8 @@ public final class BetterBackupCommand {
                                                                                 IntegerArgumentType.getInteger(ctx, "radius")))))))))
                         .then(Commands.literal("confirm").executes(BetterBackupCommand::confirmPendingRestore))
                         .then(Commands.literal("gc").executes(BetterBackupCommand::gc))
+                        .then(Commands.literal("retention")
+                                .then(Commands.literal("preview").executes(BetterBackupCommand::retentionPreview)))
         );
     }
 
@@ -306,6 +313,9 @@ public final class BetterBackupCommand {
     /**
      * 删 manifest 文件 (release reference). 不立即触发 GC, 用户跑 /betterbackup gc
      * 才真正清磁盘. 这样 delete 是 instant 的, GC 是用户主动决策的批操作.
+     *
+     * <p>删前过 {@link RetentionGuard} 三门禁 (最新一份 / 最新 baselineComplete / pending-restore
+     * 目标), 命中则拒绝并给明确原因 —— 与滚动淘汰共用同一套安全网, 防手动误删掉唯一恢复点。
      */
     private static int snapshotDelete(CommandContext<CommandSourceStack> ctx, String id) {
         if (!BetterBackupCore.isInstalled()) {
@@ -322,6 +332,20 @@ public final class BetterBackupCommand {
             ctx.getSource().sendFailure(Component.literal("Snapshot not found: " + id));
             return 0;
         }
+        Path worldRoot = ctx.getSource().getServer().getWorldPath(LevelResource.ROOT);
+        String refusal;
+        try {
+            refusal = deleteRefusalReason(creator.snapshotsDir(), id, worldRoot);
+        } catch (IOException e) {
+            // 读 manifest / pending flag 失败: 无法证明该 id 可安全删, 拒绝 (不 fail-open).
+            ctx.getSource().sendFailure(Component.literal(
+                    "Delete refused: could not verify retention guards for " + id + ": " + e.getMessage()));
+            return 0;
+        }
+        if (refusal != null) {
+            ctx.getSource().sendFailure(Component.literal("Delete refused: " + id + " " + refusal));
+            return 0;
+        }
         try {
             Files.delete(manifestFile);
         } catch (IOException e) {
@@ -331,6 +355,28 @@ public final class BetterBackupCommand {
         ctx.getSource().sendSuccess(() -> Component.literal(
                 "Snapshot " + id + " deleted (run /betterbackup gc to reclaim disk)"), true);
         return 1;
+    }
+
+    /**
+     * 命中三门禁时返回具体拒绝原因文案, 未命中返回 null (可删). 逐条判定以给出精确原因,
+     * 与 {@link RetentionGuard#protectedIds()} 的门禁集一致 (protectedIds 命中 == 此处非 null)。
+     */
+    private static String deleteRefusalReason(Path snapshotsDir, String id, Path worldRoot) throws IOException {
+        RetentionGuard guard = new RetentionGuard(snapshotsDir, worldRoot);
+        if (guard.isDeletable(id)) {
+            return null;
+        }
+        // 门禁 C: pending-restore 目标 (先判, 与 baselineComplete 正交, 给出最贴切的原因).
+        if (PendingRestoreFlag.read(worldRoot).map(id::equals).orElse(false)) {
+            return "is the pending-restore target (a restore is queued for it); cancel the restore first";
+        }
+        // 门禁 B: 唯一 / 最新 baselineComplete (最后可恢复点); 门禁 A: 最新一份.
+        SnapshotManifest manifest = SnapshotManifest.readFrom(snapshotsDir.resolve(id + ".manifest"));
+        if (manifest.baselineComplete()) {
+            return "is the only / latest baseline-complete snapshot (the last restorable point); "
+                    + "keep it or take a fresh snapshot first";
+        }
+        return "is the latest snapshot; the newest snapshot is always kept";
     }
 
     /**
@@ -744,11 +790,18 @@ public final class BetterBackupCommand {
         CommandSourceStack source = ctx.getSource();
         MinecraftServer server = source.getServer();
         StoreGc gc = new StoreGc(store, creator.snapshotsDir());
+        CurrentSnapshotState snapshotState = BetterBackupCore.snapshotState();
+        Set<Hash> writtenThisWindow = BetterBackupCore.context().writtenThisWindow();
 
         Thread worker = new Thread(() -> {
             long t0 = System.currentTimeMillis();
             try {
-                StoreGc.GcResult r = gc.gcAll();
+                // 活服手动 GC: 传在途保护集 (pendingHashes ∪ writtenThisWindow) 且不封口在写 pack,
+                // 玩家在线 / chunk 正存盘时执行不会误删尚未进 manifest 的在途对象. 阈值 0 = 运营
+                // 择时的彻底回收 (任何含死字节的 pack 都重打包), 与启动自检的有界阈值区分.
+                Set<Hash> protect = new HashSet<>(snapshotState.pendingHashes());
+                protect.addAll(writtenThisWindow);
+                StoreGc.GcResult r = gc.gcAll(protect, false, 0.0);
                 long elapsed = System.currentTimeMillis() - t0;
                 server.execute(() -> source.sendSuccess(() -> Component.literal(
                         "GC done in " + elapsed + "ms: scanned=" + r.scanned()
@@ -764,6 +817,57 @@ public final class BetterBackupCommand {
         worker.start();
 
         ctx.getSource().sendSuccess(() -> Component.literal("GC started (async)"), false);
+        return 1;
+    }
+
+    /**
+     * dry-run 保留策略预览: 按当前 config 配额 + 三门禁算出"将删 / 将留"两个集合并打印, 不真删。
+     * 让服主在启用滚动淘汰前先看清一次淘汰会删掉哪些快照, 避免配额误配删掉不该删的。
+     */
+    private static int retentionPreview(CommandContext<CommandSourceStack> ctx) {
+        CommandSourceStack source = ctx.getSource();
+        if (!checkReady(source)) {
+            return 0;
+        }
+        SnapshotCreator creator = BetterBackupCore.creator();
+        Path worldRoot = source.getServer().getWorldPath(LevelResource.ROOT);
+        RetentionPruner pruner = new RetentionPruner(creator.snapshotsDir(), worldRoot);
+        RetentionPruner.Preview preview;
+        try {
+            preview = pruner.preview();
+        } catch (IllegalArgumentException e) {
+            // fail-fast: 有非法 snapshot id, 拒绝产出半套预览 (真淘汰也会 abort).
+            source.sendFailure(Component.literal(
+                    "Retention preview aborted (invalid snapshot id present): " + e.getMessage()));
+            return 0;
+        } catch (IOException e) {
+            source.sendFailure(Component.literal("Retention preview failed: " + e.getMessage()));
+            return 0;
+        }
+        StringBuilder out = new StringBuilder();
+        out.append("=== Retention preview (dry-run, nothing deleted) ===\n");
+        out.append("Policy: hourly=").append(BetterBackupConfig.retentionHourly())
+                .append(" daily=").append(BetterBackupConfig.retentionDaily())
+                .append(" weekly=").append(BetterBackupConfig.retentionWeekly())
+                .append(" monthly=").append(BetterBackupConfig.retentionMonthly()).append('\n');
+        out.append("Would DELETE (").append(preview.toDelete().size()).append("):\n");
+        if (preview.toDelete().isEmpty()) {
+            out.append("  (none)\n");
+        } else {
+            for (String id : preview.toDelete()) {
+                out.append("  - ").append(id).append('\n');
+            }
+        }
+        out.append("Would KEEP (").append(preview.toKeep().size()).append("):\n");
+        if (preview.toKeep().isEmpty()) {
+            out.append("  (none)\n");
+        } else {
+            for (String id : preview.toKeep()) {
+                out.append("  + ").append(id).append('\n');
+            }
+        }
+        String text = out.toString();
+        source.sendSuccess(() -> Component.literal(text), false);
         return 1;
     }
 

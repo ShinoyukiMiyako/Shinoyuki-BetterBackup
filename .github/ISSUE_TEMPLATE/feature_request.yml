@@ -1,0 +1,53 @@
+name: 功能建议 / Feature request
+description: 提一个新功能、改进想法或使用体验优化
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢你的建议。提交前请先在已有 issue 里搜一下，避免重复。
+        把「想解决什么」讲清楚，往往比直接给方案更有价值 —— 越具体越容易评估与落地。
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: 建议涉及哪个方向？
+      description: 只是初步归类，最终以内容为准。
+      options:
+        - 快照 / 备份策略（间隔、保留、去重）
+        - 恢复（离线全量 / 部分回退 / 在线 restore-chunk-live）
+        - 存储 / GC（content store、pack、哈希、压实）
+        - 命令 / 运维体验（/betterbackup 子命令、离线 CLI）
+        - 监控 / 可观测性（Prometheus、状态输出）
+        - 兼容性 / 与其它 mod 协同
+        - 文档 / 使用说明
+        - 其它
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 想解决的问题（必填）
+      description: 这个建议要解决什么痛点或场景？你当前是怎么绕过去的？
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 期望的方案
+      description: 你希望它怎么工作。有具体的命令 / 配置项 / 行为设想可以一并写出。
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 备选方案 / 其它说明
+      description: 你考虑过的其它做法，或任何补充上下文（现有备份 mod 的类似能力、参考实现等）。
+
+  - type: input
+    id: bb-version
+    attributes:
+      label: 你在用的 BetterBackup 版本
+      description: 便于判断该能力是否已在新版本存在。
+      placeholder: 例 0.1.0

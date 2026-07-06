@@ -61,13 +61,37 @@ public final class RetentionPolicy {
         this.monthly = monthly;
     }
 
-    /** 工厂: 用 BetterBackupConfig 当前 retention 配置构造。 */
+    /** 工厂: 用 BetterBackupConfig 当前 retention 配置构造 (含 opt-in 主开关)。 */
     public static RetentionPolicy fromConfig() {
-        return new RetentionPolicy(
+        return fromConfig(
+                BetterBackupConfig.retentionEnabled(),
                 BetterBackupConfig.retentionHourly(),
                 BetterBackupConfig.retentionDaily(),
                 BetterBackupConfig.retentionWeekly(),
                 BetterBackupConfig.retentionMonthly());
+    }
+
+    /**
+     * 纯逻辑工厂: {@code enabled=false} (retention 未开启, 默认值) 返回全零 policy —— 其
+     * {@link #retainsNothing()} 为 true, 淘汰执行器据此保留全部快照。这让升级用户在显式开启前
+     * 首跑不会批量、不可逆地淘汰历史快照。opt-in gate 在此收口, 所有消费者 (SnapshotCreator /
+     * StoreSizeGuard / 命令 preview) 统一经 {@link #fromConfig()} 生效。
+     */
+    static RetentionPolicy fromConfig(boolean enabled, int hourly, int daily, int weekly, int monthly) {
+        if (!enabled) {
+            return new RetentionPolicy(0, 0, 0, 0);
+        }
+        return new RetentionPolicy(hourly, daily, weekly, monthly);
+    }
+
+    /**
+     * 四档配额是否全为 0。淘汰执行器据此把"全零"当作"保留策略未启用 / 未配置"处理: 保留全部快照,
+     * 不淘汰任何一份。理由: 备份 mod 绝不能把"每档都留 0 份"曲解为"删到只剩门禁兜底的最小集";
+     * 全零几乎必然是 config 未加载 (静态字段默认 0) 或用户笔误, 而非"我要删光历史"的真实意图。
+     * 单档为 0 (例如只 hourly=0 其余非 0) 不算全零, 仍照常按其余档淘汰 (门禁另行兜底最新一份)。
+     */
+    public boolean retainsNothing() {
+        return hourly == 0 && daily == 0 && weekly == 0 && monthly == 0;
     }
 
     /**
@@ -156,6 +180,18 @@ public final class RetentionPolicy {
 
     private static YearMonth monthlyKey(Instant t) {
         return YearMonth.from(t.atZone(ZoneOffset.UTC));
+    }
+
+    /**
+     * 校验单个 snapshot id 可 parse 为合法 Instant, 否则抛 {@link IllegalArgumentException}。
+     *
+     * <p>给淘汰执行器 ({@link RetentionPruner}) 做删除前的无条件预检: {@link #select} 只在
+     * daily/weekly/monthly 档 (>0 时) 才 parse id, 纯 hourly 配置下不会触碰非法 id, 故 select
+     * 抛异常的 fail-fast 依赖于配额档位。删数据前必须与配额无关地拒绝任何非法 id (否则可能删掉
+     * 好快照却把非法 id 的那份留下), 独立暴露此校验供调用方对全体 id 逐一预检。
+     */
+    public static void requireValidId(String id) {
+        parseId(id);
     }
 
     private static Instant parseId(String id) {

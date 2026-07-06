@@ -1,0 +1,68 @@
+name: CI
+
+# push / PR 上编译 + 跑全量测试. BetterBackup 编译期 link BAS api 且从 sibling 仓库的本地
+# maven (mcmodsrepo) 解析 BAS 依赖 (见 build.gradle 仓库块 + gradle.properties bas_version),
+# 故 CI 必须先把 BAS 作为 sibling 目录检出并 publish, 再构建本仓.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: ['**']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout BetterBackup
+        uses: actions/checkout@v4
+        with:
+          path: Shinoyuki-BetterBackup
+
+      # BAS 检出为 sibling 目录: build.gradle 用 file://${rootDir}/../Shinoyuki-BetterAutoSave/mcmodsrepo
+      # 解析 BAS 依赖, 相对路径要求二者同级. BAS 私有时需在此配 token (repo scope PAT).
+      - name: Checkout BetterAutoSave (BAS, dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: xiaoxiao-cvs/Shinoyuki-BetterAutoSave
+          path: Shinoyuki-BetterAutoSave
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle', '**/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      # BAS forge 模块 publish 到本地 mcmodsrepo (BetterBackup 依赖坐标
+      # com.shinoyuki.betterautosave:shinoyuki_betterautosave:<bas_version>).
+      # -D...check.certs=false: 规避 ForgeGradle 偶发的证书校验瞬态失败.
+      - name: Publish BAS to local maven
+        working-directory: Shinoyuki-BetterAutoSave
+        run: |
+          chmod +x gradlew
+          ./gradlew :forge:publish -Dnet.minecraftforge.gradle.check.certs=false --no-daemon --stacktrace
+
+      - name: Build BetterBackup (compile + 265 tests)
+        working-directory: Shinoyuki-BetterBackup
+        run: |
+          chmod +x gradlew
+          ./gradlew build -Dnet.minecraftforge.gradle.check.certs=false --no-daemon --stacktrace
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: Shinoyuki-BetterBackup/build/test-results/test/*.xml
+          if-no-files-found: ignore

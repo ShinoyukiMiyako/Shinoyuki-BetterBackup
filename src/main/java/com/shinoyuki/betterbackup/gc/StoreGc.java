@@ -27,8 +27,10 @@ import java.util.stream.Stream;
  *       随其所属快照被淘汰而在保留窗口内自然排空</li>
  * </ul>
  *
- * <p><b>1. 全量 GC ({@link #gcAll()})</b>: 排空旧树未引用对象 + 阈值 0 压实所有 pack
- * (回收全部死字节). 重活, 给手动 {@code betterbackup compact} / 启动超阈值自检 / 周期触发用.
+ * <p><b>1. 全量 GC ({@link #gcAll(Set, boolean, double)})</b>: 排空旧树未引用对象 + 压实 pack
+ * 回收死字节. 重活, 给手动 {@code betterbackup gc} (阈值 0 全量回收) / 启动超阈值自检 (有界阈值,
+ * 只重写死字节占多数的 pack) 用. 活服调用必须传 {@code protect} 在途集且不封口在写 pack;
+ * 无参 {@link #gcAll()} 只给静止 store (离线 CLI).
  *
  * <p><b>2. 阈值压实 ({@link #compactAfterSnapshot(double, Set)})</b>: 只重写死字节占比超阈值
  * 的 pack (有界), 给 SnapshotCreator 攒够死对象后触发的自动压实用. {@code protect} 排除在途
@@ -54,20 +56,48 @@ public final class StoreGc {
     }
 
     /**
-     * 全量 GC: 收集所有存活 manifest 的引用集, 排空旧树未引用对象, 阈值 0 压实所有 pack.
-     * 损坏 manifest 在动对象之前直接抛 IOException, 不删不压.
+     * 静止 store 的全量 GC (离线 CLI / 无并发 writer): 封口在写 pack、无在途保护、阈值 0 回收全部
+     * 死字节. 等价 {@code gcAll(Set.of(), true, 0.0)}. 有活跃 worker / baseline 并发写入时严禁调此
+     * 无参重载 —— 会物理删掉尚未进 manifest 的在途对象; 活服路径改用 {@link #gcAll(Set, boolean, double)}.
      *
      * @return 本次 GC 统计 (旧树 + pack 合并)
      * @throws IOException 任意 manifest 读失败 / 文件系统操作失败
      */
     public GcResult gcAll() throws IOException {
+        return gcAll(Set.of(), true, 0.0);
+    }
+
+    /**
+     * 全量 GC: 收集所有存活 manifest 的引用集 (∪ {@code protect}), 排空旧树未引用对象, 压实 pack
+     * 回收死字节. 损坏 manifest 在动对象之前直接抛 IOException, 不删不压.
+     *
+     * <p>活服调用 (命令 gc / 启动 {@code StoreSizeGuard} 自检) 必须传
+     * {@code protect = pendingHashes ∪ writtenThisWindow} 并 {@code sealActiveWritePack=false}:
+     * 在途对象 (已 store.put 入库、已登记 state, 但尚未随任何 manifest 落盘) 不在 manifest 引用集内,
+     * 不保护就会被判死物理回收, 下一份快照 drain 出这些 hash 即成悬空引用, 备份静默丢数据.
+     * protect 与"跳过在写 pack"两层各挡一类: protect 挡已落入封口 pack 的在途对象; 跳过在写 pack
+     * 挡"已 put 但 state / writtenThisWindow 登记尚未可见"的时序窗口.
+     *
+     * <p>{@code deadRatioThreshold} 决定重写 I/O 的边界: 0.0 = 任何含死字节的 pack 都重打包 (回收
+     * 最彻底, I/O 无界, 给运营手动触发用); 较高阈值 (如 0.5) 只重写死字节占多数的 pack, 把后台重写
+     * I/O 压到"回收划算"的子集 (给启动自检等无人值守路径用). 全死 pack 无视阈值一律直接删除.
+     *
+     * @param protect             额外保护的在途 hash (不在 manifest 引用集但即将被引用)
+     * @param sealActiveWritePack  true = 封口在写 pack 使其也参与压实 (仅静止 store 安全);
+     *                             false = 跳过在写 pack (活服并发写入时必须)
+     * @param deadRatioThreshold   pack 死字节占比超此值才重打包 (0.0~1.0); 全死 pack 无视阈值直接删
+     * @return 本次 GC 统计 (旧树 + pack 合并)
+     * @throws IOException 任意 manifest 读失败 / 文件系统操作失败
+     */
+    public GcResult gcAll(Set<Hash> protect, boolean sealActiveWritePack, double deadRatioThreshold)
+            throws IOException {
         Set<Hash> live = collectReferencedFromAllManifests();
+        live.addAll(protect);
 
         LegacyStats legacy = drainLegacy(live);
 
         long packBefore = store.packStore().objectCount();
-        // 全量 GC 封口在写 pack, 连最新写入也一并回收死字节 (阈值 0 = 回收全部死字节).
-        PackStore.CompactResult cr = store.packStore().compact(live, 0.0, true);
+        PackStore.CompactResult cr = store.packStore().compact(live, deadRatioThreshold, sealActiveWritePack);
 
         long scanned = legacy.scanned() + packBefore;
         long retained = legacy.retained() + (packBefore - cr.objectsRemoved());

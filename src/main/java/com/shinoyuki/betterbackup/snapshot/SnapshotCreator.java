@@ -2,9 +2,11 @@ package com.shinoyuki.betterbackup.snapshot;
 
 import com.shinoyuki.betterbackup.BetterBackupMod;
 import com.shinoyuki.betterbackup.baseline.BaselineProgress;
+import com.shinoyuki.betterbackup.config.BetterBackupConfig;
 import com.shinoyuki.betterbackup.diagnostic.BetterBackupMetrics;
 import com.shinoyuki.betterbackup.gc.StoreGc;
 import com.shinoyuki.betterbackup.io.WorldPaths;
+import com.shinoyuki.betterbackup.retention.RetentionPruner;
 import com.shinoyuki.betterbackup.safety.DiskSpaceCheck;
 import com.shinoyuki.betterbackup.safety.SnapshotFailureMarker;
 import com.shinoyuki.betterbackup.schedule.SnapshotTrigger;
@@ -15,6 +17,7 @@ import org.slf4j.Logger;
 
 import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.time.ZoneOffset;
@@ -245,6 +248,15 @@ public final class SnapshotCreator implements SnapshotTrigger {
             // 已落地数据不丢, 失败的 region 下次快照按 scanned 重扫一遍重新晋升 (幂等).
             promoteBaselineAfterWrite(scannedBeforeDrain);
 
+            // 滚动保留策略淘汰: 在 promote 之后、runIncrementalGc 之前跑, 这样接下来的 GC 收集
+            // 引用集时看到的已是淘汰后的 manifest 集, 被淘汰 manifest 独占的对象立即成死对象,
+            // 可被本轮 (或后续) 压实回收。淘汰只删 manifest 文件, 不同步跑重活 gcAll。
+            runRetentionPrune();
+
+            // 写入期自检: 在 runIncrementalGc 之前跑, 因为 runIncrementalGc 会 removeAll 清空
+            // writtenThisWindow (复验对象来源). 只在 config 开启时跑 (默认 false 零开销).
+            verifyOnSnapshot();
+
             runIncrementalGc(newManifest);
         } catch (IOException e) {
             LOGGER.error("[BetterBackup] snapshot write failed: {}", target, e);
@@ -271,6 +283,74 @@ public final class SnapshotCreator implements SnapshotTrigger {
         } catch (IOException e) {
             LOGGER.error("[BetterBackup] baseline progress promotion failed (snapshot already written, "
                     + "regions will be rescanned and re-promoted next snapshot)", e);
+        }
+    }
+
+    /**
+     * 滚动保留策略淘汰 (收尾 polish, 幂等). 只删被配额判 doomed 且未被 RetentionGuard 三门禁
+     * 保护的 manifest 文件。淘汰失败只 LOGGER.error 不抛: 快照已落盘, 淘汰是收尾, 下次快照重算
+     * doomed 补删 (天然幂等)。fail-fast abort (含非法 id / 损坏 manifest 时整次不删) 由
+     * {@link RetentionPruner} 内部保证, 抛出的异常在此统一收口成一条 error 日志。
+     */
+    private void runRetentionPrune() {
+        try {
+            RetentionPruner pruner = new RetentionPruner(snapshotsDir, paths.worldRoot());
+            pruner.prune();
+        } catch (IOException | RuntimeException e) {
+            LOGGER.error("[BetterBackup] retention prune failed (snapshot already written, "
+                    + "doomed snapshots will be recomputed and pruned next snapshot)", e);
+        }
+    }
+
+    /**
+     * 写入期自检 (收尾 polish, 幂等, config {@code safety.verifyOnSnapshot} 开启才跑).
+     * 复验对象 = 本窗口 {@link #writtenThisWindow} 里的新 unique 对象 (store.put 返回 true 那批;
+     * dedup 命中的老对象不在内), 对每个 hash 重新 {@code store.get} 拿字节 -> {@code hashFunction.hash}
+     * -> 与原 hash 比对。这是"写入期自检"非"全 store 防腐蚀", 覆盖面仅本窗口新写入。全 store 完整性
+     * 走离线 CLI fsck。
+     *
+     * <p><b>失配处置 (degraded-only, 无 panic, 不牵连后续)</b>: 任一失配调 {@link #recordFailure}
+     * 落 .incomplete + snapshotsFailed++, 标记<b>本份</b>快照失败。<b>绝不</b>调 {@link #markDegraded} ——
+     * verify 失配是本次写盘完整性问题, 与 BAS dirty 路径失明的进程级单向闩锁语义不同, 不复用它牵连后续
+     * 快照。两类失配区分日志级别: 对象读不出 (NoSuchFileException 等) = 更严重的写入丢失; 读到但 hash
+     * 不等 = 位翻转。
+     *
+     * <p><b>失败隔离</b>: 整个方法包 try-catch, verify 自身抛异常 (store.get IO 等) 只 log 不向上抛 ——
+     * 快照 manifest 已落盘成功, verify 是写盘后自检; 绝不能让 verify 异常冒泡到 create() 的
+     * catch(IOException) 去 reinject/recordFailure "manifest write failed" 把已成功快照误标写盘失败
+     * (参照 {@link #runRetentionPrune} 的失败隔离写法)。先拍 writtenThisWindow 快照副本再遍历,
+     * 避免与 baseline 扫描线程并发新增撞车 (同 {@link #runIncrementalGc})。
+     */
+    private void verifyOnSnapshot() {
+        if (!BetterBackupConfig.verifyOnSnapshot()) {
+            return;
+        }
+        try {
+            Set<Hash> toVerify = new HashSet<>(writtenThisWindow);
+            for (Hash hash : toVerify) {
+                byte[] bytes;
+                try {
+                    bytes = store.get(hash);
+                } catch (NoSuchFileException e) {
+                    // 更严重: 本窗口刚写入的对象读不出 = 写入丢失 (pack 未落盘 / 被误删), 单独更高级别语义.
+                    LOGGER.error("[BetterBackup] verify: object written this snapshot is now unreadable "
+                            + "(write lost): {}", hash.toHex(), e);
+                    recordFailure("verify: object unreadable " + hash.toHex());
+                    return;
+                }
+                Hash recomputed = hashFunction.hash(bytes);
+                if (!recomputed.equals(hash)) {
+                    // 读到字节但重算 hash 不等 = 位翻转 / 内容损坏.
+                    LOGGER.error("[BetterBackup] verify: content hash mismatch (bit rot) for {} (recomputed {})",
+                            hash.toHex(), recomputed.toHex());
+                    recordFailure("verify: content mismatch " + hash.toHex());
+                    return;
+                }
+            }
+        } catch (IOException | RuntimeException e) {
+            // verify 自身故障 (非失配, 如非 NoSuchFileException 的 pack 读 IO 错): 快照已落盘成功,
+            // 只 log 不抛, 不误标本份快照失败 —— 区别于上面失配走 recordFailure 的"内容失配"语义.
+            LOGGER.error("[BetterBackup] verify step failed (snapshot already written, self-check skipped)", e);
         }
     }
 

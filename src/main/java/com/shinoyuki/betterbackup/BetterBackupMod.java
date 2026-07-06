@@ -12,6 +12,7 @@ import com.shinoyuki.betterbackup.config.ConfigSpec;
 import com.shinoyuki.betterbackup.diagnostic.BetterBackupMetrics;
 import com.shinoyuki.betterbackup.diagnostic.DiagnosticLogger;
 import com.shinoyuki.betterbackup.diagnostic.PrometheusExporter;
+import com.shinoyuki.betterbackup.gc.StoreSizeGuard;
 import com.shinoyuki.betterbackup.integration.BackupListenerBridge;
 import com.shinoyuki.betterbackup.integration.PipelineDegradedHandler;
 import com.shinoyuki.betterbackup.io.WorldPaths;
@@ -59,9 +60,11 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Supplier;
 import java.util.stream.Stream;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
@@ -101,11 +104,24 @@ public final class BetterBackupMod {
     /** 关服 worker join 总超时 (毫秒). 写死 30s, 后续可考虑接入 BetterBackupConfig. */
     private static final long SHUTDOWN_JOIN_TIMEOUT_MS = 30_000L;
 
+    /**
+     * BackupTask 队列容量上限. 稳态下队列很浅 (worker 消费快于 vanilla 存盘), 但压实 / 手动 GC
+     * 长时间持 store 写锁阻塞消费时会堆积. 有界 + bridge 满时反压后降级, 防无上限增长致堆压力.
+     */
+    private static final int TASK_QUEUE_CAPACITY = 100_000;
+
     // baseline 扫描线程的关服停止句柄. 不进 BetterBackupCore: 扫描是一次性启动期任务,
     // 不是常驻组件, install 签名不为它扩列. volatile 因 startBaselineScan (server 线程)
     // 与 onServerStopping (server 线程) 之间隔着 daemon 线程的生命周期.
     private static volatile BaselineScanner activeBaselineScanner;
     private static volatile Thread activeBaselineThread;
+    // 降级窗口补采 (DegradedRescan) 的关服停止句柄. 与 baseline 同款: 后台 daemon 跑, 关服
+    // requestStop + join. 不进 BetterBackupCore (一次性启动期任务, 非常驻组件).
+    private static volatile DegradedRescan activeDegradedRescan;
+    private static volatile Thread activeDegradedThread;
+    // maxStoreSizeGB 自检 (StoreSizeGuard.gcAll) 的关服 join 句柄. gcAll 持 store 写锁, 关服
+    // 前先 join 它让写锁尽量释放, 免 final snapshot 撞其写锁久等 (gcAll 不可中断, 只能 join).
+    private static volatile Thread activeStoreSizeCheckThread;
 
     public BetterBackupMod() {
         // 游戏内: 把 BackupLog 门面桥回 slf4j, 让已迁到门面的 CLI 可达类 (ChunkStore 等)
@@ -270,6 +286,22 @@ public final class BetterBackupMod {
             BetterBackupMetrics metrics = new BetterBackupMetrics();
             Set<Hash> writtenThisWindow = ConcurrentHashMap.newKeySet();
 
+            // maxStoreSizeGB 软阈值自检: store 体积超阈值则先 retention 淘汰 (删超期 manifest) 再
+            // full GC 回收死对象. 与 .tmp 清扫同款后台 daemon 线程——算体积要 walk 整个 store, 大 store
+            // (百万对象 + 未排空旧树) 可达数十秒, 绝不能在 server 主线程同步跑, 否则推迟 ServerStarted /
+            // 登录门. 失败仅 warn 不中止启动 (自检不影响备份正确性). snapshotsDir 与 SnapshotCreator /
+            // StoreGc 用的同为 storeRoot/snapshots. 派发在 snapshotState + writtenThisWindow 创建之后:
+            // 自检的 gcAll 求值在途保护集 (二者并集), 排除启动期 worker / baseline 已 put 但未进 manifest
+            // 的对象, 不封口在写 pack —— 否则会物理删掉这些对象致下份快照悬空引用.
+            long maxStoreBytes = (long) BetterBackupConfig.maxStoreSizeGB() * 1024 * 1024 * 1024;
+            Path snapshotsDir = storeRoot.resolve("snapshots");
+            dispatchStoreSizeCheck(store, snapshotsDir, worldRoot, maxStoreBytes,
+                    () -> {
+                        Set<Hash> protect = new HashSet<>(snapshotState.pendingHashes());
+                        protect.addAll(writtenThisWindow);
+                        return protect;
+                    });
+
             // baseline 进度先于 creator 创建: creator 在每份 manifest 写盘成功后晋升
             // scanned->committed 并据 baselineProgress.isComplete() 盖 baselineComplete 戳.
             // load() 读已记录进度供续传. 旧格式行按 scanned 读入 (向后兼容, 重扫后自动晋升).
@@ -281,7 +313,9 @@ public final class BetterBackupMod {
             AtomicBoolean baselineScanFinished = new AtomicBoolean(false);
             // queue 先于 context 创建: context 持有同一个 queue 引用, chunk/entity task
             // 命中撕裂读时把自己重 offer 回这个 queue 延后重试 (BackupContext.retryQueue).
-            BlockingQueue<BackupTask> queue = new LinkedBlockingQueue<>();
+            // 有界: 消费被长时压实写锁阻塞时防无上限堆积 (bridge 满时反压后降级并 WARN);
+            // 撕裂读重试走非阻塞 offer, 队满时丢弃该轮重试 (chunk 下次存盘再 fire), 不与消费者死锁.
+            BlockingQueue<BackupTask> queue = new LinkedBlockingQueue<>(TASK_QUEUE_CAPACITY);
             BackupContext context = new BackupContext(store, snapshotState, paths, hashFunction,
                     writtenThisWindow, metrics, queue);
 
@@ -348,9 +382,7 @@ public final class BetterBackupMod {
 
             LOGGER.info("[BetterBackup]   |- worldRoot: {}", worldRoot);
             LOGGER.info("[BetterBackup]   |- storeRoot: {}", storeRoot);
-            LOGGER.info("[BetterBackup]   |- hash: {} compress: {}",
-                    hashFunction.name(),
-                    BetterBackupConfig.compressionAlgorithm());
+            LOGGER.info("[BetterBackup]   |- hash: {}", hashFunction.name());
             LOGGER.info("[BetterBackup]   |- workers: {} thread(s)", threadCount);
             LOGGER.info("[BetterBackup]   |- schedule: {} (interval={}min)",
                     BetterBackupConfig.scheduleMode(),
@@ -389,6 +421,12 @@ public final class BetterBackupMod {
         BaselineScanner baselineScanner = activeBaselineScanner;
         if (baselineScanner != null) {
             baselineScanner.requestStop();
+        }
+
+        // 降级窗口补采同样尽早请求停止, 与 baseline 并行收尾, join 在关服快照之前.
+        DegradedRescan degradedRescan = activeDegradedRescan;
+        if (degradedRescan != null) {
+            degradedRescan.requestStop();
         }
 
         DiagnosticLogger diagnosticLogger = BetterBackupCore.diagnosticLogger();
@@ -461,6 +499,43 @@ public final class BetterBackupMod {
         activeBaselineScanner = null;
         activeBaselineThread = null;
 
+        // 降级补采线程也必须在关服快照前停稳: 它对 state 的登记与快照 drain 竞争.
+        Thread degradedThread = activeDegradedThread;
+        if (degradedThread != null && degradedThread.isAlive()) {
+            try {
+                degradedThread.join(SHUTDOWN_JOIN_TIMEOUT_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                LOGGER.warn("[BetterBackup] interrupted joining degraded rescan thread");
+            }
+            if (degradedThread.isAlive()) {
+                LOGGER.warn("[BetterBackup] degraded rescan thread did not stop within {}ms",
+                        SHUTDOWN_JOIN_TIMEOUT_MS);
+            } else {
+                LOGGER.info("[BetterBackup] degraded rescan stopped for shutdown");
+            }
+        }
+        activeDegradedRescan = null;
+        activeDegradedThread = null;
+
+        // 启动期 store 体积自检若仍在跑 gcAll (持 store 写锁), 先 join 它 (有界超时), 让写锁在关服
+        // 快照拿读锁之前尽量释放, 避免 final snapshot 撞其写锁久等. gcAll 不支持中断, 只能等它跑完.
+        Thread storeSizeThread = activeStoreSizeCheckThread;
+        if (storeSizeThread != null && storeSizeThread.isAlive()) {
+            try {
+                storeSizeThread.join(SHUTDOWN_JOIN_TIMEOUT_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                LOGGER.warn("[BetterBackup] interrupted joining store size check thread");
+            }
+            if (storeSizeThread.isAlive()) {
+                LOGGER.warn("[BetterBackup] store size check (gcAll) did not finish within {}ms; "
+                        + "final shutdown snapshot may block on the store lock until it does",
+                        SHUTDOWN_JOIN_TIMEOUT_MS);
+            }
+        }
+        activeStoreSizeCheckThread = null;
+
         // 关服 final snapshot: 最后一次抓取本周期内 BAS fire 过的 chunk.
         // SnapshotCreator.create 用 synchronized 串行, 跟 scheduler 已停后无 race.
         SnapshotCreator creator = BetterBackupCore.creator();
@@ -474,6 +549,54 @@ public final class BetterBackupMod {
 
         BetterBackupCore.uninstall();
         LOGGER.info("[BetterBackup] uninstalled");
+    }
+
+    /**
+     * 派后台 daemon 线程跑 maxStoreSizeGB 软阈值自检 ({@link StoreSizeGuard}). 未越阈值时纯读一次
+     * 体积即返回 (零副作用); 越阈值则先 retention 淘汰再 full GC, 并把 before / prune 份数 / 回收字节 /
+     * after 打进日志.
+     *
+     * <p><b>软阈值不是硬配额</b>: gcAll 回收量被"受保留策略保护的活数据"封顶. 若 after 仍超阈值,
+     * 显式 WARN 让服主看到"上限没兜住"的真相——要真控上限得调 retention / 缩短保留窗口 + 定期重启,
+     * 而非指望本自检把体积压到阈值以下.
+     *
+     * <p>daemon=true 且失败仅 warn: 自检不影响活跃备份路径, 崩了下次启动重试. 绝不阻塞启动.
+     *
+     * @param inFlightProtect 在途保护集供应器 (pendingHashes ∪ writtenThisWindow), gcAll 时求值,
+     *                        保护并发写入尚未进 manifest 的对象不被误删
+     */
+    private static void dispatchStoreSizeCheck(ChunkStore store, Path snapshotsDir, Path worldRoot,
+                                               long maxStoreBytes, Supplier<Set<Hash>> inFlightProtect) {
+        StoreSizeGuard guard = new StoreSizeGuard(store, snapshotsDir, worldRoot, maxStoreBytes, inFlightProtect);
+        Thread thread = new Thread(() -> {
+            try {
+                StoreSizeGuard.Result r = guard.checkAndReclaim();
+                if (!r.triggered()) {
+                    LOGGER.info("[BetterBackup] store size check: {} bytes, under maxStoreSizeGB threshold ({} bytes); no GC",
+                            r.beforeBytes(), maxStoreBytes);
+                    return;
+                }
+                LOGGER.info("[BetterBackup] store size check: over threshold; before={} bytes, prune deleted {} manifest(s), "
+                                + "gcAll freed {} bytes, after={} bytes (threshold={} bytes)",
+                        r.beforeBytes(), r.prunedManifests(), r.gcBytesFreed(), r.afterBytes(), maxStoreBytes);
+                if (r.stillOver()) {
+                    // 软阈值兜不住: 回收量被活数据封顶. 如实告知, 别让服主误以为体积已降到阈值以下.
+                    LOGGER.warn("[BetterBackup] store still exceeds maxStoreSizeGB after GC: reclaimed {} bytes leaves {} bytes "
+                                    + "(threshold {} bytes). The remainder is live data protected by the retention policy. "
+                                    + "maxStoreSizeGB is a soft startup trigger, not a hard disk quota; to lower the ceiling, "
+                                    + "reduce retention (hourly/daily/weekly/monthly) or shorten the retention window and restart, "
+                                    + "or manually delete snapshots.",
+                            r.gcBytesFreed(), r.afterBytes(), maxStoreBytes);
+                }
+            } catch (IOException e) {
+                LOGGER.warn("[BetterBackup] store size check failed (non-fatal, retries next start)", e);
+            }
+        }, "BetterBackup-StoreSize-Check");
+        thread.setDaemon(true);
+        activeStoreSizeCheckThread = thread;
+        thread.start();
+        LOGGER.info("[BetterBackup] store size check dispatched to background (maxStoreSizeGB={})",
+                BetterBackupConfig.maxStoreSizeGB());
     }
 
     /**
@@ -538,8 +661,11 @@ public final class BetterBackupMod {
      * region/entities 文件做增量重扫 ({@link DegradedRescan}), 把降级窗口内 vanilla 同步
      * 写盘但没进快照的 chunk 登记进 CurrentSnapshotState, 由下次快照纳入. 完成后清标志.
      *
-     * <p>同步跑 (非后台线程): 只扫 mtime 变化的子集, 远小于全量 baseline; 且必须在下次
-     * 快照前补完才有意义. 重扫失败保留标志 (下次启动重试), 不清, 不 throw 中止启动.
+     * <p>后台 daemon 线程跑 + ThrottlingRateLimiter 限速 (与 baseline 同款): cutoff=0 退化为
+     * 全量重扫, 若同步跑在 ServerStartingEvent 主线程会阻塞 ServerStarted / 登录门 (历史 62s
+     * 假启动同类症状), 且补采读盘量可能很大不该在玩家在线时打满磁盘. 补采本就是"下次快照前补齐"
+     * 语义, 异步跑不影响正确性. 关服路径 requestStop + join 防半扫与关服快照 drain 竞争; 被中断
+     * 或失败时保留 degraded-session 标志 (下次启动重试), 不清, 不 throw 中止启动.
      */
     private static void runDegradedRescanIfNeeded(ChunkStore store,
                                                   CurrentSnapshotState state,
@@ -556,15 +682,31 @@ public final class BetterBackupMod {
         LOGGER.warn("[BetterBackup] degraded-session flag present from a prior run; "
                 + "rescanning region files modified after lastCompleteSnapshotMillis={} to backfill the degraded window",
                 cutoff);
-        DegradedRescan rescan = new DegradedRescan(store, state, paths, hashFunction, writtenThisWindow);
-        try {
-            DegradedRescan.Result result = rescan.rescan(cutoff);
-            session.clear();
-            LOGGER.info("[BetterBackup] degraded-window backfill done: recovered={} deduped={} skipped(active)={} regions={}; flag cleared",
-                    result.recovered(), result.deduped(), result.skippedActive(), result.regionsScanned());
-        } catch (IOException e) {
-            LOGGER.error("[BetterBackup] degraded-window rescan failed, flag retained for retry next start", e);
-        }
+        int rate = BetterBackupConfig.baselineScanChunksPerSecond();
+        DegradedRescan rescan = new DegradedRescan(store, state, paths, hashFunction, writtenThisWindow,
+                new ThrottlingRateLimiter(rate));
+        Thread thread = new Thread(() -> {
+            try {
+                DegradedRescan.Result result = rescan.rescan(cutoff);
+                if (result.stopped()) {
+                    // 关服中断: backfill 未跑完, 保留标志下次启动重试, 不清.
+                    LOGGER.info("[BetterBackup] degraded-window backfill stopped for shutdown: recovered={} so far, "
+                            + "flag retained, resumes next start", result.recovered());
+                    return;
+                }
+                session.clear();
+                LOGGER.info("[BetterBackup] degraded-window backfill done: recovered={} deduped={} skipped(active)={} regions={}; flag cleared",
+                        result.recovered(), result.deduped(), result.skippedActive(), result.regionsScanned());
+            } catch (IOException e) {
+                LOGGER.error("[BetterBackup] degraded-window rescan failed, flag retained for retry next start", e);
+            }
+        }, "BetterBackup-Degraded-Rescan");
+        thread.setDaemon(true);
+        activeDegradedRescan = rescan;
+        activeDegradedThread = thread;
+        thread.start();
+        LOGGER.info("[BetterBackup] degraded-window backfill started in background (rate={} chunk/s, cutoffMillis={})",
+                rate, cutoff);
     }
 
     /**

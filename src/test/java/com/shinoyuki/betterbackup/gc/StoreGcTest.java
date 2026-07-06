@@ -291,6 +291,45 @@ class StoreGcTest {
     }
 
     @Test
+    void gc_all_protect_and_no_seal_keep_in_flight_and_active_pack(@TempDir Path tempDir)
+            throws IOException {
+        Path storeRoot = tempDir.resolve("backup-store");
+        Path snapshotsDir = tempDir.resolve("snapshots");
+        Files.createDirectories(snapshotsDir);
+        ChunkStore store = new ChunkStore(storeRoot);
+        store.initialize();
+
+        // 1..5 写入后 close+reopen -> 落入封口 pack; manifest 仅引用 1,2,3.
+        for (int i = 1; i <= 5; i++) {
+            store.put(hash(i), payload(i));
+        }
+        Set<Hash> referenced = new HashSet<>();
+        for (int i = 1; i <= 3; i++) referenced.add(hash(i));
+        writeManifest(snapshotsDir, "snap-1", referenced);
+        store.close();
+
+        ChunkStore reopened = new ChunkStore(storeRoot);
+        reopened.initialize();
+        // reopen 后新写 6 -> 落入本会话的在写 pack (activeWritePack), 未引用未保护.
+        reopened.put(hash(6), payload(6));
+
+        StoreGc gc = new StoreGc(reopened, snapshotsDir);
+        // 活服语义: protect={4} (在途待引用), 不封口在写 pack. 阈值 0 = 任何死字节都回收.
+        StoreGc.GcResult r = gc.gcAll(Set.of(hash(4)), false, 0.0);
+
+        // 4 受 protect 保护存活 (在封口 pack 内), 5 未保护未引用被回收 -> 删 protect 逻辑此断言必挂.
+        assertTrue(reopened.has(hash(4)), "in-flight object 4 in protect set must survive");
+        assertFalse(reopened.has(hash(5)), "unprotected unreferenced object 5 must be reclaimed");
+        // 6 在在写 pack 内: seal=false 跳过整个在写 pack, 即便未引用也不动 -> 改 seal=true 此断言必挂.
+        assertTrue(reopened.has(hash(6)),
+                "object in active write pack must not be touched when sealActiveWritePack=false");
+        for (int i = 1; i <= 3; i++) {
+            assertTrue(reopened.has(hash(i)), "referenced object " + i + " survives");
+        }
+        assertEquals(1, r.deleted(), "only the unprotected unreferenced sealed-pack object is reclaimed");
+    }
+
+    @Test
     void gc_all_aborts_and_keeps_all_files_when_manifest_corrupt(@TempDir Path tempDir)
             throws IOException {
         ChunkStore store = new ChunkStore(tempDir.resolve("backup-store"));

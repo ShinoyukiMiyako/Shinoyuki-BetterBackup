@@ -13,7 +13,6 @@ import org.slf4j.Logger;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -73,7 +72,7 @@ public final class RestoreFlow {
         // 盘满会产出半覆盖的世界. 预检不过直接抛, 旧世界原封不动 (Advanced Backups #128).
         DiskSpaceCheck.require(paths.worldRoot(), DiskSpaceCheck.MIN_FREE_BYTES, "restore");
 
-        Path backupDir = moveCurrentWorldToBackup();
+        Path backupDir = new WorldBackupMover().moveToBackup(paths.worldRoot());
 
         long chunkSlots = rebuildChunkPath(manifest.chunks(), false);
         long entitySlots = rebuildChunkPath(manifest.entityChunks(), true);
@@ -101,40 +100,6 @@ public final class RestoreFlow {
         if (!missing.isEmpty()) {
             throw new IOException("store incomplete: " + missing.size() + " hash(es) missing, first="
                     + missing.get(0).toHex());
-        }
-    }
-
-    /**
-     * 把 worldRoot 内 chunk-related 子目录 + 玩家数据目录 + level.dat 用 atomic rename 移到
-     * {@code <worldRoot>.bak-<ts>/}. 玩家数据 (playerdata / stats / advancements / poi)
-     * 跟 region 在同一原子边界内一起进 .bak, 保证恢复后玩家背包与世界回到同一快照态
-     * (Phase D 推翻了 MVP 时期"不动 playerdata"的限制, 那会导致 FTB2 #95 刷物品事故)。
-     */
-    private Path moveCurrentWorldToBackup() throws IOException {
-        Path worldRoot = paths.worldRoot();
-        String backupName = worldRoot.getFileName() + ".bak-" + System.currentTimeMillis();
-        Path backupDir = worldRoot.resolveSibling(backupName);
-        Files.createDirectories(backupDir);
-
-        moveIfExists(worldRoot.resolve("region"), backupDir.resolve("region"));
-        moveIfExists(worldRoot.resolve("entities"), backupDir.resolve("entities"));
-        moveIfExists(worldRoot.resolve("data"), backupDir.resolve("data"));
-        moveIfExists(worldRoot.resolve("playerdata"), backupDir.resolve("playerdata"));
-        moveIfExists(worldRoot.resolve("stats"), backupDir.resolve("stats"));
-        moveIfExists(worldRoot.resolve("advancements"), backupDir.resolve("advancements"));
-        moveIfExists(worldRoot.resolve("poi"), backupDir.resolve("poi"));
-        moveIfExists(worldRoot.resolve("DIM-1"), backupDir.resolve("DIM-1"));
-        moveIfExists(worldRoot.resolve("DIM1"), backupDir.resolve("DIM1"));
-        moveIfExists(worldRoot.resolve("dimensions"), backupDir.resolve("dimensions"));
-        moveIfExists(worldRoot.resolve("level.dat"), backupDir.resolve("level.dat"));
-        moveIfExists(worldRoot.resolve("level.dat_old"), backupDir.resolve("level.dat_old"));
-        return backupDir;
-    }
-
-    private static void moveIfExists(Path src, Path dst) throws IOException {
-        if (Files.exists(src)) {
-            Files.createDirectories(dst.getParent());
-            Files.move(src, dst, StandardCopyOption.ATOMIC_MOVE);
         }
     }
 

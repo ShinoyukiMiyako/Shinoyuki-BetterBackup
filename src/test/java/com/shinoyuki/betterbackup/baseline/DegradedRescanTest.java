@@ -23,6 +23,8 @@ import java.nio.file.attribute.FileTime;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -45,11 +47,16 @@ class DegradedRescanTest {
 
     private DegradedRescan newRescan(Path storeRoot, Path worldRoot, CurrentSnapshotState state,
                                      Set<Hash> written) throws IOException {
+        return newRescan(storeRoot, worldRoot, state, written, BaselineScanner.RateLimiter.NONE);
+    }
+
+    private DegradedRescan newRescan(Path storeRoot, Path worldRoot, CurrentSnapshotState state,
+                                     Set<Hash> written, BaselineScanner.RateLimiter rateLimiter) throws IOException {
         ChunkStore store = new ChunkStore(storeRoot);
         store.initialize();
         WorldPaths paths = new WorldPaths(worldRoot);
         HashFunction hashFunction = new Xxh128HashFunction();
-        return new DegradedRescan(store, state, paths, hashFunction, written);
+        return new DegradedRescan(store, state, paths, hashFunction, written, rateLimiter);
     }
 
     /** 在 worldRoot/region 写 r.rx.rz.mca, slot->明文, 返回 packedPos->raw zlib payload. */
@@ -184,6 +191,54 @@ class DegradedRescanTest {
         CurrentSnapshotState.Drained drained = state.drainAndClear();
         assertEquals(activeHash, drained.chunks().get(new DimChunkKey(OVERWORLD, ChunkPos.asLong(0, 0))),
                 "重扫不得用磁盘旧字节覆盖活跃路径的较新 hash");
+    }
+
+    @Test
+    void rate_limiter_is_invoked_once_per_recovered_chunk(@TempDir Path base) throws IOException {
+        // 补采改后台化后必须限速: 每读一个非空 chunk slot 节流一次. 删掉 rateLimiter.acquire()
+        // 调用时 acquires 计数为 0, 断言必挂.
+        Path storeRoot = base.resolve("store");
+        Path worldRoot = base.resolve("world");
+        long cutoff = 1_000_000L;
+        writeRegion(worldRoot, "region", 0, 0,
+                Map.of(0, "c0".getBytes(), 1, "c1".getBytes(), 2, "c2".getBytes()));
+        setMtime(worldRoot, "region", 0, 0, cutoff + 1_000L);
+
+        CurrentSnapshotState state = new CurrentSnapshotState();
+        Set<Hash> written = ConcurrentHashMap.newKeySet();
+        AtomicInteger acquires = new AtomicInteger();
+        DegradedRescan rescan = newRescan(storeRoot, worldRoot, state, written, acquires::incrementAndGet);
+
+        DegradedRescan.Result result = rescan.rescan(cutoff);
+
+        assertEquals(3, result.recovered());
+        assertEquals(3, acquires.get(), "rate limiter acquired exactly once per non-empty chunk slot read");
+        assertFalse(result.stopped());
+    }
+
+    @Test
+    void request_stop_halts_rescan_and_reports_stopped(@TempDir Path base) throws IOException {
+        // 关服路径: requestStop 让补采在 slot 边界退出并返回 stopped=true, 调用方据此保留标志重试.
+        // 删掉 rescan/rescanRegionFile 的 stopRequested 检查时, 全部 chunk 被扫、stopped=false, 断言必挂.
+        Path storeRoot = base.resolve("store");
+        Path worldRoot = base.resolve("world");
+        long cutoff = 1_000_000L;
+        writeRegion(worldRoot, "region", 0, 0,
+                Map.of(0, "c0".getBytes(), 1, "c1".getBytes(), 2, "c2".getBytes(), 3, "c3".getBytes()));
+        setMtime(worldRoot, "region", 0, 0, cutoff + 1_000L);
+
+        CurrentSnapshotState state = new CurrentSnapshotState();
+        Set<Hash> written = ConcurrentHashMap.newKeySet();
+        // 限速器在第一次 acquire (第一个非空 slot) 时请求停止: 本 chunk 仍入库, 下一个 slot 迭代退出.
+        AtomicReference<DegradedRescan> ref = new AtomicReference<>();
+        BaselineScanner.RateLimiter stopOnFirst = () -> ref.get().requestStop();
+        DegradedRescan rescan = newRescan(storeRoot, worldRoot, state, written, stopOnFirst);
+        ref.set(rescan);
+
+        DegradedRescan.Result result = rescan.rescan(cutoff);
+
+        assertTrue(result.stopped(), "requestStop mid-scan must report stopped=true");
+        assertEquals(1, result.recovered(), "only the chunk being processed when stop fired is recovered");
     }
 
     @Test
