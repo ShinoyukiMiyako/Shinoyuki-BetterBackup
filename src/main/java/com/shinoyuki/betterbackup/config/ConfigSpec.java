@@ -174,7 +174,10 @@ public final class ConfigSpec {
                 .comment("After each snapshot, recompute hashes for the entries newly written this snapshot",
                          "(write-path self-check). A mismatch marks only this snapshot failed (.incomplete);",
                          "it does not trip degraded mode. Slow; default off. Covers this snapshot's writes only,",
-                         "not the whole store -- use the CLI fsck for a full-store integrity scan.")
+                         "not the whole store -- use the CLI fsck for a full-store integrity scan.",
+                         "During the initial baseline full scan a single snapshot window can accumulate a very",
+                         "large set of newly written objects, so this re-read + rehash can take minutes on the",
+                         "scheduler thread until the baseline completes; steady-state increments are small.")
                 .define("verifyOnSnapshot", false);
 
         BUILDER.pop();
