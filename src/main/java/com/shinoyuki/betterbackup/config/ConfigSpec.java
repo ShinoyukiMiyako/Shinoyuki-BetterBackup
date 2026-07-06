@@ -39,6 +39,7 @@ public final class ConfigSpec {
     public static final ForgeConfigSpec.IntValue INTERVAL_MINUTES;
     public static final ForgeConfigSpec.IntValue DIRTY_CHUNK_THRESHOLD;
 
+    public static final ForgeConfigSpec.BooleanValue RETENTION_ENABLED;
     public static final ForgeConfigSpec.IntValue RETENTION_HOURLY;
     public static final ForgeConfigSpec.IntValue RETENTION_DAILY;
     public static final ForgeConfigSpec.IntValue RETENTION_WEEKLY;
@@ -127,22 +128,32 @@ public final class ConfigSpec {
 
         BUILDER.comment("Retention policy: how many of each rolling category to keep").push("retention");
 
+        RETENTION_ENABLED = BUILDER
+                .comment("Master opt-in switch for rolling retention pruning. Default false: every snapshot is",
+                         "kept forever, so upgrading never starts deleting history implicitly. When false the",
+                         "hourly/daily/weekly/monthly quotas below are ignored. Pruning is irreversible; before",
+                         "turning this on for an existing store run '/betterbackup retention preview' to see",
+                         "exactly which snapshots the policy would delete.")
+                .define("enabled", false);
+
         RETENTION_HOURLY = BUILDER
-                .comment("Hourly snapshots to retain (most recent N).",
+                .comment("Hourly snapshots to retain (most recent N). Applied only when retention.enabled=true.",
                          "336 = full hourly coverage for 14 days; manifest overhead grows ~30MB per retained",
                          "snapshot on 1M+ chunk worlds until manifest delta encoding lands (v0.2).")
                 .defineInRange("hourly", 24, 0, 2000);
 
         RETENTION_DAILY = BUILDER
-                .comment("Daily snapshots to retain (the 00:00 snapshot of each day).")
+                .comment("Daily snapshots to retain (the 00:00 snapshot of each day). Applied only when",
+                         "retention.enabled=true.")
                 .defineInRange("daily", 7, 0, 90);
 
         RETENTION_WEEKLY = BUILDER
-                .comment("Weekly snapshots to retain (Monday 00:00).")
+                .comment("Weekly snapshots to retain (Monday 00:00). Applied only when retention.enabled=true.")
                 .defineInRange("weekly", 4, 0, 52);
 
         RETENTION_MONTHLY = BUILDER
-                .comment("Monthly snapshots to retain (1st of month 00:00).")
+                .comment("Monthly snapshots to retain (1st of month 00:00). Applied only when",
+                         "retention.enabled=true.")
                 .defineInRange("monthly", 12, 0, 120);
 
         BUILDER.pop();

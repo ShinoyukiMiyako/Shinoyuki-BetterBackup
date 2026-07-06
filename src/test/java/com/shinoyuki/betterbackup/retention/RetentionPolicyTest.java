@@ -9,6 +9,7 @@ import java.util.List;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -27,6 +28,18 @@ class RetentionPolicyTest {
         assertEquals(Collections.emptySet(), kept);
         Set<String> doomed = policy.selectForDeletion(Collections.emptyList());
         assertEquals(Collections.emptySet(), doomed);
+    }
+
+    @Test
+    void from_config_disabled_yields_retains_nothing_policy_regardless_of_counts() {
+        // opt-in gate: retention.enabled=false 时无视四档配额返回全零 policy, 其 retainsNothing()=true;
+        // 淘汰执行器 (RetentionPruner) 据此短路保留全部快照 (见 RetentionPrunerTest 的空转回归)。
+        // 删掉 fromConfig 的 !enabled 短路时, 全零工厂返回 (24,7,4,12), retainsNothing 变 false, 断言必挂。
+        RetentionPolicy disabled = RetentionPolicy.fromConfig(false, 24, 7, 4, 12);
+        assertTrue(disabled.retainsNothing(), "retention disabled must yield a retains-nothing (keep-all) policy");
+
+        RetentionPolicy enabled = RetentionPolicy.fromConfig(true, 24, 7, 4, 12);
+        assertFalse(enabled.retainsNothing(), "retention enabled with non-zero counts is an active policy");
     }
 
     @Test

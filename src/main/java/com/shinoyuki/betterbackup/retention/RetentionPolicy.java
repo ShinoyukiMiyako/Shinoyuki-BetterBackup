@@ -61,13 +61,27 @@ public final class RetentionPolicy {
         this.monthly = monthly;
     }
 
-    /** 工厂: 用 BetterBackupConfig 当前 retention 配置构造。 */
+    /** 工厂: 用 BetterBackupConfig 当前 retention 配置构造 (含 opt-in 主开关)。 */
     public static RetentionPolicy fromConfig() {
-        return new RetentionPolicy(
+        return fromConfig(
+                BetterBackupConfig.retentionEnabled(),
                 BetterBackupConfig.retentionHourly(),
                 BetterBackupConfig.retentionDaily(),
                 BetterBackupConfig.retentionWeekly(),
                 BetterBackupConfig.retentionMonthly());
+    }
+
+    /**
+     * 纯逻辑工厂: {@code enabled=false} (retention 未开启, 默认值) 返回全零 policy —— 其
+     * {@link #retainsNothing()} 为 true, 淘汰执行器据此保留全部快照。这让升级用户在显式开启前
+     * 首跑不会批量、不可逆地淘汰历史快照。opt-in gate 在此收口, 所有消费者 (SnapshotCreator /
+     * StoreSizeGuard / 命令 preview) 统一经 {@link #fromConfig()} 生效。
+     */
+    static RetentionPolicy fromConfig(boolean enabled, int hourly, int daily, int weekly, int monthly) {
+        if (!enabled) {
+            return new RetentionPolicy(0, 0, 0, 0);
+        }
+        return new RetentionPolicy(hourly, daily, weekly, monthly);
     }
 
     /**

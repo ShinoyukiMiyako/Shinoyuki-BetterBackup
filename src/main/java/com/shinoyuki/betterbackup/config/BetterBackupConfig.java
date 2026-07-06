@@ -24,6 +24,7 @@ public final class BetterBackupConfig {
     private static volatile int intervalMinutes;
     private static volatile int dirtyChunkThreshold;
 
+    private static volatile boolean retentionEnabled;
     private static volatile int retentionHourly;
     private static volatile int retentionDaily;
     private static volatile int retentionWeekly;
@@ -74,6 +75,10 @@ public final class BetterBackupConfig {
 
     public static int dirtyChunkThreshold() {
         return dirtyChunkThreshold;
+    }
+
+    public static boolean retentionEnabled() {
+        return retentionEnabled;
     }
 
     public static int retentionHourly() {
@@ -142,6 +147,7 @@ public final class BetterBackupConfig {
         scheduleMode = ConfigSpec.SCHEDULE_MODE.get();
         intervalMinutes = ConfigSpec.INTERVAL_MINUTES.get();
         dirtyChunkThreshold = ConfigSpec.DIRTY_CHUNK_THRESHOLD.get();
+        retentionEnabled = ConfigSpec.RETENTION_ENABLED.get();
         retentionHourly = ConfigSpec.RETENTION_HOURLY.get();
         retentionDaily = ConfigSpec.RETENTION_DAILY.get();
         retentionWeekly = ConfigSpec.RETENTION_WEEKLY.get();
