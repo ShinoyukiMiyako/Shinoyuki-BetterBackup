@@ -119,6 +119,9 @@ public final class BetterBackupMod {
     // requestStop + join. 不进 BetterBackupCore (一次性启动期任务, 非常驻组件).
     private static volatile DegradedRescan activeDegradedRescan;
     private static volatile Thread activeDegradedThread;
+    // maxStoreSizeGB 自检 (StoreSizeGuard.gcAll) 的关服 join 句柄. gcAll 持 store 写锁, 关服
+    // 前先 join 它让写锁尽量释放, 免 final snapshot 撞其写锁久等 (gcAll 不可中断, 只能 join).
+    private static volatile Thread activeStoreSizeCheckThread;
 
     public BetterBackupMod() {
         // 游戏内: 把 BackupLog 门面桥回 slf4j, 让已迁到门面的 CLI 可达类 (ChunkStore 等)
@@ -515,6 +518,24 @@ public final class BetterBackupMod {
         activeDegradedRescan = null;
         activeDegradedThread = null;
 
+        // 启动期 store 体积自检若仍在跑 gcAll (持 store 写锁), 先 join 它 (有界超时), 让写锁在关服
+        // 快照拿读锁之前尽量释放, 避免 final snapshot 撞其写锁久等. gcAll 不支持中断, 只能等它跑完.
+        Thread storeSizeThread = activeStoreSizeCheckThread;
+        if (storeSizeThread != null && storeSizeThread.isAlive()) {
+            try {
+                storeSizeThread.join(SHUTDOWN_JOIN_TIMEOUT_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                LOGGER.warn("[BetterBackup] interrupted joining store size check thread");
+            }
+            if (storeSizeThread.isAlive()) {
+                LOGGER.warn("[BetterBackup] store size check (gcAll) did not finish within {}ms; "
+                        + "final shutdown snapshot may block on the store lock until it does",
+                        SHUTDOWN_JOIN_TIMEOUT_MS);
+            }
+        }
+        activeStoreSizeCheckThread = null;
+
         // 关服 final snapshot: 最后一次抓取本周期内 BAS fire 过的 chunk.
         // SnapshotCreator.create 用 synchronized 串行, 跟 scheduler 已停后无 race.
         SnapshotCreator creator = BetterBackupCore.creator();
@@ -572,6 +593,7 @@ public final class BetterBackupMod {
             }
         }, "BetterBackup-StoreSize-Check");
         thread.setDaemon(true);
+        activeStoreSizeCheckThread = thread;
         thread.start();
         LOGGER.info("[BetterBackup] store size check dispatched to background (maxStoreSizeGB={})",
                 BetterBackupConfig.maxStoreSizeGB());
