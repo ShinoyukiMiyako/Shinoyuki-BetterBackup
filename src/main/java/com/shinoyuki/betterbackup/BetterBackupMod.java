@@ -104,6 +104,12 @@ public final class BetterBackupMod {
     /** 关服 worker join 总超时 (毫秒). 写死 30s, 后续可考虑接入 BetterBackupConfig. */
     private static final long SHUTDOWN_JOIN_TIMEOUT_MS = 30_000L;
 
+    /**
+     * BackupTask 队列容量上限. 稳态下队列很浅 (worker 消费快于 vanilla 存盘), 但压实 / 手动 GC
+     * 长时间持 store 写锁阻塞消费时会堆积. 有界 + bridge 满时反压后降级, 防无上限增长致堆压力.
+     */
+    private static final int TASK_QUEUE_CAPACITY = 100_000;
+
     // baseline 扫描线程的关服停止句柄. 不进 BetterBackupCore: 扫描是一次性启动期任务,
     // 不是常驻组件, install 签名不为它扩列. volatile 因 startBaselineScan (server 线程)
     // 与 onServerStopping (server 线程) 之间隔着 daemon 线程的生命周期.
@@ -304,7 +310,9 @@ public final class BetterBackupMod {
             AtomicBoolean baselineScanFinished = new AtomicBoolean(false);
             // queue 先于 context 创建: context 持有同一个 queue 引用, chunk/entity task
             // 命中撕裂读时把自己重 offer 回这个 queue 延后重试 (BackupContext.retryQueue).
-            BlockingQueue<BackupTask> queue = new LinkedBlockingQueue<>();
+            // 有界: 消费被长时压实写锁阻塞时防无上限堆积 (bridge 满时反压后降级并 WARN);
+            // 撕裂读重试走非阻塞 offer, 队满时丢弃该轮重试 (chunk 下次存盘再 fire), 不与消费者死锁.
+            BlockingQueue<BackupTask> queue = new LinkedBlockingQueue<>(TASK_QUEUE_CAPACITY);
             BackupContext context = new BackupContext(store, snapshotState, paths, hashFunction,
                     writtenThisWindow, metrics, queue);
 
