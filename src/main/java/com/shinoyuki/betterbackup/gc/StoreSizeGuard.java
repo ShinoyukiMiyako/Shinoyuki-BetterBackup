@@ -3,10 +3,13 @@ package com.shinoyuki.betterbackup.gc;
 import com.shinoyuki.betterbackup.BetterBackupMod;
 import com.shinoyuki.betterbackup.retention.RetentionPruner;
 import com.shinoyuki.betterbackup.store.ChunkStore;
+import com.shinoyuki.betterbackup.store.Hash;
 
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.Objects;
+import java.util.Set;
+import java.util.function.Supplier;
 
 /**
  * maxStoreSizeGB 软阈值自检的可测编排逻辑. 启动期 (由 {@link BetterBackupMod} 在后台 daemon
@@ -32,26 +35,32 @@ public final class StoreSizeGuard {
     private final Path snapshotsDir;
     private final RetentionPruner pruner;
     private final long maxBytes;
+    private final Supplier<Set<Hash>> inFlightProtect;
 
     /**
      * 生产入口: 用当前 config 的 retention 配额构造 pruner (经 snapshotsDir + worldRoot).
      *
-     * @param store        dedup store, 供算体积 + gcAll 回收
-     * @param snapshotsDir manifest 目录, gcAll 的存活根来源 + pruner 删除目标
-     * @param worldRoot    世界根, {@link RetentionPruner} 三门禁 (pending-restore flag 等) 需要
-     * @param maxBytes     体积软阈值 (字节); store 超过它才触发 prune+gcAll
+     * @param store           dedup store, 供算体积 + gcAll 回收
+     * @param snapshotsDir    manifest 目录, gcAll 的存活根来源 + pruner 删除目标
+     * @param worldRoot       世界根, {@link RetentionPruner} 三门禁 (pending-restore flag 等) 需要
+     * @param maxBytes        体积软阈值 (字节); store 超过它才触发 prune+gcAll
+     * @param inFlightProtect 在途保护集供应器 (pendingHashes ∪ writtenThisWindow); gcAll 时求值,
+     *                        保护启动期 worker / baseline 已 put 但尚未进 manifest 的对象不被误删
      */
-    public StoreSizeGuard(ChunkStore store, Path snapshotsDir, Path worldRoot, long maxBytes) {
+    public StoreSizeGuard(ChunkStore store, Path snapshotsDir, Path worldRoot, long maxBytes,
+                          Supplier<Set<Hash>> inFlightProtect) {
         this(store, snapshotsDir, new RetentionPruner(
                 Objects.requireNonNull(snapshotsDir, "snapshotsDir"),
-                Objects.requireNonNull(worldRoot, "worldRoot")), maxBytes);
+                Objects.requireNonNull(worldRoot, "worldRoot")), maxBytes, inFlightProtect);
     }
 
     /**
-     * 测试入口: 注入显式 pruner (通常带确定 policy), 不依赖静态 config. 供空转回归 (retainsNothing
-     * 的 pruner) 与"触发且降下来"两类测试注入不同 policy.
+     * 测试入口: 注入显式 pruner (通常带确定 policy) 与在途保护集供应器, 不依赖静态 config /
+     * BetterBackupCore. 供空转回归 (retainsNothing 的 pruner)、"触发且降下来"、在途对象受保护三类
+     * 测试注入不同 policy / protect.
      */
-    StoreSizeGuard(ChunkStore store, Path snapshotsDir, RetentionPruner pruner, long maxBytes) {
+    StoreSizeGuard(ChunkStore store, Path snapshotsDir, RetentionPruner pruner, long maxBytes,
+                   Supplier<Set<Hash>> inFlightProtect) {
         this.store = Objects.requireNonNull(store, "store");
         this.snapshotsDir = Objects.requireNonNull(snapshotsDir, "snapshotsDir");
         this.pruner = Objects.requireNonNull(pruner, "pruner");
@@ -59,6 +68,7 @@ public final class StoreSizeGuard {
             throw new IllegalArgumentException("maxBytes must be positive: " + maxBytes);
         }
         this.maxBytes = maxBytes;
+        this.inFlightProtect = Objects.requireNonNull(inFlightProtect, "inFlightProtect");
     }
 
     /**
@@ -81,8 +91,10 @@ public final class StoreSizeGuard {
         RetentionPruner.PruneResult pruneResult = pruner.prune();
         int prunedManifests = pruneResult.deleted().size();
 
+        // 活服自检: 传在途保护集 (求值于此刻) 且不封口在写 pack, 与增量压实同源防并发误删——
+        // 启动期 worker / baseline 正并发写入尚未进 manifest 的对象.
         StoreGc gc = new StoreGc(store, snapshotsDir);
-        StoreGc.GcResult gcResult = gc.gcAll();
+        StoreGc.GcResult gcResult = gc.gcAll(inFlightProtect.get(), false);
 
         long after = store.approxStoreBytes();
         boolean stillOver = after > maxBytes;

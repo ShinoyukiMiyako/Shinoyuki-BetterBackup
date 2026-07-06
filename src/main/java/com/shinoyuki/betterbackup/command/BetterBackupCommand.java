@@ -22,6 +22,7 @@ import com.shinoyuki.betterbackup.snapshot.CurrentSnapshotState;
 import com.shinoyuki.betterbackup.snapshot.SnapshotCreator;
 import com.shinoyuki.betterbackup.snapshot.SnapshotManifest;
 import com.shinoyuki.betterbackup.store.ChunkStore;
+import com.shinoyuki.betterbackup.store.Hash;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.core.registries.Registries;
@@ -42,8 +43,10 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.EnumMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Stream;
@@ -787,11 +790,17 @@ public final class BetterBackupCommand {
         CommandSourceStack source = ctx.getSource();
         MinecraftServer server = source.getServer();
         StoreGc gc = new StoreGc(store, creator.snapshotsDir());
+        CurrentSnapshotState snapshotState = BetterBackupCore.snapshotState();
+        Set<Hash> writtenThisWindow = BetterBackupCore.context().writtenThisWindow();
 
         Thread worker = new Thread(() -> {
             long t0 = System.currentTimeMillis();
             try {
-                StoreGc.GcResult r = gc.gcAll();
+                // 活服手动 GC: 传在途保护集 (pendingHashes ∪ writtenThisWindow) 且不封口在写 pack,
+                // 玩家在线 / chunk 正存盘时执行不会误删尚未进 manifest 的在途对象.
+                Set<Hash> protect = new HashSet<>(snapshotState.pendingHashes());
+                protect.addAll(writtenThisWindow);
+                StoreGc.GcResult r = gc.gcAll(protect, false);
                 long elapsed = System.currentTimeMillis() - t0;
                 server.execute(() -> source.sendSuccess(() -> Component.literal(
                         "GC done in " + elapsed + "ms: scanned=" + r.scanned()

@@ -92,7 +92,8 @@ class StoreSizeGuardTest {
         // 阈值远高于当前体积 -> 不触发.
         long maxBytes = realBytes + 1_000_000L;
         StoreSizeGuard guard = new StoreSizeGuard(store, snapshotsDir,
-                RetentionPrunerTestFactory.withPolicy(snapshotsDir, worldRoot, new RetentionPolicy(1, 0, 0, 0)), maxBytes);
+                RetentionPrunerTestFactory.withPolicy(snapshotsDir, worldRoot, new RetentionPolicy(1, 0, 0, 0)), maxBytes,
+                HashSet::new);
         StoreSizeGuard.Result r = guard.checkAndReclaim();
 
         assertFalse(r.triggered(), "under threshold must not trigger");
@@ -135,6 +136,12 @@ class StoreSizeGuardTest {
         writeManifest(snapshotsDir, "2026-05-09T12-00-00Z", setA, false);   // snap-A
         writeManifest(snapshotsDir, "2026-05-10T12-00-00Z", setB, true);    // snap-B
 
+        // close+reopen 使对象落入封口 pack, 与真实启动自检 (store 刚 load, 无在写 pack) 一致:
+        // guard 现走 gcAll(seal=false) 跳过在写 pack, 只回收封口 pack 的死对象.
+        store.close();
+        store = new ChunkStore(storeRoot);
+        store.initialize();
+
         long before = store.approxStoreBytes();
         // gcAll 回收 1,2,3 的 pack 帧: 每对象 16B hash + 4B len + 数据. 精确期望值.
         long expectedReclaimed = 0;
@@ -145,7 +152,8 @@ class StoreSizeGuardTest {
         // 阈值卡在"当前体积之下但回收目标之上", 确保触发.
         long maxBytes = before - 1;
         StoreSizeGuard guard = new StoreSizeGuard(store, snapshotsDir,
-                RetentionPrunerTestFactory.withPolicy(snapshotsDir, worldRoot, new RetentionPolicy(1, 0, 0, 0)), maxBytes);
+                RetentionPrunerTestFactory.withPolicy(snapshotsDir, worldRoot, new RetentionPolicy(1, 0, 0, 0)), maxBytes,
+                HashSet::new);
         StoreSizeGuard.Result r = guard.checkAndReclaim();
 
         assertTrue(r.triggered(), "over threshold must trigger");
@@ -199,7 +207,8 @@ class StoreSizeGuardTest {
 
         long maxBytes = before - 1; // 撑过阈值
         StoreSizeGuard guard = new StoreSizeGuard(store, snapshotsDir,
-                RetentionPrunerTestFactory.withPolicy(snapshotsDir, worldRoot, new RetentionPolicy(0, 0, 0, 0)), maxBytes);
+                RetentionPrunerTestFactory.withPolicy(snapshotsDir, worldRoot, new RetentionPolicy(0, 0, 0, 0)), maxBytes,
+                HashSet::new);
         StoreSizeGuard.Result r = guard.checkAndReclaim();
 
         assertTrue(r.triggered(), "still triggers (体积确实超阈值)");
@@ -238,6 +247,11 @@ class StoreSizeGuardTest {
         writeManifest(snapshotsDir, "2026-05-09T12-00-00Z", setA, false);
         writeManifest(snapshotsDir, "2026-05-10T12-00-00Z", setB, true);
 
+        // close+reopen 使对象落入封口 pack, 与真实启动自检一致 (guard 走 gcAll seal=false).
+        store.close();
+        store = new ChunkStore(storeRoot);
+        store.initialize();
+
         long before = store.approxStoreBytes();
         long expectedReclaimed = 0;
         for (int i = 1; i <= 3; i++) {
@@ -247,7 +261,8 @@ class StoreSizeGuardTest {
         // 阈值设在回收后体积之下 (但当前体积之上): 触发 + 回收, 但 after 仍超阈值.
         long maxBytes = afterExpected - 1;
         StoreSizeGuard guard = new StoreSizeGuard(store, snapshotsDir,
-                RetentionPrunerTestFactory.withPolicy(snapshotsDir, worldRoot, new RetentionPolicy(1, 0, 0, 0)), maxBytes);
+                RetentionPrunerTestFactory.withPolicy(snapshotsDir, worldRoot, new RetentionPolicy(1, 0, 0, 0)), maxBytes,
+                HashSet::new);
         StoreSizeGuard.Result r = guard.checkAndReclaim();
 
         assertTrue(r.triggered());
@@ -256,6 +271,68 @@ class StoreSizeGuardTest {
         assertEquals(afterExpected, r.afterBytes());
         assertTrue(r.stillOver(),
                 "reclaim happened but after still exceeds threshold -> stillOver must be true");
+        store.close();
+    }
+
+    // ---- Critical: 启动自检 gcAll 必须保护在途对象 (protect + 不封口在写 pack) ----------
+
+    @Test
+    void trigger_protects_in_flight_objects_from_gcall(@TempDir Path tempDir) throws IOException {
+        // 启动自检与 worker/baseline 写入并发: 已 put 入库但尚未进任何 manifest 的在途对象必须被
+        // gcAll 的 protect 集保护, 否则下一份快照 drain 出这些 hash 即成悬空引用, 备份静默丢数据.
+        // 删掉 protect 接线 (guard 改回无参 gcAll) 时, 7/8 会被物理删, store.has(7/8) 断言必挂.
+        Path storeRoot = tempDir.resolve("backup-store");
+        Path snapshotsDir = tempDir.resolve("snapshots");
+        Files.createDirectories(snapshotsDir);
+        Path worldRoot = tempDir.resolve("world");
+        Files.createDirectories(worldRoot);
+        ChunkStore store = new ChunkStore(storeRoot);
+        store.initialize();
+
+        // 1..9 全部入库; 1..3 被 doomed 的 snap-A 独占, 4..6 被保留的 snap-B 引用,
+        // 7..8 在途 (protect 集), 9 死对象 (无引用无保护) —— 用于反证 protect 是选择性的.
+        for (int i = 1; i <= 9; i++) {
+            store.put(hash(i), payload(i));
+        }
+        Set<Hash> setA = new HashSet<>();
+        for (int i = 1; i <= 3; i++) setA.add(hash(i));
+        Set<Hash> setB = new HashSet<>();
+        for (int i = 4; i <= 6; i++) setB.add(hash(i));
+        writeManifest(snapshotsDir, "2026-05-09T12-00-00Z", setA, false);
+        writeManifest(snapshotsDir, "2026-05-10T12-00-00Z", setB, true);
+
+        // close+reopen -> 全对象进封口 pack (仿真启动自检: store 刚 load).
+        store.close();
+        store = new ChunkStore(storeRoot);
+        store.initialize();
+
+        long before = store.approxStoreBytes();
+        long expectedReclaimed = 0;
+        for (int i : new int[]{1, 2, 3, 9}) {
+            expectedReclaimed += 16 + 4 + payload(i).length;
+        }
+        long maxBytes = before - 1;
+
+        Set<Hash> inFlight = Set.of(hash(7), hash(8));
+        StoreSizeGuard guard = new StoreSizeGuard(store, snapshotsDir,
+                RetentionPrunerTestFactory.withPolicy(snapshotsDir, worldRoot, new RetentionPolicy(1, 0, 0, 0)), maxBytes,
+                () -> inFlight);
+        StoreSizeGuard.Result r = guard.checkAndReclaim();
+
+        assertTrue(r.triggered());
+        assertEquals(1, r.prunedManifests(), "prune deletes snap-A only");
+        assertEquals(expectedReclaimed, r.gcBytesFreed(),
+                "reclaims exactly A-exclusive {1,2,3} + orphan {9}, never protected {7,8}");
+        // 在途对象存活 (protect 生效): Critical 修复的核心断言.
+        assertTrue(store.has(hash(7)), "in-flight object 7 must survive gcAll");
+        assertTrue(store.has(hash(8)), "in-flight object 8 must survive gcAll");
+        // A 独占 + 孤儿死对象被回收 (证明 protect 是选择性的, 非一律不删).
+        for (int i : new int[]{1, 2, 3, 9}) {
+            assertFalse(store.has(hash(i)), "dead object " + i + " reclaimed");
+        }
+        for (int i = 4; i <= 6; i++) {
+            assertTrue(store.has(hash(i)), "referenced object " + i + " survives");
+        }
         store.close();
     }
 
@@ -277,7 +354,7 @@ class StoreSizeGuardTest {
         Thread caller = Thread.currentThread();
         StoreSizeGuard guard = new StoreSizeGuard(store, snapshotsDir,
                 RetentionPrunerTestFactory.withPolicy(snapshotsDir, worldRoot, new RetentionPolicy(1, 0, 0, 0)),
-                store.approxStoreBytes() + 1_000_000L);
+                store.approxStoreBytes() + 1_000_000L, HashSet::new);
         StoreSizeGuard.Result r = guard.checkAndReclaim();
 
         // 断言在调用线程上同步完成 (无 spawn), 结果已就绪.

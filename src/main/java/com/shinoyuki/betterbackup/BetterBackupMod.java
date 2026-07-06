@@ -60,9 +60,11 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Supplier;
 import java.util.stream.Stream;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
@@ -265,20 +267,27 @@ public final class BetterBackupMod {
                 LOGGER.info("[BetterBackup] orphan .tmp cleanup dispatched to background");
             }
 
-            // maxStoreSizeGB 软阈值自检: store 体积超阈值则先 retention 淘汰 (删超期 manifest) 再
-            // full GC 回收死对象. 与 .tmp 清扫同款后台 daemon 线程——算体积要 walk 整个 store, 大 store
-            // (百万对象 + 未排空旧树) 可达数十秒, 绝不能在 server 主线程同步跑, 否则推迟 ServerStarted /
-            // 登录门. 失败仅 warn 不中止启动 (自检不影响备份正确性). snapshotsDir 与 SnapshotCreator /
-            // StoreGc 用的同为 storeRoot/snapshots.
-            long maxStoreBytes = (long) BetterBackupConfig.maxStoreSizeGB() * 1024 * 1024 * 1024;
-            Path snapshotsDir = storeRoot.resolve("snapshots");
-            dispatchStoreSizeCheck(store, snapshotsDir, worldRoot, maxStoreBytes);
-
             CurrentSnapshotState snapshotState = new CurrentSnapshotState();
             WorldPaths paths = new WorldPaths(worldRoot);
             HashFunction hashFunction = new Xxh128HashFunction();
             BetterBackupMetrics metrics = new BetterBackupMetrics();
             Set<Hash> writtenThisWindow = ConcurrentHashMap.newKeySet();
+
+            // maxStoreSizeGB 软阈值自检: store 体积超阈值则先 retention 淘汰 (删超期 manifest) 再
+            // full GC 回收死对象. 与 .tmp 清扫同款后台 daemon 线程——算体积要 walk 整个 store, 大 store
+            // (百万对象 + 未排空旧树) 可达数十秒, 绝不能在 server 主线程同步跑, 否则推迟 ServerStarted /
+            // 登录门. 失败仅 warn 不中止启动 (自检不影响备份正确性). snapshotsDir 与 SnapshotCreator /
+            // StoreGc 用的同为 storeRoot/snapshots. 派发在 snapshotState + writtenThisWindow 创建之后:
+            // 自检的 gcAll 求值在途保护集 (二者并集), 排除启动期 worker / baseline 已 put 但未进 manifest
+            // 的对象, 不封口在写 pack —— 否则会物理删掉这些对象致下份快照悬空引用.
+            long maxStoreBytes = (long) BetterBackupConfig.maxStoreSizeGB() * 1024 * 1024 * 1024;
+            Path snapshotsDir = storeRoot.resolve("snapshots");
+            dispatchStoreSizeCheck(store, snapshotsDir, worldRoot, maxStoreBytes,
+                    () -> {
+                        Set<Hash> protect = new HashSet<>(snapshotState.pendingHashes());
+                        protect.addAll(writtenThisWindow);
+                        return protect;
+                    });
 
             // baseline 进度先于 creator 创建: creator 在每份 manifest 写盘成功后晋升
             // scanned->committed 并据 baselineProgress.isComplete() 盖 baselineComplete 戳.
@@ -496,10 +505,13 @@ public final class BetterBackupMod {
      * 而非指望本自检把体积压到阈值以下.
      *
      * <p>daemon=true 且失败仅 warn: 自检不影响活跃备份路径, 崩了下次启动重试. 绝不阻塞启动.
+     *
+     * @param inFlightProtect 在途保护集供应器 (pendingHashes ∪ writtenThisWindow), gcAll 时求值,
+     *                        保护并发写入尚未进 manifest 的对象不被误删
      */
     private static void dispatchStoreSizeCheck(ChunkStore store, Path snapshotsDir, Path worldRoot,
-                                               long maxStoreBytes) {
-        StoreSizeGuard guard = new StoreSizeGuard(store, snapshotsDir, worldRoot, maxStoreBytes);
+                                               long maxStoreBytes, Supplier<Set<Hash>> inFlightProtect) {
+        StoreSizeGuard guard = new StoreSizeGuard(store, snapshotsDir, worldRoot, maxStoreBytes, inFlightProtect);
         Thread thread = new Thread(() -> {
             try {
                 StoreSizeGuard.Result r = guard.checkAndReclaim();
