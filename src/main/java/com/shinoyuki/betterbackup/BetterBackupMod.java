@@ -379,9 +379,7 @@ public final class BetterBackupMod {
 
             LOGGER.info("[BetterBackup]   |- worldRoot: {}", worldRoot);
             LOGGER.info("[BetterBackup]   |- storeRoot: {}", storeRoot);
-            LOGGER.info("[BetterBackup]   |- hash: {} compress: {}",
-                    hashFunction.name(),
-                    BetterBackupConfig.compressionAlgorithm());
+            LOGGER.info("[BetterBackup]   |- hash: {}", hashFunction.name());
             LOGGER.info("[BetterBackup]   |- workers: {} thread(s)", threadCount);
             LOGGER.info("[BetterBackup]   |- schedule: {} (interval={}min)",
                     BetterBackupConfig.scheduleMode(),

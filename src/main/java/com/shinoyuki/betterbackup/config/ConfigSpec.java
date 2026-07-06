@@ -14,11 +14,6 @@ public final class ConfigSpec {
         BLAKE3
     }
 
-    public enum CompressionAlgorithm {
-        NONE,
-        ZSTD
-    }
-
     public enum ScheduleMode {
         INTERVAL,
         AFTER_AUTOSAVE,
@@ -31,8 +26,6 @@ public final class ConfigSpec {
     public static final ForgeConfigSpec.ConfigValue<String> BACKUP_DIRECTORY;
 
     public static final ForgeConfigSpec.EnumValue<HashAlgorithm> HASH_ALGORITHM;
-    public static final ForgeConfigSpec.EnumValue<CompressionAlgorithm> COMPRESSION_ALGORITHM;
-    public static final ForgeConfigSpec.IntValue COMPRESSION_LEVEL;
     public static final ForgeConfigSpec.IntValue MAX_STORE_SIZE_GB;
 
     public static final ForgeConfigSpec.EnumValue<ScheduleMode> SCHEDULE_MODE;
@@ -73,7 +66,7 @@ public final class ConfigSpec {
 
         BUILDER.pop();
 
-        BUILDER.comment("Content-addressed store: hash + compression").push("storage");
+        BUILDER.comment("Content-addressed store: hash").push("storage");
 
         HASH_ALGORITHM = BUILDER
                 .comment("Hash algorithm for chunk slot raw bytes.",
@@ -82,18 +75,6 @@ public final class ConfigSpec {
                          "SHA256: cryptographic, slower, useful when you must satisfy compliance / forensic requirements.",
                          "BLAKE3: future option (not implemented in MVP).")
                 .defineEnum("hashAlgorithm", HashAlgorithm.XXH128);
-
-        COMPRESSION_ALGORITHM = BUILDER
-                .comment("Compression for store entries.",
-                         "NONE (default, recommended for chunk path): chunk slots in .mca are already vanilla zlib",
-                         "  compressed. Wrapping with zstd is double compression for marginal gain and waste of CPU.",
-                         "ZSTD: useful for SavedData / level.dat which are uncompressed.",
-                         "MVP applies this setting uniformly; v0.2+ may split per-payload-type.")
-                .defineEnum("compressionAlgorithm", CompressionAlgorithm.NONE);
-
-        COMPRESSION_LEVEL = BUILDER
-                .comment("Compression level for ZSTD (1=fast, 22=max). Ignored when compressionAlgorithm=NONE.")
-                .defineInRange("compressionLevel", 0, 0, 22);
 
         MAX_STORE_SIZE_GB = BUILDER
                 .comment("Soft, one-shot startup trigger on total store size in GB -- NOT a real-time disk quota.",

@@ -16,8 +16,6 @@ public final class BetterBackupConfig {
     private static volatile String backupDirectory;
 
     private static volatile ConfigSpec.HashAlgorithm hashAlgorithm;
-    private static volatile ConfigSpec.CompressionAlgorithm compressionAlgorithm;
-    private static volatile int compressionLevel;
     private static volatile int maxStoreSizeGB;
 
     private static volatile ConfigSpec.ScheduleMode scheduleMode;
@@ -51,14 +49,6 @@ public final class BetterBackupConfig {
 
     public static ConfigSpec.HashAlgorithm hashAlgorithm() {
         return hashAlgorithm;
-    }
-
-    public static ConfigSpec.CompressionAlgorithm compressionAlgorithm() {
-        return compressionAlgorithm;
-    }
-
-    public static int compressionLevel() {
-        return compressionLevel;
     }
 
     public static int maxStoreSizeGB() {
@@ -141,8 +131,6 @@ public final class BetterBackupConfig {
         enabled = ConfigSpec.ENABLED.get();
         backupDirectory = ConfigSpec.BACKUP_DIRECTORY.get();
         hashAlgorithm = ConfigSpec.HASH_ALGORITHM.get();
-        compressionAlgorithm = ConfigSpec.COMPRESSION_ALGORITHM.get();
-        compressionLevel = ConfigSpec.COMPRESSION_LEVEL.get();
         maxStoreSizeGB = ConfigSpec.MAX_STORE_SIZE_GB.get();
         scheduleMode = ConfigSpec.SCHEDULE_MODE.get();
         intervalMinutes = ConfigSpec.INTERVAL_MINUTES.get();
