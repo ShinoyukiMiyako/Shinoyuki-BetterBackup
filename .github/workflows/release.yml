@@ -1,0 +1,179 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run: 仅构建 + 校验, 不创建 release (jar 作为 workflow artifact 下载)'
+        type: boolean
+        default: false
+      prerelease:
+        description: '预发布: 标记为 pre-release (测试版, 不作为 Latest 推给用户)'
+        type: boolean
+        default: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # BetterBackup 编译期 link BAS api 且从 sibling 仓库的本地 maven (mcmodsrepo) 解析 BAS 依赖
+      # (见 build.gradle 仓库块 + gradle.properties bas_version), 故发版必须先把 BAS 作为 sibling
+      # 目录检出并 publish 到本地 maven, 再构建本仓 —— 与 ci.yml 完全一致的两仓检出 + BAS publish 前置。
+      - name: Checkout BetterBackup
+        uses: actions/checkout@v4
+        with:
+          path: Shinoyuki-BetterBackup
+          # 需要完整 tag 历史用于 "tag 已存在" 守卫 (ci.yml 无发版守卫, 故用默认浅检出)。
+          fetch-depth: 0
+
+      # BAS 检出为 sibling 目录: build.gradle 用 file://${rootDir}/../Shinoyuki-BetterAutoSave/mcmodsrepo
+      # 解析 BAS 依赖, 相对路径要求二者同级。BAS 私有时需在此配 token (repo scope PAT)。
+      - name: Checkout BetterAutoSave (BAS, dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: ShinoyukiMiyako/Shinoyuki-BetterAutoSave
+          path: Shinoyuki-BetterAutoSave
+
+      - name: Set up JDK 17
+        # BB (forge 1.20.1) 与 BAS forge 模块 toolchain 均为 Java 17, 单 JDK 即可 (与 ci.yml 一致)。
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Read mod version from gradle.properties
+        id: version
+        working-directory: Shinoyuki-BetterBackup
+        run: |
+          VERSION=$(grep '^mod_version=' gradle.properties | cut -d= -f2-)
+          if [ -z "$VERSION" ]; then
+            echo "::error::mod_version not found in gradle.properties"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Detected mod_version: $VERSION"
+
+      - name: Verify tag and release do not exist yet
+        if: inputs.dry_run == false
+        working-directory: Shinoyuki-BetterBackup
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          # 守卫只校验本次发布的确切 tag: remote 已有孤 tag v0.1.0, 校验 v0.2.0 不受其影响而通过;
+          # 若忘记 bump (仍为 0.1.0) 则此处正确 fail。
+          if git rev-parse "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "::error::Tag $TAG already exists locally. Bump mod_version in gradle.properties before publishing."
+            exit 1
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::Release $TAG already exists on GitHub."
+            exit 1
+          fi
+
+      - name: Verify release notes and compose bilingual body
+        id: notes
+        working-directory: Shinoyuki-BetterBackup
+        run: |
+          ZH="release-notes/${{ steps.version.outputs.tag }}.md"
+          EN="release-notes/${{ steps.version.outputs.tag }}.en.md"
+          if [ ! -f "$ZH" ]; then
+            echo "::error::Release notes not found at $ZH. Create the file (matching the tag) before triggering."
+            exit 1
+          fi
+          # BB 无 Modrinth 项目, 英文发行说明无处投放, 故与中文一并拼进 GitHub Release 正文;
+          # 缺失则提前失败, 不让发版半途 (tag 已建) 才炸。
+          if [ ! -f "$EN" ]; then
+            echo "::error::English release notes not found at $EN (required to compose the bilingual release body)."
+            exit 1
+          fi
+          BODY="${RUNNER_TEMP}/release-body.md"
+          {
+            cat "$ZH"
+            printf '\n\n---\n\n'
+            cat "$EN"
+          } > "$BODY"
+          echo "body_path=$BODY" >> "$GITHUB_OUTPUT"
+
+      # BAS forge 模块 publish 到本地 mcmodsrepo (BB 依赖坐标
+      # com.shinoyuki.betterautosave:shinoyuki_betterautosave:<bas_version>)。
+      # -D...check.certs=false 规避 ForgeGradle 偶发的证书校验瞬态失败 (命令与 ci.yml 逐字一致)。
+      - name: Publish BAS to local maven
+        working-directory: Shinoyuki-BetterAutoSave
+        run: |
+          chmod +x gradlew
+          ./gradlew :forge:publish -Dnet.minecraftforge.gradle.check.certs=false --no-daemon --stacktrace
+
+      - name: Build Forge 1.20.1 mod jar (compile + 266 tests)
+        # 单模块工程, ./gradlew build 一并跑 jarJar (build.gradle tasks.build.dependsOn('jarJar'))
+        # 产出自包含 -all fat jar, 并执行全量测试 (含起子进程跑最终 -all jar 的进程级集成测试)。
+        # certs flag 与 ci.yml 逐字一致。
+        working-directory: Shinoyuki-BetterBackup
+        run: |
+          chmod +x gradlew
+          ./gradlew build -Dnet.minecraftforge.gradle.check.certs=false --no-daemon --stacktrace
+
+      - name: Verify jar artifact
+        id: jar
+        working-directory: Shinoyuki-BetterBackup
+        run: |
+          # 必须发自包含 -all fat jar: jarJar.enable() 把 OpenHFT (net.openhft.hashing.*) 平铺进顶层,
+          # 离线 CLI (java -jar) 的应用类加载器与 FML 模块层均可解析; 普通 thin jar (无 -all) 仅供
+          # 编译期消费, 绝不作为发布产物。
+          JAR="build/libs/shinoyuki_betterbackup-${{ steps.version.outputs.version }}-all.jar"
+          if [ ! -f "$JAR" ]; then
+            echo "::error::Expected fat jar not found: $JAR"
+            ls -la build/libs/ || true
+            exit 1
+          fi
+          # 输出 workspace 根相对路径供后续 uses: 步骤 (upload-artifact / softprops) 消费:
+          # 这些 action 的 cwd 固定在 workspace 根, 不受本 run 步的 working-directory 影响。
+          echo "path=Shinoyuki-BetterBackup/$JAR" >> "$GITHUB_OUTPUT"
+          echo "Built: $JAR ($(du -h "$JAR" | cut -f1))"
+
+      - name: Upload jar as workflow artifact (dry-run only)
+        if: inputs.dry_run == true
+        uses: actions/upload-artifact@v4
+        with:
+          name: shinoyuki_betterbackup-${{ steps.version.outputs.version }}
+          path: ${{ steps.jar.outputs.path }}
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: inputs.dry_run == false
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: BetterBackup ${{ steps.version.outputs.tag }} — Forge 1.20.1 内容寻址增量备份
+          # 正文为中英双语拼接体 (compose 步骤产出), BB 无 Modrinth 故英文说明并入此处。
+          body_path: ${{ steps.notes.outputs.body_path }}
+          files: ${{ steps.jar.outputs.path }}
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: ${{ inputs.prerelease }}
+
+      # BB 尚未创建 Modrinth 项目, 未配 MODRINTH_TOKEN secret 时本步自动跳过 (与 Slipstream 同款
+      # token 缺失即跳过写法, 保留以便日后上架 Modrinth 时零改动启用)。发的是同一自包含 -all fat jar,
+      # changelog 用英文 .en.md; version-type 跟随 prerelease 勾选: 预发布 -> beta, 正式 -> release。
+      - name: Publish to Modrinth
+        if: inputs.dry_run == false && env.MODRINTH_TOKEN != ''
+        uses: Kir-Antipov/mc-publish@v3
+        env:
+          MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
+        with:
+          modrinth-id: shinoyuki-betterbackup
+          modrinth-token: ${{ secrets.MODRINTH_TOKEN }}
+          files: ${{ steps.jar.outputs.path }}
+          name: BetterBackup ${{ steps.version.outputs.tag }}
+          version: ${{ steps.version.outputs.version }}
+          version-type: ${{ inputs.prerelease && 'beta' || 'release' }}
+          # Modrinth 面向国际用户, changelog 用英文 .en.md (GitHub release 正文用中英双语拼接)。
+          changelog-file: Shinoyuki-BetterBackup/release-notes/${{ steps.version.outputs.tag }}.en.md
+          loaders: forge
+          game-versions: 1.20.1
