@@ -26,7 +26,7 @@ jobs:
       - name: Checkout BetterAutoSave (BAS, dependency)
         uses: actions/checkout@v4
         with:
-          repository: xiaoxiao-cvs/Shinoyuki-BetterAutoSave
+          repository: ShinoyukiMiyako/Shinoyuki-BetterAutoSave
           path: Shinoyuki-BetterAutoSave
 
       - name: Set up JDK 17
@@ -53,7 +53,7 @@ jobs:
           chmod +x gradlew
           ./gradlew :forge:publish -Dnet.minecraftforge.gradle.check.certs=false --no-daemon --stacktrace
 
-      - name: Build BetterBackup (compile + 265 tests)
+      - name: Build BetterBackup (compile + 266 tests)
         working-directory: Shinoyuki-BetterBackup
         run: |
           chmod +x gradlew
