@@ -47,11 +47,13 @@ import net.minecraftforge.event.server.ServerStoppingEvent;
 import net.minecraftforge.eventbus.api.EventPriority;
 import net.minecraftforge.eventbus.api.IEventBus;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
+import net.minecraftforge.fml.IExtensionPoint;
 import net.minecraftforge.fml.ModLoadingContext;
 import net.minecraftforge.fml.common.Mod;
 import net.minecraftforge.fml.config.ModConfig;
 import net.minecraftforge.fml.javafmlmod.FMLJavaModLoadingContext;
 import net.minecraftforge.fml.loading.FMLPaths;
+import net.minecraftforge.network.NetworkConstants;
 import org.slf4j.Logger;
 
 import java.io.IOException;
@@ -140,7 +142,14 @@ public final class BetterBackupMod {
             throw new IllegalStateException("Cannot create config directory " + configRoot, e);
         }
         String configRelative = SERIES_CONFIG_DIR + "/" + MOD_ID + "/common.toml";
-        ModLoadingContext.get().registerConfig(ModConfig.Type.COMMON, ConfigSpec.SPEC, configRelative);
+        ModLoadingContext modLoadingContext = ModLoadingContext.get();
+        modLoadingContext.registerConfig(ModConfig.Type.COMMON, ConfigSpec.SPEC, configRelative);
+
+        // 声明服务端专用: 客户端 (含 vanilla) 无需安装即可连接, 服务器列表 ping 不标红、加入不被要求安装。
+        modLoadingContext.registerExtensionPoint(IExtensionPoint.DisplayTest.class,
+                () -> new IExtensionPoint.DisplayTest(
+                        () -> NetworkConstants.IGNORESERVERONLY,
+                        (remoteVersion, isFromServer) -> true));
 
         MinecraftForge.EVENT_BUS.register(this);
     }
