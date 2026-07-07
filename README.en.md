@@ -2,7 +2,7 @@
 
 [简体中文](README.md) | **English**
 
-An **incremental backup** mod for Minecraft 1.20.1 Forge servers. From the second backup onward it only processes changed chunks, cutting the footprint of 84 backups from the ~16.8 TB a vanilla approach would need down to roughly 150-300 GB (98% saved). Backups run on background worker threads with zero main-thread cost. It integrates deeply with [Shinoyuki-BetterAutoSave](https://github.com/xiaoxiao-cvs/Shinoyuki-BetterAutoSave) (BAS).
+An **incremental backup** mod for Minecraft 1.20.1 Forge servers. From the second backup onward it only processes changed chunks, cutting the footprint of 84 backups from the ~16.8 TB a vanilla approach would need down to roughly 150-300 GB (98% saved). Backups run on background worker threads with zero main-thread cost. It integrates deeply with [Shinoyuki-BetterAutoSave](https://github.com/ShinoyukiMiyako/Shinoyuki-BetterAutoSave) (BAS).
 
 ## Contents
 
@@ -47,9 +47,9 @@ Requirements:
 - Minecraft 1.20.1
 - Minecraft Forge 47.3.22+
 - Java 17 (Eclipse Temurin)
-- **Required**: [Shinoyuki-BetterAutoSave](https://github.com/xiaoxiao-cvs/Shinoyuki-BetterAutoSave) v0.16.2+ (this lower bound matches the dependency versionRange in mods.toml; below it Forge refuses to load BetterBackup). BetterBackup receives chunk-save events through the BAS Listener API; the online single-chunk restore (`restore-chunk-live`) additionally depends on the `SaveCoordination` / `ChunkRestoreOutcome` / `ChunkRestoreResult` API that only exists in BAS v0.16.2+, so on an older BAS the interfaces that feature needs are absent.
+- **Required**: [Shinoyuki-BetterAutoSave](https://github.com/ShinoyukiMiyako/Shinoyuki-BetterAutoSave) v0.16.2+ (this lower bound matches the dependency versionRange in mods.toml; below it Forge refuses to load BetterBackup). BetterBackup receives chunk-save events through the BAS Listener API; the online single-chunk restore (`restore-chunk-live`) additionally depends on the `SaveCoordination` / `ChunkRestoreOutcome` / `ChunkRestoreResult` API that only exists in BAS v0.16.2+, so on an older BAS the interfaces that feature needs are absent.
 
-Drop `shinoyuki_betterbackup-0.1.0-all.jar` (the one with the `-all` suffix, which bundles the hashing library) into `mods/`; after startup the config file is generated at `config/Shinoyuki-Optimize/shinoyuki_betterbackup/common.toml`.
+Drop `shinoyuki_betterbackup-0.2.0-all.jar` (the one with the `-all` suffix, which bundles the hashing library) into `mods/`; after startup the config file is generated at `config/Shinoyuki-Optimize/shinoyuki_betterbackup/common.toml`.
 
 > Do not install the jar without the `-all` suffix; it lacks the hashing library and throws `ClassNotFoundException` on startup.
 
@@ -124,21 +124,21 @@ A failed restore (missing backup store data, etc.) logs an ERROR but **does not 
 The mod jar doubles as a command-line tool (no Minecraft / Forge needed, a bare JRE 17 is enough), so you can self-rescue from a backup even when the server is down:
 
 ```bash
-java -jar shinoyuki_betterbackup-0.1.0-all.jar list    --store <backup dir>
-java -jar shinoyuki_betterbackup-0.1.0-all.jar info    --store <backup dir> --id <snapshot id>
-java -jar shinoyuki_betterbackup-0.1.0-all.jar verify  --store <backup dir> [--id <snapshot id>]
-java -jar shinoyuki_betterbackup-0.1.0-all.jar restore --store <backup dir> --id <snapshot id> --world <world dir>
-java -jar shinoyuki_betterbackup-0.1.0-all.jar fsck    --store <backup dir> [--rebuild-index]
+java -jar shinoyuki_betterbackup-0.2.0-all.jar list    --store <backup dir>
+java -jar shinoyuki_betterbackup-0.2.0-all.jar info    --store <backup dir> --id <snapshot id>
+java -jar shinoyuki_betterbackup-0.2.0-all.jar verify  --store <backup dir> [--id <snapshot id>]
+java -jar shinoyuki_betterbackup-0.2.0-all.jar restore --store <backup dir> --id <snapshot id> --world <world dir>
+java -jar shinoyuki_betterbackup-0.2.0-all.jar fsck    --store <backup dir> [--rebuild-index]
 ```
 
 `restore` defaults to restoring the entire snapshot; it also supports **partial restore** of terrain only (everything else is left untouched):
 
 ```bash
 # Single chunk (explicitly named; errors if it was never captured)
-java -jar shinoyuki_betterbackup-0.1.0-all.jar restore --store <backup dir> --id <snapshot id> --world <world dir> \
+java -jar shinoyuki_betterbackup-0.2.0-all.jar restore --store <backup dir> --id <snapshot id> --world <world dir> \
     --dim <dimension id> --chunk <x>,<z>
 # Rectangular area (centered on center, side length 2r+1; uncaptured chunks in the area are skipped)
-java -jar shinoyuki_betterbackup-0.1.0-all.jar restore --store <backup dir> --id <snapshot id> --world <world dir> \
+java -jar shinoyuki_betterbackup-0.2.0-all.jar restore --store <backup dir> --id <snapshot id> --world <world dir> \
     --dim <dimension id> --center <x>,<z> --radius <r>
 ```
 
@@ -194,8 +194,8 @@ cd Shinoyuki-BetterBackup
 ./gradlew build
 
 # Artifacts in build/libs/:
-#   shinoyuki_betterbackup-0.1.0-all.jar    <- install this one
-#   shinoyuki_betterbackup-0.1.0.jar         <- lacks the hashing library, do not use
+#   shinoyuki_betterbackup-0.2.0-all.jar    <- install this one
+#   shinoyuki_betterbackup-0.2.0.jar         <- lacks the hashing library, do not use
 ```
 
 Tests: `./gradlew test` (store / snapshot / GC / torn read / baseline / player data / CLI / degraded re-capture, etc. -- 266 unit tests in total).

@@ -1,6 +1,6 @@
 # Shinoyuki-BetterBackup
 
-Minecraft 1.20.1 Forge 服务端**增量备份** mod。第二次备份起只处理变化的 chunk，84 份备份占用从 vanilla 方案的 16.8 TB 降到约 150-300 GB（98% 节省）。备份在后台 worker 线程跑，主线程零开销。跟 [Shinoyuki-BetterAutoSave](https://github.com/xiaoxiao-cvs/Shinoyuki-BetterAutoSave) (BAS) 深度集成。
+Minecraft 1.20.1 Forge 服务端**增量备份** mod。第二次备份起只处理变化的 chunk，84 份备份占用从 vanilla 方案的 16.8 TB 降到约 150-300 GB（98% 节省）。备份在后台 worker 线程跑，主线程零开销。跟 [Shinoyuki-BetterAutoSave](https://github.com/ShinoyukiMiyako/Shinoyuki-BetterAutoSave) (BAS) 深度集成。
 
 ## 目录
 
@@ -45,9 +45,9 @@ BetterBackup 的解法：
 - Minecraft 1.20.1
 - Minecraft Forge 47.3.22+
 - Java 17 (Eclipse Temurin)
-- **必装**：[Shinoyuki-BetterAutoSave](https://github.com/xiaoxiao-cvs/Shinoyuki-BetterAutoSave) v0.16.2+（版本下限与 mods.toml 的依赖 versionRange 一致，低于此版本 Forge 会拒绝加载 BetterBackup）。BetterBackup 通过 BAS Listener API 接收 chunk save 事件；在线单 chunk 回退（`restore-chunk-live`）还依赖 BAS v0.16.2 才具备的 `SaveCoordination` / `ChunkRestoreOutcome` / `ChunkRestoreResult` API，装更低版本 BAS 时该功能所需接口不存在
+- **必装**：[Shinoyuki-BetterAutoSave](https://github.com/ShinoyukiMiyako/Shinoyuki-BetterAutoSave) v0.16.2+（版本下限与 mods.toml 的依赖 versionRange 一致，低于此版本 Forge 会拒绝加载 BetterBackup）。BetterBackup 通过 BAS Listener API 接收 chunk save 事件；在线单 chunk 回退（`restore-chunk-live`）还依赖 BAS v0.16.2 才具备的 `SaveCoordination` / `ChunkRestoreOutcome` / `ChunkRestoreResult` API，装更低版本 BAS 时该功能所需接口不存在
 
-把 `shinoyuki_betterbackup-0.1.0-all.jar`（带 `-all` 后缀的，包内嵌了哈希库）放进 `mods/`，启动后配置文件生成在 `config/Shinoyuki-Optimize/shinoyuki_betterbackup/common.toml`。
+把 `shinoyuki_betterbackup-0.2.0-all.jar`（带 `-all` 后缀的，包内嵌了哈希库）放进 `mods/`，启动后配置文件生成在 `config/Shinoyuki-Optimize/shinoyuki_betterbackup/common.toml`。
 
 > 不要装不带 `-all` 后缀的 jar，那个缺哈希库会启动报 `ClassNotFoundException`。
 
@@ -122,21 +122,21 @@ BetterBackup 的解法：
 mod jar 可以直接当命令行工具跑（不需要 Minecraft / Forge，裸 JRE 17 即可），服务端瘫痪时照样能从备份自救：
 
 ```bash
-java -jar shinoyuki_betterbackup-0.1.0-all.jar list    --store <备份目录>
-java -jar shinoyuki_betterbackup-0.1.0-all.jar info    --store <备份目录> --id <快照ID>
-java -jar shinoyuki_betterbackup-0.1.0-all.jar verify  --store <备份目录> [--id <快照ID>]
-java -jar shinoyuki_betterbackup-0.1.0-all.jar restore --store <备份目录> --id <快照ID> --world <world目录>
-java -jar shinoyuki_betterbackup-0.1.0-all.jar fsck    --store <备份目录> [--rebuild-index]
+java -jar shinoyuki_betterbackup-0.2.0-all.jar list    --store <备份目录>
+java -jar shinoyuki_betterbackup-0.2.0-all.jar info    --store <备份目录> --id <快照ID>
+java -jar shinoyuki_betterbackup-0.2.0-all.jar verify  --store <备份目录> [--id <快照ID>]
+java -jar shinoyuki_betterbackup-0.2.0-all.jar restore --store <备份目录> --id <快照ID> --world <world目录>
+java -jar shinoyuki_betterbackup-0.2.0-all.jar fsck    --store <备份目录> [--rebuild-index]
 ```
 
 `restore` 默认整份快照全量回退；也支持只回地形的**部分回退**（其余数据不动）：
 
 ```bash
 # 单 chunk（显式点名，未采集会报错）
-java -jar shinoyuki_betterbackup-0.1.0-all.jar restore --store <备份目录> --id <快照ID> --world <world目录> \
+java -jar shinoyuki_betterbackup-0.2.0-all.jar restore --store <备份目录> --id <快照ID> --world <world目录> \
     --dim <维度ID> --chunk <x>,<z>
 # 矩形区域（以 center 为中心，边长 2r+1，区域内未采集的 chunk 自动跳过）
-java -jar shinoyuki_betterbackup-0.1.0-all.jar restore --store <备份目录> --id <快照ID> --world <world目录> \
+java -jar shinoyuki_betterbackup-0.2.0-all.jar restore --store <备份目录> --id <快照ID> --world <world目录> \
     --dim <维度ID> --center <x>,<z> --radius <r>
 ```
 
@@ -192,8 +192,8 @@ cd Shinoyuki-BetterBackup
 ./gradlew build
 
 # 产物在 build/libs/:
-#   shinoyuki_betterbackup-0.1.0-all.jar    <- 给用户装这个
-#   shinoyuki_betterbackup-0.1.0.jar         <- 缺哈希库, 别用
+#   shinoyuki_betterbackup-0.2.0-all.jar    <- 给用户装这个
+#   shinoyuki_betterbackup-0.2.0.jar         <- 缺哈希库, 别用
 ```
 
 测试：`./gradlew test`（store / 快照 / GC / 撕裂读 / baseline / 玩家数据 / CLI / 降级补采等共 266 个单元测试）。
