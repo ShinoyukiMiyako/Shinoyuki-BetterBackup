@@ -340,6 +340,43 @@ class PackStoreTest {
         reopened.close();
     }
 
+    @Test
+    void operations_before_initialize_throw_and_leave_existing_store_intact(@TempDir Path root) throws IOException {
+        // 既有 store: 一个已初始化实例写入对象 X 后正常关闭.
+        byte[] x = randomBytes(500, 77);
+        Hash hx = hashFn.hash(x);
+        PackStore first = new PackStore(root, HASH_LEN, PackStore.DEFAULT_TARGET_PACK_SIZE_BYTES);
+        first.initialize();
+        assertTrue(first.put(hx, x));
+        first.flushAndSync();
+        first.close();
+        long packBytesBefore = sumPackFileSizes(root);
+
+        // 未初始化实例: 一切对象读写必须响亮拒绝. 判定标准: 把 requireInitialized 硬闸删掉,
+        // 下面的 put 会打开既有 0000000000.pack 从偏移 0 覆盖写 —— assertThrows 必挂且
+        // 后续完整性断言也必挂.
+        byte[] y = randomBytes(300, 88);
+        Hash hy = hashFn.hash(y);
+        PackStore uninitialized = new PackStore(root, HASH_LEN, PackStore.DEFAULT_TARGET_PACK_SIZE_BYTES);
+        assertThrows(IllegalStateException.class, () -> uninitialized.put(hy, y));
+        assertThrows(IllegalStateException.class, () -> uninitialized.get(hx));
+        assertThrows(IllegalStateException.class, () -> uninitialized.has(hx));
+        assertThrows(IllegalStateException.class, uninitialized::flushAndSync);
+        assertThrows(IllegalStateException.class, () -> uninitialized.compact(Set.of(), 0.0));
+        assertThrows(IllegalStateException.class, () -> uninitialized.forEachObject((h, d) -> { }));
+
+        // 未初始化 close 不得 checkpoint: 否则空索引配上匹配指纹, 重开后 X 不可达.
+        uninitialized.close();
+
+        assertEquals(packBytesBefore, sumPackFileSizes(root),
+                "uninitialized instance must not have touched any pack file bytes");
+        PackStore reopened = new PackStore(root, HASH_LEN, PackStore.DEFAULT_TARGET_PACK_SIZE_BYTES);
+        reopened.initialize();
+        assertArrayEquals(x, reopened.get(hx), "X must survive byte-exact after the uninitialized episode");
+        assertEquals(1, reopened.objectCount());
+        reopened.close();
+    }
+
     /**
      * 委托真 FileChannel, 但累计写满 failAtByte 字节后, 在下一次 write 里先写完剩余额度再抛
      * IOException, 模拟磁盘满 / 网络盘瞬断的写中途失败 (部分写). 失败一次后不再拦截.

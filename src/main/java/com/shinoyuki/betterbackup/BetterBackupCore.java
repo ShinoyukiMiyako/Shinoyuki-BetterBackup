@@ -39,6 +39,9 @@ public final class BetterBackupCore {
     private static volatile PrometheusExporter EXPORTER;
     private static volatile BaselineProgress BASELINE_PROGRESS;
     private static volatile PipelineDegradedHandler PIPELINE_DEGRADED_HANDLER;
+    // store 后台初始化 (issue #3 异步化) 完成且 worker/scheduler 已启动后才置 true.
+    // isInstalled() 只表示 "已接线, 关停需要拆"; isReady() 才表示 "store 可安全读写".
+    private static volatile boolean STORE_READY;
 
     public static void install(ChunkStore store,
                                CurrentSnapshotState snapshotState,
@@ -67,6 +70,7 @@ public final class BetterBackupCore {
     }
 
     public static void uninstall() {
+        STORE_READY = false;
         STORE = null;
         SNAPSHOT_STATE = null;
         CONTEXT = null;
@@ -97,6 +101,15 @@ public final class BetterBackupCore {
 
     public static boolean isInstalled() {
         return STORE != null;
+    }
+
+    /** store 后台初始化完成、worker/scheduler 已启动. 触碰 store 对象数据的入口据此门控. */
+    public static boolean isReady() {
+        return STORE != null && STORE_READY;
+    }
+
+    public static void setStoreReady(boolean ready) {
+        STORE_READY = ready;
     }
 
     public static ChunkStore store() {

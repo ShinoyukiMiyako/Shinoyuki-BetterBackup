@@ -76,6 +76,12 @@ public final class PackStore {
     private FileChannel writeChannel;
     private long writeOffset;
 
+    // 硬闸: initialize()/load() 完成前拒绝一切对象读写. 未初始化时写状态停留在 nextPackId=0
+    // 的假象上, 此时 put 会打开既有 store 的 0000000000.pack 从偏移 0 覆盖写, 静默损坏历史
+    // 备份数据 —— store 初始化已移到后台线程 (issue #3), 任何漏过上层就绪门控的调用都必须在
+    // 这里响亮失败, 而不是损坏数据.
+    private volatile boolean initialized;
+
     // 在写 pack 的通道工厂. 生产用真 FileChannel.open; 测试可注入模拟写中途 IO 失败的假通道,
     // 验证失败后 put 能恢复 position==writeOffset 不变量.
     private volatile WriteChannelOpener writeChannelOpener =
@@ -140,6 +146,11 @@ public final class PackStore {
      * 不续写历史 pack (简化 + 避免重开已封口 pack 的边界问题; 碎 pack 由后续压实合并).
      */
     public synchronized void load() throws IOException {
+        loadInternal();
+        initialized = true;
+    }
+
+    private void loadInternal() throws IOException {
         index.clear();
         nextPackId = 0;
         currentWritePackId = -1;
@@ -183,6 +194,7 @@ public final class PackStore {
      * <p>仅顺序追加, 不 fsync —— 持久化由 {@link #flushAndSync} 屏障负责.
      */
     public boolean put(Hash hash, byte[] data) throws IOException {
+        requireInitialized();
         if (hash.length() != hashLength) {
             throw new IllegalArgumentException("hash length " + hash.length()
                     + " != store hashLength " + hashLength);
@@ -224,11 +236,13 @@ public final class PackStore {
     }
 
     public boolean has(Hash hash) {
+        requireInitialized();
         return index.contains(hash);
     }
 
     /** 读出对象原始字节. 不在 store 抛 {@link NoSuchFileException} (与 ChunkStore.get 缺失语义一致). */
     public byte[] get(Hash hash) throws IOException {
+        requireInitialized();
         storeLock.readLock().lock();
         try {
             PackLocation loc = index.get(hash);
@@ -246,6 +260,7 @@ public final class PackStore {
 
     /** fsync 提交屏障: force 当前在写 pack. 封口的 pack 在换页时已各自 force, 无需重做. */
     public void flushAndSync() throws IOException {
+        requireInitialized();
         storeLock.readLock().lock();
         try {
             synchronized (writeLock) {
@@ -288,6 +303,7 @@ public final class PackStore {
      * 按 pack 顺序读, 机械盘友好. 持读锁防压实并发改 pack.
      */
     public void forEachObject(ObjectVisitor visitor) throws IOException {
+        requireInitialized();
         storeLock.readLock().lock();
         try {
             for (int packId : listPackIds()) {
@@ -316,8 +332,13 @@ public final class PackStore {
                 writeChannel.close();
                 writeChannel = null;
             }
-            // checkpoint 索引: pack 文件此刻已最终化, 打上当前指纹, 下次 load 匹配即 mmap 命中免重扫.
-            index.checkpoint(packSetFingerprint(listPackIds()));
+            if (initialized) {
+                // checkpoint 索引: pack 文件此刻已最终化, 打上当前指纹, 下次 load 匹配即 mmap 命中免重扫.
+                // 未初始化的 store 绝不 checkpoint: 空索引 + 匹配指纹会让下次 load 误判 "store 为空",
+                // 既有对象全部不可达.
+                index.checkpoint(packSetFingerprint(listPackIds()));
+            }
+            initialized = false;
             index.close();
             for (FileChannel ch : readChannels.values()) {
                 try {
@@ -358,6 +379,7 @@ public final class PackStore {
      */
     public CompactResult compact(Set<Hash> live, double deadRatioThreshold, boolean sealActiveWritePack)
             throws IOException {
+        requireInitialized();
         storeLock.writeLock().lock();
         try {
             if (sealActiveWritePack && writeChannel != null) {
@@ -497,6 +519,13 @@ public final class PackStore {
     }
 
     // ---- internals ----
+
+    private void requireInitialized() {
+        if (!initialized) {
+            throw new IllegalStateException("pack store not initialized: initialize()/load() has not "
+                    + "completed; refusing object access to avoid overwriting existing pack files");
+        }
+    }
 
     private void ensureWriter() throws IOException {
         if (writeChannel != null && writeOffset < targetPackSizeBytes) {

@@ -124,6 +124,10 @@ public final class BetterBackupMod {
     // maxStoreSizeGB 自检 (StoreSizeGuard.gcAll) 的关服 join 句柄. gcAll 持 store 写锁, 关服
     // 前先 join 它让写锁尽量释放, 免 final snapshot 撞其写锁久等 (gcAll 不可中断, 只能 join).
     private static volatile Thread activeStoreSizeCheckThread;
+    // store 后台初始化 (issue #3 异步化) 的握手状态机. 关服据 beginStop 返回的状态决定走完整
+    // 拆线 (含 final snapshot) 还是未就绪拆线 (跳过 final snapshot + 落 degraded-session 补采
+    // 标志). init 线程是 daemon 且不被 join —— 等它扫完正是 issue #3 要消灭的启动阻塞.
+    private static volatile StoreInitCoordinator activeStoreInitCoordinator;
 
     public BetterBackupMod() {
         // 游戏内: 把 BackupLog 门面桥回 slf4j, 让已迁到门面的 CLI 可达类 (ChunkStore 等)
@@ -245,8 +249,8 @@ public final class BetterBackupMod {
         LOGGER.info("[BetterBackup] starting for {}", event.getServer().name());
 
         try {
-            // orphan .tmp 后台清扫的时间闸 (见下方 verifyOnStartup 块): 此刻 worker 尚未启动,
-            // 无本次运行的在途 .tmp, 故 cutoff=此刻只清上次运行崩溃残留的孤儿, 不误删活跃 worker 的在途 .tmp。
+            // orphan .tmp 后台清扫的时间闸 (dispatchTmpCleanup): cutoff=本方法进入时刻, 只清
+            // 上次运行崩溃残留的孤儿; 本次 worker 的在途 .tmp mtime 必晚于它, 并发无 race。
             long startMillis = System.currentTimeMillis();
             Path worldRoot = event.getServer().getWorldPath(LevelResource.ROOT);
             Path storeRoot = resolveStoreRoot(BetterBackupConfig.backupDirectory());
@@ -261,33 +265,10 @@ public final class BetterBackupMod {
                         storeRoot, worldRoot);
             }
 
+            // phase 1 (主线程): 只做廉价接线. store 构造不触盘; 真正的 initialize() (索引失配时
+            // O(pack 集) 重扫, issue #3 的 120s Watchdog 阻塞点) 甩到下方 BetterBackup-Store-Init
+            // 后台线程, 完成后经 StoreInitCoordinator 与关停互斥地启动 worker/scheduler (arm).
             ChunkStore store = new ChunkStore(storeRoot);
-            store.initialize();
-
-            // 启动时清 kill -9 留下的孤儿 .tmp (DESIGN §8 store 文件写一半断电场景).
-            // 实际 atomic put (tmp + fsync + rename) 已经防止半写文件被引用, 但
-            // 进程被强杀时 tmp 文件可能残留在磁盘, 这里启动时一次性清掉避免占空间.
-            if (BetterBackupConfig.verifyOnStartup()) {
-                // orphan .tmp 全树扫描是 O(store 文件数), store 大时 (百万级 chunk) 可达数十秒。
-                // 绝不能在 server 主线程同步跑: ServerStartingEvent 在主线程同步 dispatch, 阻塞它
-                // 就推迟 ServerStarted / 登录门, 玩家被挡在 "server is still starting" 数十秒。改后台
-                // daemon 线程跑 (与下方 baseline 扫描同款)。cutoff=startMillis 只清上次运行的孤儿,
-                // 不碰本次 worker 在途 .tmp, 故可与活跃 worker 并发无 race。失败仅 warn (清扫不影响备份正确性)。
-                final long cleanupCutoff = startMillis;
-                Thread cleanupThread = new Thread(() -> {
-                    try {
-                        int cleaned = store.cleanupOrphanTmpFiles(cleanupCutoff);
-                        if (cleaned > 0) {
-                            LOGGER.warn("[BetterBackup] cleaned {} orphan .tmp files from store (background)", cleaned);
-                        }
-                    } catch (IOException e) {
-                        LOGGER.warn("[BetterBackup] orphan .tmp cleanup failed (non-fatal, retries next start)", e);
-                    }
-                }, "BetterBackup-Tmp-Cleanup");
-                cleanupThread.setDaemon(true);
-                cleanupThread.start();
-                LOGGER.info("[BetterBackup] orphan .tmp cleanup dispatched to background");
-            }
 
             CurrentSnapshotState snapshotState = new CurrentSnapshotState();
             WorldPaths paths = new WorldPaths(worldRoot);
@@ -295,21 +276,17 @@ public final class BetterBackupMod {
             BetterBackupMetrics metrics = new BetterBackupMetrics();
             Set<Hash> writtenThisWindow = ConcurrentHashMap.newKeySet();
 
-            // maxStoreSizeGB 软阈值自检: store 体积超阈值则先 retention 淘汰 (删超期 manifest) 再
-            // full GC 回收死对象. 与 .tmp 清扫同款后台 daemon 线程——算体积要 walk 整个 store, 大 store
-            // (百万对象 + 未排空旧树) 可达数十秒, 绝不能在 server 主线程同步跑, 否则推迟 ServerStarted /
-            // 登录门. 失败仅 warn 不中止启动 (自检不影响备份正确性). snapshotsDir 与 SnapshotCreator /
-            // StoreGc 用的同为 storeRoot/snapshots. 派发在 snapshotState + writtenThisWindow 创建之后:
-            // 自检的 gcAll 求值在途保护集 (二者并集), 排除启动期 worker / baseline 已 put 但未进 manifest
-            // 的对象, 不封口在写 pack —— 否则会物理删掉这些对象致下份快照悬空引用.
+            // maxStoreSizeGB 软阈值自检参数. 自检的 gcAll 求值在途保护集 (pendingHashes ∪
+            // writtenThisWindow), 排除启动期 worker / baseline 已 put 但未进 manifest 的对象,
+            // 不封口在写 pack —— 否则会物理删掉这些对象致下份快照悬空引用. 派发本身在 arm 阶段
+            // (store 就绪后), 算体积要 walk 整个 store, 未初始化时跑既无意义也撞硬闸.
             long maxStoreBytes = (long) BetterBackupConfig.maxStoreSizeGB() * 1024 * 1024 * 1024;
             Path snapshotsDir = storeRoot.resolve("snapshots");
-            dispatchStoreSizeCheck(store, snapshotsDir, worldRoot, maxStoreBytes,
-                    () -> {
-                        Set<Hash> protect = new HashSet<>(snapshotState.pendingHashes());
-                        protect.addAll(writtenThisWindow);
-                        return protect;
-                    });
+            Supplier<Set<Hash>> inFlightProtect = () -> {
+                Set<Hash> protect = new HashSet<>(snapshotState.pendingHashes());
+                protect.addAll(writtenThisWindow);
+                return protect;
+            };
 
             // baseline 进度先于 creator 创建: creator 在每份 manifest 写盘成功后晋升
             // scanned->committed 并据 baselineProgress.isComplete() 盖 baselineComplete 戳.
@@ -338,7 +315,9 @@ public final class BetterBackupMod {
                 thread.setDaemon(false);
                 workers.add(worker);
                 workerThreads.add(thread);
-                thread.start();
+                // 不在此启动: worker 消费即 store.put, 必须等后台 initialize() 完成 (arm 阶段).
+                // 在那之前 bridge 入队的 task 安静堆在有界 queue 里, 满则 bridge 降级丢弃 + WARN
+                // (与稳态压实堵塞同语义), 丢掉的 chunk 下次存盘再 fire.
             }
 
             BackupListenerBridge bridge = new BackupListenerBridge(queue);
@@ -350,8 +329,8 @@ public final class BetterBackupMod {
             SnapshotCreator creator = new SnapshotCreator(store, snapshotState, paths, hashFunction,
                     storeRoot, () -> overworldGameTime(server), writtenThisWindow, metrics,
                     baselineProgress, baselineScanFinished::get);
+            // scheduler 不在此启动: 定时快照会 store.put/flushAndSync, 等 arm 阶段.
             SnapshotScheduler scheduler = createScheduler();
-            scheduler.start(creator);
 
             // BAS 降级感知: 注册 PipelineStateListener. BAS 管线降级时暂停 scheduler +
             // 标后续快照 incomplete + 持久化 degraded-session 标志供下次启动补采.
@@ -367,15 +346,6 @@ public final class BetterBackupMod {
             BetterBackupCore.install(store, snapshotState, context, queue, workers, workerThreads,
                     bridge, creator, scheduler, diagnosticLogger, metrics, baselineProgress);
 
-            startBaselineScan(store, snapshotState, paths, hashFunction, writtenThisWindow, baselineProgress,
-                    creator, baselineScanFinished);
-
-            // 上一次运行经历过 BAS 降级时, 补采降级窗口内变更的 chunk. 在 baseline 之后跑:
-            // 二者都把 chunk 登记进 CurrentSnapshotState 等下次快照 drain, 互不冲突 (state
-            // 已采的 chunk 双方都按 contains 跳过).
-            runDegradedRescanIfNeeded(store, snapshotState, paths, hashFunction, writtenThisWindow,
-                    storeRoot, creator);
-
             if (BetterBackupConfig.prometheusEnabled()) {
                 String bind = BetterBackupConfig.prometheusBindAddress();
                 int port = BetterBackupConfig.prometheusPort();
@@ -389,6 +359,38 @@ public final class BetterBackupMod {
                 }
             }
 
+            // phase 2 (arm): 全部依赖 store 已 initialize 的组件在此启动, 由 init 线程在
+            // StoreInitCoordinator 锁内执行, 与关停拆线互斥. worker 最先启动以尽快排空
+            // init 窗口内 bridge 攒下的 queue 积压.
+            StoreInitCoordinator coordinator = new StoreInitCoordinator();
+            final long cleanupCutoff = startMillis;
+            Runnable armPipeline = () -> {
+                for (Thread thread : workerThreads) {
+                    thread.start();
+                }
+                if (BetterBackupConfig.verifyOnStartup()) {
+                    dispatchTmpCleanup(store, cleanupCutoff);
+                }
+                dispatchStoreSizeCheck(store, snapshotsDir, worldRoot, maxStoreBytes, inFlightProtect);
+                scheduler.start(creator);
+                startBaselineScan(store, snapshotState, paths, hashFunction, writtenThisWindow, baselineProgress,
+                        creator, baselineScanFinished);
+                // 上一次运行经历过 BAS 降级时, 补采降级窗口内变更的 chunk. 在 baseline 之后跑:
+                // 二者都把 chunk 登记进 CurrentSnapshotState 等下次快照 drain, 互不冲突 (state
+                // 已采的 chunk 双方都按 contains 跳过).
+                runDegradedRescanIfNeeded(store, snapshotState, paths, hashFunction, writtenThisWindow,
+                        storeRoot, creator);
+                BetterBackupCore.setStoreReady(true);
+            };
+            Runnable failureTeardown = () ->
+                    teardownAfterInitFailure(bridge, degradedHandler, diagnosticLogger, store);
+            activeStoreInitCoordinator = coordinator;
+            Thread initThread = new Thread(
+                    () -> runStoreInit(coordinator, store, armPipeline, failureTeardown),
+                    "BetterBackup-Store-Init");
+            initThread.setDaemon(true);
+            initThread.start();
+
             LOGGER.info("[BetterBackup]   |- worldRoot: {}", worldRoot);
             LOGGER.info("[BetterBackup]   |- storeRoot: {}", storeRoot);
             LOGGER.info("[BetterBackup]   |- hash: {}", hashFunction.name());
@@ -397,10 +399,103 @@ public final class BetterBackupMod {
                     BetterBackupConfig.scheduleMode(),
                     BetterBackupConfig.intervalMinutes());
             LOGGER.info("[BetterBackup]   `- config: {}/{}/common.toml", SERIES_CONFIG_DIR, MOD_ID);
-            LOGGER.info("[BetterBackup] pipeline installed (BAS Listener -> BackupWorker queue + scheduler)");
+            LOGGER.info("[BetterBackup] wiring complete; store initializing in background "
+                    + "(listener events buffer in queue, pipeline arms when init finishes)");
         } catch (IOException e) {
             LOGGER.error("[BetterBackup] startup failed, mod degraded (no backups will be created)", e);
         }
+    }
+
+    /**
+     * BetterBackup-Store-Init 后台线程主体: 跑重 IO 的 store.initialize() (持久索引失配时
+     * O(pack 集) 全量重扫, issue #3 的原主线程 Watchdog 阻塞点), 完成后经 coordinator 与
+     * 关停互斥地 arm 管线; 关停抢先则安静收尾不 arm. arm 自身抛异常时状态停留在未就绪,
+     * 关停按未就绪拆线 (对已部分启动的组件 requestStop/stop 幂等安全).
+     */
+    private static void runStoreInit(StoreInitCoordinator coordinator, ChunkStore store,
+                                     Runnable armPipeline, Runnable failureTeardown) {
+        long t0 = System.currentTimeMillis();
+        try {
+            store.initialize();
+        } catch (IOException e) {
+            LOGGER.error("[BetterBackup] store initialization failed; backup pipeline will not arm "
+                    + "(mod degraded, no backups this run)", e);
+            if (!coordinator.failInit(failureTeardown)) {
+                LOGGER.info("[BetterBackup] store init failure raced server shutdown; shutdown path owns teardown");
+            }
+            return;
+        }
+        long elapsed = System.currentTimeMillis() - t0;
+        boolean armed;
+        try {
+            armed = coordinator.completeInit(armPipeline);
+        } catch (Throwable t) {
+            LOGGER.error("[BetterBackup] pipeline arm failed after store init ({} ms); state stays not-ready, "
+                    + "shutdown will tear down any partially started components", elapsed, t);
+            return;
+        }
+        if (armed) {
+            LOGGER.info("[BetterBackup] store initialized in {} ms ({} objects); backup pipeline armed",
+                    elapsed, store.packStore().objectCount());
+        } else {
+            LOGGER.info("[BetterBackup] store initialized in {} ms but server is already stopping; pipeline not armed",
+                    elapsed);
+            try {
+                store.close();
+            } catch (IOException e) {
+                LOGGER.warn("[BetterBackup] failed to close store after late init completion", e);
+            }
+        }
+    }
+
+    /**
+     * store 后台初始化失败后的拆线: phase 1 已注册的 bridge/handler/diagnostic/exporter 全部
+     * 摘除, worker/scheduler 从未启动无需 join. 在 StoreInitCoordinator 锁内执行, 与
+     * ServerStopping 拆线互斥, 二者恰跑其一. 摘除后 uninstall, 此后命令/关停按未安装处理.
+     */
+    private static void teardownAfterInitFailure(BackupListenerBridge bridge,
+                                                 PipelineDegradedHandler degradedHandler,
+                                                 DiagnosticLogger diagnosticLogger,
+                                                 ChunkStore store) {
+        SaveListenerRegistry.unregisterChunk(bridge);
+        SaveListenerRegistry.unregisterEntityChunk(bridge);
+        SaveListenerRegistry.unregisterSavedData(bridge);
+        SaveListenerRegistry.unregisterPipelineState(degradedHandler);
+        MinecraftForge.EVENT_BUS.unregister(diagnosticLogger);
+        PrometheusExporter exporter = BetterBackupCore.exporter();
+        if (exporter != null) {
+            exporter.stop();
+        }
+        try {
+            store.close();
+        } catch (IOException e) {
+            LOGGER.warn("[BetterBackup] failed to close store after init failure", e);
+        }
+        BetterBackupCore.uninstall();
+        LOGGER.error("[BetterBackup] pipeline torn down after store init failure; no backups will be created this run");
+    }
+
+    /**
+     * 启动时清 kill -9 留下的孤儿 .tmp (DESIGN §8 store 文件写一半断电场景). atomic put
+     * (tmp + fsync + rename) 已防止半写文件被引用, 但强杀残留的 tmp 占空间, 后台 daemon 线程
+     * 一次性清掉 —— 全树扫描 O(store 文件数), 绝不在主线程跑. cutoff = 本次 onServerStarting
+     * 进入时刻: 只清上次运行的孤儿, 本次 worker 在途 .tmp 的 mtime 必晚于 cutoff, 并发无 race.
+     * 失败仅 warn (清扫不影响备份正确性).
+     */
+    private static void dispatchTmpCleanup(ChunkStore store, long cleanupCutoff) {
+        Thread cleanupThread = new Thread(() -> {
+            try {
+                int cleaned = store.cleanupOrphanTmpFiles(cleanupCutoff);
+                if (cleaned > 0) {
+                    LOGGER.warn("[BetterBackup] cleaned {} orphan .tmp files from store (background)", cleaned);
+                }
+            } catch (IOException e) {
+                LOGGER.warn("[BetterBackup] orphan .tmp cleanup failed (non-fatal, retries next start)", e);
+            }
+        }, "BetterBackup-Tmp-Cleanup");
+        cleanupThread.setDaemon(true);
+        cleanupThread.start();
+        LOGGER.info("[BetterBackup] orphan .tmp cleanup dispatched to background");
     }
 
     /**
@@ -414,6 +509,18 @@ public final class BetterBackupMod {
             return;
         }
         LOGGER.info("[BetterBackup] server stopping (LOW priority, after BAS drain)");
+
+        // 先关初始化握手: STOPPED 之后 init 线程绝不 arm (锁内互斥, 进行中的 arm 会先跑完).
+        // init 线程本身是 daemon 且不 join —— 等它扫完正是 issue #3 要消灭的阻塞; 它发现
+        // STOPPED 后只安静 close store. 未就绪时跳过 final snapshot (store 不可读写) 并在
+        // 下方落 degraded-session 补采标志.
+        StoreInitCoordinator initCoordinator = activeStoreInitCoordinator;
+        StoreInitCoordinator.State initState =
+                initCoordinator != null ? initCoordinator.beginStop() : StoreInitCoordinator.State.READY;
+        if (initState != StoreInitCoordinator.State.READY) {
+            LOGGER.warn("[BetterBackup] store init did not complete before shutdown (state={}); "
+                    + "tearing down wired pipeline without final snapshot", initState);
+        }
 
         // 先停 exporter (避免抓取期间读半 drain 状态), 再停 scheduler 防新定时.
         PrometheusExporter exporter = BetterBackupCore.exporter();
@@ -547,15 +654,31 @@ public final class BetterBackupMod {
 
         // 关服 final snapshot: 最后一次抓取本周期内 BAS fire 过的 chunk.
         // SnapshotCreator.create 用 synchronized 串行, 跟 scheduler 已停后无 race.
+        // 仅在 store 就绪时跑: 未就绪的 store 读写会撞 PackStore 硬闸 (响亮失败但无意义).
         SnapshotCreator creator = BetterBackupCore.creator();
-        if (creator != null) {
+        if (creator != null && initState == StoreInitCoordinator.State.READY) {
             try {
                 creator.create("shutdown");
             } catch (Throwable t) {
                 LOGGER.error("[BetterBackup] final shutdown snapshot failed", t);
             }
+        } else if (initState != StoreInitCoordinator.State.READY) {
+            // init 窗口内 bridge 已入队但从未被 worker 持久化的存盘事件随进程消失. 落
+            // degraded-session 标志, 下次启动按 mtime 补采该窗口 (与 BAS 降级窗口同一套
+            // 机制), 这些 chunk 不会静默停留在旧版本.
+            ChunkStore store = BetterBackupCore.store();
+            if (store != null && leftover > 0) {
+                try {
+                    new DegradedSession(store.storeRoot()).mark(System.currentTimeMillis());
+                    LOGGER.warn("[BetterBackup] {} queued backup task(s) were never persisted (store init "
+                            + "incomplete); degraded-session flag written for next-start backfill", leftover);
+                } catch (IOException e) {
+                    LOGGER.error("[BetterBackup] failed to write degraded-session flag for init-window backlog", e);
+                }
+            }
         }
 
+        activeStoreInitCoordinator = null;
         BetterBackupCore.uninstall();
         LOGGER.info("[BetterBackup] uninstalled");
     }

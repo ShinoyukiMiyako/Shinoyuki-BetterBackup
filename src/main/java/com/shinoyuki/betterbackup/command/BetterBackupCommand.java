@@ -157,7 +157,11 @@ public final class BetterBackupCommand {
                     .append(" savedData=").append(state.savedDataCount()).append('\n');
         }
         if (store != null) {
-            out.append("Store: ").append(store.storeRoot()).append('\n');
+            out.append("Store: ").append(store.storeRoot());
+            if (!BetterBackupCore.isReady()) {
+                out.append(" [INITIALIZING - background index rebuild, backups arm when done]");
+            }
+            out.append('\n');
         }
         // baseline 全量扫描进度: 完成前 restore 被拒, 服主据此判断何时可恢复.
         BaselineProgress baselineProgress = BetterBackupCore.baselineProgress();
@@ -186,15 +190,11 @@ public final class BetterBackupCommand {
      * 写盘 + level.dat hash 可能花几秒, 主线程命令执行不应阻塞).
      */
     private static int snapshotCreate(CommandContext<CommandSourceStack> ctx, String name) {
-        if (!BetterBackupCore.isInstalled()) {
-            ctx.getSource().sendFailure(Component.literal("BetterBackup is not installed"));
+        // 写路径: store 未就绪时 creator.create 会 put level.dat/玩家数据, 必须过就绪门控.
+        if (!checkReady(ctx.getSource())) {
             return 0;
         }
         SnapshotCreator creator = BetterBackupCore.creator();
-        if (creator == null) {
-            ctx.getSource().sendFailure(Component.literal("BetterBackup creator not initialized"));
-            return 0;
-        }
         CommandSourceStack source = ctx.getSource();
         MinecraftServer server = source.getServer();
         String reason = name != null ? "manual:" + name : "manual";
@@ -739,6 +739,14 @@ public final class BetterBackupCommand {
             source.sendFailure(Component.literal("BetterBackup is not installed"));
             return false;
         }
+        if (!BetterBackupCore.isReady()) {
+            // store 初始化在后台跑 (大 store 索引重建可达分钟级), 就绪前写路径会撞 PackStore
+            // 硬闸, 读路径会误报 "对象缺失". 统一在此快速失败, 文案指向 status 查进度.
+            source.sendFailure(Component.literal(
+                    "BetterBackup store is still initializing in the background (index rebuild); "
+                            + "try again shortly. Check /betterbackup status for progress."));
+            return false;
+        }
         if (BetterBackupCore.creator() == null || BetterBackupCore.store() == null) {
             source.sendFailure(Component.literal("BetterBackup not fully initialized"));
             return false;
@@ -777,16 +785,12 @@ public final class BetterBackupCommand {
      * 可能 walk 几十万文件, 不能阻塞主线程命令执行).
      */
     private static int gc(CommandContext<CommandSourceStack> ctx) {
-        if (!BetterBackupCore.isInstalled()) {
-            ctx.getSource().sendFailure(Component.literal("BetterBackup is not installed"));
+        // 写路径: gcAll 压实会重写/删除 pack, store 未就绪时既撞硬闸也语义错误 (空索引 = 全死).
+        if (!checkReady(ctx.getSource())) {
             return 0;
         }
         SnapshotCreator creator = BetterBackupCore.creator();
         ChunkStore store = BetterBackupCore.store();
-        if (creator == null || store == null) {
-            ctx.getSource().sendFailure(Component.literal("BetterBackup not fully initialized"));
-            return 0;
-        }
         CommandSourceStack source = ctx.getSource();
         MinecraftServer server = source.getServer();
         StoreGc gc = new StoreGc(store, creator.snapshotsDir());
