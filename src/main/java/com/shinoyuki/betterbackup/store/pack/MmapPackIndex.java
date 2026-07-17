@@ -220,6 +220,14 @@ final class MmapPackIndex implements PackIndex {
         this.base = filtered;
         this.baseCount = kept;
         this.liveSize.set(kept);
+        if (toScan.isEmpty()) {
+            // 只有消失 pack (无需重扫) 时, PackStore 的 load 不会再 checkpoint, 必须就地自愈
+            // sidecar. 否则过期清单跨崩溃残留, 而 load 会复用被删的最高 packId: 新会话在复用 id
+            // 上写出恰好同尺寸的新 pack 后再崩溃, 下次 tryLoad 会把它判为 "未变" 并复活指向旧
+            // 内容布局的幻影条目 —— 内容寻址 dedup 撞上幻影 hash 时跳过写入, manifest 引用到
+            // 的对象从错误偏移读回垃圾字节, 静默损坏备份.
+            checkpoint(currentPacks);
+        }
         return toScan;
     }
 

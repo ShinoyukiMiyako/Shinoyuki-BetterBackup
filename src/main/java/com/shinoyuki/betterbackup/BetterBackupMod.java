@@ -816,15 +816,18 @@ public final class BetterBackupMod {
         if (!session.exists()) {
             return;
         }
-        long cutoff = lastCompleteSnapshotMillis(creator.snapshotsDir());
         LOGGER.warn("[BetterBackup] degraded-session flag present from a prior run; "
-                + "rescanning region files modified after lastCompleteSnapshotMillis={} to backfill the degraded window",
-                cutoff);
+                + "backfill of the degraded window starts in background");
         int rate = BetterBackupConfig.baselineScanChunksPerSecond();
         DegradedRescan rescan = new DegradedRescan(store, state, paths, hashFunction, writtenThisWindow,
                 new ThrottlingRateLimiter(rate));
         Thread thread = new Thread(() -> {
             try {
+                // cutoff 计算要 Files.list + 逐个 readFrom 全部 manifest, O(快照数) 读盘. 本方法
+                // 在 arm 阶段被 StoreInitCoordinator 锁内调用, 关服 beginStop 会等锁 —— 读盘必须
+                // 在后台线程里做, 不许留在调用线程拖住 arm 临界区 (关服卡死是历史事故线).
+                long cutoff = lastCompleteSnapshotMillis(creator.snapshotsDir());
+                LOGGER.info("[BetterBackup] degraded-window backfill cutoff: lastCompleteSnapshotMillis={}", cutoff);
                 DegradedRescan.Result result = rescan.rescan(cutoff);
                 if (result.stopped()) {
                     // 关服中断: backfill 未跑完, 保留标志下次启动重试, 不清.
@@ -843,8 +846,7 @@ public final class BetterBackupMod {
         activeDegradedRescan = rescan;
         activeDegradedThread = thread;
         thread.start();
-        LOGGER.info("[BetterBackup] degraded-window backfill started in background (rate={} chunk/s, cutoffMillis={})",
-                rate, cutoff);
+        LOGGER.info("[BetterBackup] degraded-window backfill started in background (rate={} chunk/s)", rate);
     }
 
     /**

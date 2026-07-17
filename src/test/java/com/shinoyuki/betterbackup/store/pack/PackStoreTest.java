@@ -216,7 +216,10 @@ class PackStoreTest {
         store2.flushAndSync();
         store2.close();
 
-        // 回收必须跨重启保持 (物理删除, 非逻辑墓碑)
+        // 回收必须跨重启保持 (物理删除, 非逻辑墓碑). 删 sidecar 强制纯 pack 扫描重建 —— 否则
+        // reopen 命中 close 的 checkpoint 只是在复读持久索引, 区分不了 "物理删除" 与 "仅索引摘除"
+        // (把 compact 的文件删除/重写改成只 index.remove, 不删 sidecar 时本测试照样绿).
+        Files.deleteIfExists(root.resolve("index").resolve("base.idx"));
         PackStore reopened = new PackStore(root, HASH_LEN, 1200);
         reopened.initialize();
         assertEquals(4, reopened.objectCount(), "only live objects remain after compaction + reopen");

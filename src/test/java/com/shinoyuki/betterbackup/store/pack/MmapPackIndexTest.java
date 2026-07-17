@@ -151,6 +151,38 @@ class MmapPackIndexTest {
     }
 
     @Test
+    void gone_only_load_heals_stale_sidecar_against_pack_id_reuse(@TempDir Path root) throws IOException {
+        Path indexDir = root.resolve("index");
+        MmapPackIndex first = new MmapPackIndex(indexDir, HASH_LEN);
+        for (int i = 0; i < 10; i++) {
+            first.put(hash(i), new PackLocation(1, i * 100L, i + 1)); // 全部条目在 pack 1
+        }
+        first.put(hash(100), new PackLocation(0, 0L, 5));
+        first.checkpoint(packs(0, 1000, 1, 2000));
+        first.close();
+
+        // pack 1 消失 (压实删除后、checkpoint 前崩溃的典型残留): gone-only 载入必须就地重写
+        // sidecar 自愈, 不能留过期清单.
+        MmapPackIndex healed = new MmapPackIndex(indexDir, HASH_LEN);
+        assertEquals(Set.of(), healed.tryLoad(packs(0, 1000)));
+        assertEquals(1, healed.size());
+        healed.close();
+
+        // PackStore.load 会复用被删的最高 packId: 复用 id 1 且尺寸巧合同为 2000 字节的新 pack
+        // 出现时, 自愈后的 sidecar 已不认识 pack 1, 必须交回重扫 —— 指向旧内容布局的幻影条目
+        // 绝不复活 (幻影 + 内容寻址 dedup = 静默损坏). 判定标准: 删掉 gone-only 自愈 checkpoint,
+        // 此处 tryLoad 会全命中并复活 hash(0..9), 两条断言必挂.
+        MmapPackIndex reopened = new MmapPackIndex(indexDir, HASH_LEN);
+        assertEquals(Set.of(1), reopened.tryLoad(packs(0, 1000, 1, 2000)),
+                "reused pack id with coincidental size must be rescanned, not trusted");
+        assertEquals(1, reopened.size());
+        for (int i = 0; i < 10; i++) {
+            assertFalse(reopened.contains(hash(i)), "phantom entry " + i + " must not resurrect");
+        }
+        reopened.close();
+    }
+
+    @Test
     void try_load_full_rescan_when_no_base_file_or_v1_sidecar(@TempDir Path root) throws IOException {
         // 无 base.idx -> 全量重扫.
         MmapPackIndex idx = new MmapPackIndex(root.resolve("index"), HASH_LEN);
@@ -158,8 +190,10 @@ class MmapPackIndexTest {
         assertEquals(0, idx.size());
         idx.close();
 
-        // 手写 v1 sidecar (BBIDX1 魔数 + 单 long 指纹, count=0): v2 代码必须整体拒用并退化为
-        // 全量重扫, 不崩溃; 随后 checkpoint 升格 v2, 再 tryLoad 即全命中.
+        // 手写 v1 sidecar (BBIDX1 魔数 + 单 long 指纹): 契约 = v1 一律退化为全量重扫且不崩溃,
+        // 随后 checkpoint 升格 v2, 再 tryLoad 即全命中. 注: v1 布局巧合下 (off24 恒 0 被读作
+        // packCount=0 -> 清单空 -> 全部 pack 视为新增), 即便没有魔数判别, 合法 v1 文件也会得到
+        // 同样的全量重扫 —— 魔数判别是对畸形/未来格式文件的纯防御, 本测试守的是行为契约本身.
         Path v1Dir = root.resolve("index-v1");
         Files.createDirectories(v1Dir);
         ByteBuffer v1 = ByteBuffer.allocate(32);
