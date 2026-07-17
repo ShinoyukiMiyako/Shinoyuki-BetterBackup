@@ -3,6 +3,9 @@ package com.shinoyuki.betterbackup.store.pack;
 import com.shinoyuki.betterbackup.store.Hash;
 
 import java.util.Map;
+import java.util.Set;
+import java.util.SortedMap;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -47,12 +50,13 @@ final class InMemoryPackIndex implements PackIndex {
     }
 
     @Override
-    public boolean tryLoad(long packSetFingerprint) {
-        return false; // 无持久化, 总是让 PackStore 重扫 pack 重建
+    public Set<Integer> tryLoad(SortedMap<Integer, Long> currentPacks) {
+        clear();
+        return new TreeSet<>(currentPacks.keySet()); // 无持久化, 总是让 PackStore 全量重扫重建
     }
 
     @Override
-    public void checkpoint(long packSetFingerprint) {
+    public void checkpoint(SortedMap<Integer, Long> currentPacks) {
         // no-op: 内存索引不落盘
     }
 

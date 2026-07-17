@@ -3,6 +3,8 @@ package com.shinoyuki.betterbackup.store.pack;
 import com.shinoyuki.betterbackup.store.Hash;
 
 import java.io.IOException;
+import java.util.Set;
+import java.util.SortedMap;
 
 /**
  * pack 对象索引: hash -> {@link PackLocation}. 抽成接口以便在"内存 HashMap" (简单, 小 store /
@@ -32,16 +34,22 @@ interface PackIndex {
     void clear();
 
     /**
-     * 尝试从磁盘加载已持久化的索引并校验其与当前 pack 集的指纹一致。
+     * 尝试从磁盘加载已持久化的索引, 并与当前 pack 集按 pack 粒度差分。
      *
-     * @param packSetFingerprint PackStore 算出的当前 pack 集指纹 (pack id + 文件大小)
-     * @return true = 已加载且指纹匹配 (PackStore 无需重扫 pack); false = 无持久索引 / 指纹不匹配
-     *         (PackStore 须顺序扫所有 pack 重建索引, 再 {@link #checkpoint})
+     * <p>pack 文件封口后不可变 (load 后新写入只进新 pack), 故 (id, 字节数) 是 pack 内容的
+     * 可靠身份: 崩溃恢复通常只有最后一个在写 pack 尺寸变化, 差分让重扫从 O(全部 pack) 降到
+     * O(变化 pack) (issue #3 的重扫放大根因)。
+     *
+     * @param currentPacks 当前磁盘 pack 集: packId -&gt; 文件字节数 (按 id 升序)
+     * @return 仍需 PackStore {@code scanPack} 的 packId 集合: 空集 = 全命中零重扫;
+     *         未变 pack 的条目已保留, 变化/新增 pack 需重扫 (调用方扫完后 {@link #checkpoint});
+     *         无持久索引 / 版本或内容无法使用时返回全集 (退化为全量重扫)。
+     *         清单里有而磁盘上消失的 pack, 其条目一律丢弃。
      */
-    boolean tryLoad(long packSetFingerprint) throws IOException;
+    Set<Integer> tryLoad(SortedMap<Integer, Long> currentPacks) throws IOException;
 
-    /** 把当前索引持久化到磁盘, 打上 {@code packSetFingerprint} 戳 (close / 压实后调)。 */
-    void checkpoint(long packSetFingerprint) throws IOException;
+    /** 把当前索引连同 per-pack (id, 字节数) 清单持久化到磁盘 (close / 压实 / load 重扫后调)。 */
+    void checkpoint(SortedMap<Integer, Long> currentPacks) throws IOException;
 
     /** 关闭底层资源 (mmap / 文件句柄)。 */
     void close() throws IOException;

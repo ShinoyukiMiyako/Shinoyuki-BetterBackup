@@ -662,6 +662,12 @@ public final class BetterBackupMod {
             } catch (Throwable t) {
                 LOGGER.error("[BetterBackup] final shutdown snapshot failed", t);
             }
+            // 索引关服 checkpoint: 记下本会话的 per-pack 清单, 下次启动零重扫. 没有它, 每个
+            // 写过新对象的会话都让下次启动付一遍重扫 (issue #3 稳定复现的直接原因之一).
+            ChunkStore readyStore = BetterBackupCore.store();
+            if (readyStore != null) {
+                readyStore.checkpointOnShutdown();
+            }
         } else if (initState != StoreInitCoordinator.State.READY) {
             // init 窗口内 bridge 已入队但从未被 worker 持久化的存盘事件随进程消失. 落
             // degraded-session 标志, 下次启动按 mtime 补采该窗口 (与 BAS 降级窗口同一套

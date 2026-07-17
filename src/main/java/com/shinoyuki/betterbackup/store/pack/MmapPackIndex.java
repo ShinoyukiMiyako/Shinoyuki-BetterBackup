@@ -12,10 +12,13 @@ import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.SortedMap;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -31,15 +34,18 @@ import java.util.concurrent.atomic.AtomicInteger;
  * GC 回收), 跨平台稳妥; 内存占用与 mmap 同量级 (3M 对象 ~96MB off-heap, 远小于内存 HashMap 的
  * ~180MB on-heap), 二分查询同样是内存访问速度。
  *
- * <p><b>record 布局</b> (entry 宽度 = hashLength + 16):
+ * <p><b>record 布局 v2</b> (entry 宽度 = hashLength + 16):
  * <pre>
- *   header(32B): [8B magic][8B fingerprint][4B count][4B hashLength][8B reserved]
+ *   header(32B): [8B magic "BBIDX2\0\0"][8B reserved][4B count][4B hashLength][4B packCount][4B reserved]
  *   entry:       [hashLength B hash][4B packId][8B offset][4B length]   (按 hash 字节升序)
+ *   manifest:    packCount 条 [4B packId][8B packBytes]                 (按 id 升序, 尾段)
  * </pre>
  *
- * <p><b>fingerprint</b>: base.idx 头记录写盘当时的 pack 集指纹。{@link #tryLoad} 仅在指纹与当前
- * pack 集一致时命中 (mmap 等价), 否则返回 false 让 PackStore 顺序扫 pack 重建 —— 崩溃恢复 (无干净
- * checkpoint) / pack 变化 时自动走重建路径, 不会用过期索引。
+ * <p><b>per-pack 差分</b>: 尾段 manifest 记录写盘当时每个 pack 的 (id, 字节数)。pack 封口后不可变,
+ * 故 {@link #tryLoad} 与当前磁盘 pack 集逐 pack 比对: 未变 pack 的条目从 base 线性过滤保留 (过滤
+ * 保持 hash 有序, 二分不破), 只把变化/新增 pack 交还 PackStore 重扫 —— 崩溃恢复通常只有最后一个
+ * 在写 pack 尺寸变化, 重扫从 O(全部 pack) 降到 O(1 pack) (issue #3 的重扫放大根因)。旧 v1 格式
+ * ("BBIDX1", 单 long 指纹) 无 per-pack 清单, 读到即退化为全量重扫, 首次 checkpoint 升格 v2。
  *
  * <p><b>并发</b>: PackStore 保证所有 mutation (put/remove/clear/checkpoint/tryLoad) 串行 (put 在
  * append 锁内, remove/checkpoint 在压实写锁内, load 单线程); get/contains 与 put 并发。delta /
@@ -47,9 +53,11 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 final class MmapPackIndex implements PackIndex {
 
-    private static final byte[] MAGIC = "BBIDX1\0\0".getBytes(StandardCharsets.US_ASCII); // 8 字节
+    private static final byte[] MAGIC_V1 = "BBIDX1\0\0".getBytes(StandardCharsets.US_ASCII); // 8 字节
+    private static final byte[] MAGIC_V2 = "BBIDX2\0\0".getBytes(StandardCharsets.US_ASCII); // 8 字节
     private static final int HEADER_BYTES = 32;
     private static final int LOC_BYTES = 16; // packId(4) + offset(8) + length(4)
+    private static final int PACK_META_BYTES = 12; // manifest 尾段每条: packId(4) + packBytes(8)
 
     private final Path baseFile;
     private final Path baseTmpFile;
@@ -127,63 +135,116 @@ final class MmapPackIndex implements PackIndex {
     }
 
     @Override
-    public boolean tryLoad(long packSetFingerprint) throws IOException {
+    public Set<Integer> tryLoad(SortedMap<Integer, Long> currentPacks) throws IOException {
         clear();
+        Set<Integer> fullRescan = new TreeSet<>(currentPacks.keySet());
         if (!Files.isRegularFile(baseFile)) {
-            return false;
+            return fullRescan;
         }
         long size = Files.size(baseFile);
         if (size < HEADER_BYTES) {
-            return false;
+            return fullRescan;
         }
         ByteBuffer buf = ByteBuffer.allocateDirect((int) size);
         try (FileChannel ch = FileChannel.open(baseFile, StandardOpenOption.READ)) {
             while (buf.hasRemaining()) {
                 if (ch.read(buf) < 0) {
-                    return false; // 文件比声称的短, 视为无效
+                    return fullRescan; // 文件比声称的短, 视为无效
                 }
             }
         }
         buf.flip();
-        for (int k = 0; k < MAGIC.length; k++) {
-            if (buf.get(k) != MAGIC[k]) {
-                return false;
-            }
+        if (!magicMatches(buf, MAGIC_V2)) {
+            // v1 (单 long 指纹, 无 per-pack 清单) 或未知格式: 无法差分, 退化为全量重扫,
+            // 重扫后的 checkpoint 会把 sidecar 升格为 v2.
+            return fullRescan;
         }
-        long storedFingerprint = buf.getLong(8);
         int count = buf.getInt(16);
         int storedHashLength = buf.getInt(20);
-        if (storedHashLength != hashLength) {
-            return false;
+        int packCount = buf.getInt(24);
+        if (storedHashLength != hashLength || count < 0 || packCount < 0) {
+            return fullRescan;
         }
-        if (size != (long) HEADER_BYTES + (long) count * entryWidth) {
-            return false; // 大小与 count 不符, 损坏
+        if (size != (long) HEADER_BYTES + (long) count * entryWidth + (long) packCount * PACK_META_BYTES) {
+            return fullRescan; // 大小与 count/packCount 不符, 损坏
         }
-        if (storedFingerprint != packSetFingerprint) {
-            return false; // pack 集已变 / 崩溃残留, 让 PackStore 重扫重建
+
+        // 读 manifest 尾段, 与当前磁盘 pack 集差分.
+        Map<Integer, Long> stored = new HashMap<>(packCount * 2);
+        int manifestBase = HEADER_BYTES + count * entryWidth;
+        for (int k = 0; k < packCount; k++) {
+            int metaPos = manifestBase + k * PACK_META_BYTES;
+            stored.put(buf.getInt(metaPos), buf.getLong(metaPos + 4));
         }
-        this.base = buf;
-        this.baseCount = count;
-        this.liveSize.set(count);
-        return true;
+        Set<Integer> unchanged = new HashSet<>();
+        Set<Integer> toScan = new TreeSet<>();
+        for (Map.Entry<Integer, Long> e : currentPacks.entrySet()) {
+            Long storedBytes = stored.get(e.getKey());
+            if (storedBytes != null && storedBytes.longValue() == e.getValue()) {
+                unchanged.add(e.getKey());
+            } else {
+                toScan.add(e.getKey()); // 新增或尺寸变化
+            }
+        }
+        boolean anyGone = false;
+        for (Integer id : stored.keySet()) {
+            if (!currentPacks.containsKey(id)) {
+                anyGone = true; // 清单有、磁盘无: 其条目必须被过滤掉
+                break;
+            }
+        }
+
+        if (toScan.isEmpty() && !anyGone) {
+            // 全命中: 整块 buffer 直接作 base (含 manifest 尾段无妨, 二分以 baseCount 限界).
+            this.base = buf;
+            this.baseCount = count;
+            this.liveSize.set(count);
+            return Set.of();
+        }
+
+        // 部分失效: 线性过滤 base, 只保留 packId ∈ 未变集 的条目. 过滤保持原有 hash 升序,
+        // 二分不破; 变化 pack 的条目丢弃后由 PackStore 重扫灌回 delta, 消失 pack 的条目就此消亡.
+        ByteBuffer filtered = ByteBuffer.allocateDirect(HEADER_BYTES + count * entryWidth);
+        filtered.position(HEADER_BYTES); // 与 base 同款寻址 (entry 从 HEADER_BYTES 起), 头部留零
+        int kept = 0;
+        for (int i = 0; i < count; i++) {
+            int pos = HEADER_BYTES + i * entryWidth;
+            int packId = buf.getInt(pos + hashLength);
+            if (unchanged.contains(packId)) {
+                for (int k = 0; k < entryWidth; k++) {
+                    filtered.put(buf.get(pos + k));
+                }
+                kept++;
+            }
+        }
+        this.base = filtered;
+        this.baseCount = kept;
+        this.liveSize.set(kept);
+        return toScan;
     }
 
     @Override
-    public void checkpoint(long packSetFingerprint) throws IOException {
+    public void checkpoint(SortedMap<Integer, Long> currentPacks) throws IOException {
         Files.createDirectories(baseFile.getParent());
         int liveCount = liveSize.get();
-        ByteBuffer out = ByteBuffer.allocateDirect(HEADER_BYTES + liveCount * entryWidth);
-        out.put(MAGIC);
-        out.putLong(packSetFingerprint);
+        int packCount = currentPacks.size();
+        ByteBuffer out = ByteBuffer.allocateDirect(
+                HEADER_BYTES + liveCount * entryWidth + packCount * PACK_META_BYTES);
+        out.put(MAGIC_V2);
+        out.putLong(0L); // reserved (v1 在此存单 long 指纹, v2 由尾段 manifest 取代)
         out.putInt(liveCount);
         out.putInt(hashLength);
-        out.putInt(0);
+        out.putInt(packCount);
         out.putInt(0); // reserved (补满 HEADER_BYTES=32)
 
         int written = mergeInto(out);
         if (written != liveCount) {
             throw new IOException("pack index checkpoint inconsistency: wrote " + written
                     + " entries but liveSize=" + liveCount);
+        }
+        for (Map.Entry<Integer, Long> e : currentPacks.entrySet()) {
+            out.putInt(e.getKey());
+            out.putLong(e.getValue()); // manifest 尾段, 按 id 升序 (SortedMap 迭代序)
         }
         out.flip();
 
@@ -204,6 +265,15 @@ final class MmapPackIndex implements PackIndex {
     }
 
     // ---- internals ----
+
+    private static boolean magicMatches(ByteBuffer buf, byte[] magic) {
+        for (int k = 0; k < magic.length; k++) {
+            if (buf.get(k) != magic[k]) {
+                return false;
+            }
+        }
+        return true;
+    }
 
     /**
      * 把 (base − tombstone − 被 delta 影子) 与 delta 按 hash 升序归并写进 {@code out}。两路均已

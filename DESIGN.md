@@ -123,7 +123,7 @@ pack 记录格式 (自描述, 内联 hash 让 fsck 顺序扫即可重建索引):
 **设计理由**:
 - **pack append-only (取代两级分桶文件树)**: 众多内容寻址对象顺序追加进少量大 pack, 根治机械盘上百万小文件的随机寻道与每对象 fsync。pack 超 `targetPackSizeBytes` (默认 256 MiB) 即封口, 封口 pack 不可变
 - **fsync 一次每快照**: `put` 只顺序追加 (字节进 OS page cache, reader 即时可见), 不每对象 fsync; 持久化由 `flushAndSync` 屏障在写 manifest 前一次性完成, 把"manifest 落盘即其引用对象落盘"的不变量压成每快照 1 次 force。窗口中途崩溃丢失的只是尚未被任何 manifest 引用的对象, 安全
-- **off-heap mmap 索引 (index/)**: `MmapPackIndex` 把排序索引整读进 direct ByteBuffer (零 JVM 堆, 不给 GC 施压, OS 仍缓存底层文件), 查询走二分; 会话内新写入落内存 delta, 压实回收记 tombstone, `checkpoint` 归并成新 `base.idx`。base 头记录 pack 集指纹, 指纹失配 (崩溃 / pack 变化) 时 PackStore 顺序扫 pack 重建, 绝不用过期索引
+- **off-heap mmap 索引 (index/)**: `MmapPackIndex` 把排序索引整读进 direct ByteBuffer (零 JVM 堆, 不给 GC 施压, OS 仍缓存底层文件), 查询走二分; 会话内新写入落内存 delta, 压实回收记 tombstone, `checkpoint` 归并成新 `base.idx`。base 尾段记录 per-pack (id, 字节数) 清单 (格式 v2, "BBIDX2"), load 时逐 pack 差分: 未变 pack 的条目直接保留, 只重扫变化/新增 pack (崩溃恢复通常只有最后一个在写 pack, 重扫 O(1 pack)); 清单整体缺失/损坏/旧 v1 格式时退化为全量重扫, 绝不用过期索引。关服时尽力 checkpoint (有界 tryLock), 让干净重启零重扫
 - **崩溃恢复**: 内存索引不持久, 每次 `load` 顺序扫所有 pack 重建; 遇写一半的尾部记录 (torn tail) 截断到上一条完整记录边界 (只有最后一个 pack 可能出现)
 - **默认哈希 XXH128**: OpenHFT zero-allocation-hashing 纯 Java 实现 (`LongTupleHashFunction.xx128`), 16 字节, 跨 JVM 字节恒等, 比 SHA256 快约 5-10 倍 (ConfigSpec 默认 `hashAlgorithm = XXH128`)。SHA256 / BLAKE3 是 `hashAlgorithm` 配置项的保留枚举值, 当前尚未落地
 - **chunks/ 跟 snapshots/ 分离**: dedup store (pack + 旧树) 跨快照共享, snapshot manifest 是轻量索引

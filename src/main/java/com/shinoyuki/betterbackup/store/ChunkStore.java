@@ -67,6 +67,11 @@ public final class ChunkStore {
         return packStore;
     }
 
+    /** 关服索引 checkpoint (有界 tryLock, 失败仅 warn). 见 {@link PackStore#checkpointOnShutdown}. */
+    public void checkpointOnShutdown() {
+        packStore.checkpointOnShutdown();
+    }
+
     /**
      * store 磁盘体积近似 = pack 目录字节 ({@link PackStore#totalPackBytes}, 廉价, store 主体)
      * + 旧文件树 ({@code chunks/}) 求和. 迁移完成的新 store 旧树为空, 此项为 0; 迁移期旧树

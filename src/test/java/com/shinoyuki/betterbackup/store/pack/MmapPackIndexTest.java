@@ -5,11 +5,16 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
+import java.util.Set;
+import java.util.SortedMap;
+import java.util.TreeMap;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -46,8 +51,8 @@ class MmapPackIndexTest {
         assertEquivalent(oracle, subject, probes);
         assertEquals(50, subject.size());
 
-        // 2. checkpoint -> 全进 base, delta 清空
-        checkpoint(oracle, subject, 111L);
+        // 2. checkpoint -> 全进 base, delta 清空 (清单覆盖 loc(seed) 用到的 packId 0..4)
+        checkpoint(oracle, subject, packs(0, 100, 1, 100, 2, 100, 3, 100, 4, 100));
         assertTrue(Files.isRegularFile(root.resolve("index").resolve("base.idx")), "base.idx must be written");
         assertEquivalent(oracle, subject, probes);
 
@@ -69,7 +74,7 @@ class MmapPackIndexTest {
         assertEquals(45, subject.size());
 
         // 5. checkpoint 归并 (base 去 tombstone/影子 + delta) -> 再次全等价
-        checkpoint(oracle, subject, 222L);
+        checkpoint(oracle, subject, packs(0, 100, 1, 100, 2, 100, 3, 100, 4, 100));
         assertEquivalent(oracle, subject, probes);
         assertEquals(45, subject.size());
 
@@ -82,18 +87,20 @@ class MmapPackIndexTest {
     }
 
     @Test
-    void checkpoint_persists_and_reloads_when_fingerprint_matches(@TempDir Path root) throws IOException {
+    void checkpoint_persists_and_reloads_when_manifest_matches(@TempDir Path root) throws IOException {
         Path indexDir = root.resolve("index");
+        SortedMap<Integer, Long> manifest = packs(0, 100, 1, 100, 2, 100, 3, 100, 4, 100);
         MmapPackIndex first = new MmapPackIndex(indexDir, HASH_LEN);
         for (int i = 0; i < 30; i++) {
             first.put(hash(i), loc(i));
         }
         first.remove(hash(5));
-        first.checkpoint(777L);
+        first.checkpoint(manifest);
         first.close();
 
         MmapPackIndex reopened = new MmapPackIndex(indexDir, HASH_LEN);
-        assertTrue(reopened.tryLoad(777L), "matching fingerprint must load from base.idx");
+        assertEquals(Set.of(), reopened.tryLoad(manifest),
+                "identical per-pack manifest must load with zero packs to rescan");
         assertEquals(29, reopened.size(), "removed object must stay gone after reload");
         assertFalse(reopened.contains(hash(5)), "removed object must not reappear");
         for (int i = 0; i < 30; i++) {
@@ -106,27 +113,74 @@ class MmapPackIndexTest {
     }
 
     @Test
-    void try_load_rejects_stale_fingerprint(@TempDir Path root) throws IOException {
+    void try_load_partial_keeps_unchanged_packs_and_returns_changed(@TempDir Path root) throws IOException {
         Path indexDir = root.resolve("index");
         MmapPackIndex first = new MmapPackIndex(indexDir, HASH_LEN);
-        for (int i = 0; i < 10; i++) {
-            first.put(hash(i), loc(i));
+        // 30 个对象显式分布在 pack 0/1/2 (loc(seed) 的 packId = seed % 5, 取 seed<15 保证只落 0..4;
+        // 这里改用显式 location 保证分布可控).
+        for (int i = 0; i < 30; i++) {
+            first.put(hash(i), new PackLocation(i % 3, i * 100L, i + 1));
         }
-        first.checkpoint(100L);
+        first.checkpoint(packs(0, 1000, 1, 2000, 2, 3000));
         first.close();
 
+        // pack 1 尺寸变化 (崩溃恢复典型场景), pack 3 新增, pack 0/2 未变.
         MmapPackIndex reopened = new MmapPackIndex(indexDir, HASH_LEN);
-        assertFalse(reopened.tryLoad(200L), "stale fingerprint (pack set changed) must NOT load");
-        assertEquals(0, reopened.size(), "rejected load must leave the index empty (PackStore will rebuild)");
+        Set<Integer> toScan = reopened.tryLoad(packs(0, 1000, 1, 2500, 2, 3000, 3, 500));
+        assertEquals(Set.of(1, 3), toScan, "only the size-changed and the new pack need rescanning");
+        assertEquals(20, reopened.size(), "entries of unchanged packs 0/2 must be retained");
+        for (int i = 0; i < 30; i++) {
+            if (i % 3 == 1) {
+                assertFalse(reopened.contains(hash(i)), "changed-pack entry " + i + " must be dropped for rescan");
+            } else {
+                assertEquals(new PackLocation(i % 3, i * 100L, i + 1), reopened.get(hash(i)),
+                        "unchanged-pack entry " + i + " must survive the partial load");
+            }
+        }
         reopened.close();
+
+        // 消失 pack: 清单只剩 pack 0 -> pack 1/2 条目全部丢弃, 无需重扫任何 pack.
+        MmapPackIndex gone = new MmapPackIndex(indexDir, HASH_LEN);
+        assertEquals(Set.of(), gone.tryLoad(packs(0, 1000)),
+                "vanished packs need no rescan, their entries just drop");
+        assertEquals(10, gone.size(), "only pack-0 entries survive when packs 1/2 vanished");
+        for (int i = 0; i < 30; i++) {
+            assertEquals(i % 3 == 0, gone.contains(hash(i)));
+        }
+        gone.close();
     }
 
     @Test
-    void try_load_false_when_no_base_file(@TempDir Path root) throws IOException {
+    void try_load_full_rescan_when_no_base_file_or_v1_sidecar(@TempDir Path root) throws IOException {
+        // 无 base.idx -> 全量重扫.
         MmapPackIndex idx = new MmapPackIndex(root.resolve("index"), HASH_LEN);
-        assertFalse(idx.tryLoad(1L), "no base.idx -> tryLoad false");
+        assertEquals(Set.of(7, 9), idx.tryLoad(packs(7, 100, 9, 200)), "no base.idx -> rescan everything");
         assertEquals(0, idx.size());
         idx.close();
+
+        // 手写 v1 sidecar (BBIDX1 魔数 + 单 long 指纹, count=0): v2 代码必须整体拒用并退化为
+        // 全量重扫, 不崩溃; 随后 checkpoint 升格 v2, 再 tryLoad 即全命中.
+        Path v1Dir = root.resolve("index-v1");
+        Files.createDirectories(v1Dir);
+        ByteBuffer v1 = ByteBuffer.allocate(32);
+        v1.put("BBIDX1\0\0".getBytes(StandardCharsets.US_ASCII));
+        v1.putLong(12345L);
+        v1.putInt(0);
+        v1.putInt(HASH_LEN);
+        v1.putInt(0);
+        v1.putInt(0);
+        Files.write(v1Dir.resolve("base.idx"), v1.array());
+
+        MmapPackIndex legacy = new MmapPackIndex(v1Dir, HASH_LEN);
+        assertEquals(Set.of(0), legacy.tryLoad(packs(0, 100)), "v1 sidecar -> one-time full rescan");
+        legacy.put(hash(1), new PackLocation(0, 20L, 30));
+        legacy.checkpoint(packs(0, 100));
+        legacy.close();
+
+        MmapPackIndex upgraded = new MmapPackIndex(v1Dir, HASH_LEN);
+        assertEquals(Set.of(), upgraded.tryLoad(packs(0, 100)), "after v2 upgrade the reload is a full hit");
+        assertEquals(new PackLocation(0, 20L, 30), upgraded.get(hash(1)));
+        upgraded.close();
     }
 
     // ---- helpers ----
@@ -141,9 +195,19 @@ class MmapPackIndexTest {
         subject.remove(hash(hashSeed));
     }
 
-    private static void checkpoint(PackIndex oracle, PackIndex subject, long fingerprint) throws IOException {
-        oracle.checkpoint(fingerprint);
-        subject.checkpoint(fingerprint);
+    private static void checkpoint(PackIndex oracle, PackIndex subject, SortedMap<Integer, Long> manifest)
+            throws IOException {
+        oracle.checkpoint(manifest);
+        subject.checkpoint(manifest);
+    }
+
+    /** (id, size) 交替参数构建 per-pack 清单. */
+    private static SortedMap<Integer, Long> packs(long... idSizePairs) {
+        TreeMap<Integer, Long> m = new TreeMap<>();
+        for (int k = 0; k < idSizePairs.length; k += 2) {
+            m.put((int) idSizePairs[k], idSizePairs[k + 1]);
+        }
+        return m;
     }
 
     private static void assertEquivalent(PackIndex oracle, PackIndex subject, List<Hash> probes) {

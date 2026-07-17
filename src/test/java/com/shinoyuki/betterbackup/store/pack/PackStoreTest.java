@@ -90,6 +90,10 @@ class PackStoreTest {
         store.flushAndSync();
         store.close();
 
+        // 删掉持久索引 sidecar, 强制走全量 pack 扫描 —— 本测试守的就是 "纯靠 pack 顺序扫也能
+        // 重建索引" (close 的 checkpoint 会让重开变成索引命中, 不删则扫描路径测不到).
+        Files.deleteIfExists(root.resolve("index").resolve("base.idx"));
+
         // 全新实例, 只靠 pack 顺序扫重建索引
         PackStore reopened = new PackStore(root, HASH_LEN, PackStore.DEFAULT_TARGET_PACK_SIZE_BYTES);
         reopened.initialize();
@@ -341,6 +345,61 @@ class PackStoreTest {
     }
 
     @Test
+    void incremental_reopen_rescans_only_new_and_changed_packs(@TempDir Path root) throws IOException {
+        // 小封口逼出多个 pack; 首会话正常 close (写 v2 checkpoint).
+        long target = 1200;
+        List<byte[]> objects = new ArrayList<>();
+        List<Hash> hashes = new ArrayList<>();
+        PackStore first = new PackStore(root, HASH_LEN, target);
+        first.initialize();
+        for (int i = 0; i < 12; i++) {
+            byte[] o = randomBytes(400, 500 + i);
+            Hash h = hashFn.hash(o);
+            first.put(h, o);
+            objects.add(o);
+            hashes.add(h);
+        }
+        first.close();
+        long sealedPacks = countPacks(root);
+        assertTrue(sealedPacks >= 3, "precondition: multiple packs rolled, got " + sealedPacks);
+
+        // 第二会话: checkpoint 命中 -> 零重扫; 追加一个对象落到新 pack 后不 close (模拟崩溃,
+        // sidecar 清单里没有新 pack).
+        PackStore second = new PackStore(root, HASH_LEN, target);
+        List<Integer> scannedOnCleanReopen = new ArrayList<>();
+        second.setScanObserverForTest(scannedOnCleanReopen::add);
+        second.initialize();
+        assertEquals(List.of(), scannedOnCleanReopen, "clean reopen after checkpoint must rescan nothing");
+        byte[] extra = randomBytes(400, 999);
+        Hash extraHash = hashFn.hash(extra);
+        second.put(extraHash, extra);
+        second.flushAndSync();
+
+        // 第三会话 (崩溃恢复): 增量差分必须只重扫崩溃会话的新 pack, 其余条目从持久索引保留.
+        // 判定标准: 把 tryLoad 的 per-pack 差分退化回全量重扫, scanned.size()==1 必挂.
+        PackStore third = new PackStore(root, HASH_LEN, target);
+        List<Integer> scanned = new ArrayList<>();
+        third.setScanObserverForTest(scanned::add);
+        third.initialize();
+        assertEquals(1, scanned.size(), "only the crashed session's new pack rescans, got " + scanned);
+        assertEquals(13, third.objectCount(), "all objects reachable after incremental rebuild");
+        assertArrayEquals(extra, third.get(extraHash), "crashed-session object recovered by the rescan");
+        for (int i = 0; i < objects.size(); i++) {
+            assertArrayEquals(objects.get(i), third.get(hashes.get(i)),
+                    "object " + i + " must survive via retained index entries");
+        }
+        third.close();
+
+        // 第四会话: 第三会话扫完已重写 checkpoint, 再开必须零重扫.
+        PackStore fourth = new PackStore(root, HASH_LEN, target);
+        List<Integer> scannedAfterRecovery = new ArrayList<>();
+        fourth.setScanObserverForTest(scannedAfterRecovery::add);
+        fourth.initialize();
+        assertEquals(List.of(), scannedAfterRecovery, "recovery rescan must checkpoint so the next open is a full hit");
+        fourth.close();
+    }
+
+    @Test
     void operations_before_initialize_throw_and_leave_existing_store_intact(@TempDir Path root) throws IOException {
         // 既有 store: 一个已初始化实例写入对象 X 后正常关闭.
         byte[] x = randomBytes(500, 77);
@@ -428,6 +487,12 @@ class PackStoreTest {
         @Override public FileLock lock(long p, long s, boolean shared) throws IOException { return real.lock(p, s, shared); }
         @Override public FileLock tryLock(long p, long s, boolean shared) throws IOException { return real.tryLock(p, s, shared); }
         @Override protected void implCloseChannel() throws IOException { real.close(); }
+    }
+
+    private static long countPacks(Path root) throws IOException {
+        try (Stream<Path> s = Files.list(root.resolve("packs"))) {
+            return s.filter(x -> x.getFileName().toString().endsWith(".pack")).count();
+        }
     }
 
     private static long sumPackFileSizes(Path root) throws IOException {

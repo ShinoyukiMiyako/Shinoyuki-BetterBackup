@@ -3,9 +3,12 @@ package com.shinoyuki.betterbackup.store.pack;
 import com.shinoyuki.betterbackup.log.BackupLog;
 import com.shinoyuki.betterbackup.store.Hash;
 
+import java.io.BufferedInputStream;
+import java.io.DataInputStream;
 import java.io.EOFException;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.channels.Channels;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -16,8 +19,12 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.SortedMap;
+import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.IntConsumer;
 import java.util.stream.Stream;
 
 /**
@@ -54,6 +61,9 @@ public final class PackStore {
     private static final int LEN_FIELD_BYTES = 4;
     private static final String PACK_SUFFIX = ".pack";
 
+    /** scanPack 流式读缓冲. 8 MiB: 足以让机械盘保持顺序吞吐, 又不至于单 pack 扫描占用过多堆. */
+    private static final int SCAN_BUFFER_BYTES = 8 * 1024 * 1024;
+
     /** store.meta 魔数 + 格式版本 (尾字节 '1' = 格式 v1). hashLength 写在其后 4 字节 BE. */
     private static final byte[] META_MAGIC = "BBPACK1".getBytes(StandardCharsets.US_ASCII);
 
@@ -86,6 +96,9 @@ public final class PackStore {
     // 验证失败后 put 能恢复 position==writeOffset 不变量.
     private volatile WriteChannelOpener writeChannelOpener =
             p -> FileChannel.open(p, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+
+    // 测试观测点: 每次 scanPack 回调 packId, 用于断言增量重扫只扫了变化 pack. 生产恒 null.
+    private volatile IntConsumer scanObserverForTest;
 
     public PackStore(Path storeRoot, int hashLength, long targetPackSizeBytes) {
         if (hashLength <= 0) {
@@ -166,26 +179,34 @@ public final class PackStore {
         }
         nextPackId = maxId + 1;
 
-        if (index.tryLoad(packSetFingerprint(ids))) {
-            return; // 持久索引命中 (mmap): 无需重扫 pack
+        // 持久索引按 pack 粒度差分: 未变 pack 的条目直接保留, 只重扫变化/新增 pack.
+        // 崩溃恢复通常只有最后一个在写 pack 尺寸变化, 重扫从 O(全部 pack) 降到 O(1 pack)
+        // (issue #3 的重扫放大根因); 全命中则零重扫.
+        Set<Integer> toScan = index.tryLoad(packSizes(ids));
+        if (toScan.isEmpty()) {
+            return;
         }
-        // 无持久索引 / 指纹不匹配 (新 store / 崩溃恢复 / pack 变化): 顺序扫所有 pack 重建索引,
-        // 顺带截断 torn tail. checkpoint 的指纹必须在扫描 (可能截断改了 pack 大小) 之后重算,
-        // 否则记的是截断前的过期指纹, 下次 load 又判失配白白重扫.
-        for (int id : ids) {
+        if (toScan.size() < ids.size()) {
+            BackupLog.info(LOGGER_NAME, "[BetterBackup] incremental index rebuild: rescanning {} of {} pack(s)",
+                    toScan.size(), ids.size());
+        } else {
+            BackupLog.info(LOGGER_NAME, "[BetterBackup] full index rebuild: scanning {} pack(s)", ids.size());
+        }
+        for (int id : toScan) {
             scanPack(id);
         }
-        index.checkpoint(packSetFingerprint(ids));
+        // checkpoint 的清单必须在扫描 (可能截断改了 pack 大小) 之后重算, 否则记的是截断前的
+        // 过期尺寸, 下次 load 又判失配白白重扫.
+        index.checkpoint(packSizes(listPackIds()));
     }
 
-    /** 当前 pack 集指纹: (sorted packId, 文件大小) 折叠. 用于持久索引判定是否仍与磁盘 pack 一致. */
-    private long packSetFingerprint(List<Integer> ids) throws IOException {
-        long fp = 1125899906842597L;
+    /** 当前 pack 集清单: packId -> 文件字节数 (按 id 升序). 持久索引差分与 checkpoint 用. */
+    private SortedMap<Integer, Long> packSizes(List<Integer> ids) throws IOException {
+        TreeMap<Integer, Long> sizes = new TreeMap<>();
         for (int id : ids) {
-            fp = fp * 31 + id;
-            fp = fp * 31 + Files.size(packPath(id));
+            sizes.put(id, Files.size(packPath(id)));
         }
-        return fp;
+        return sizes;
     }
 
     /**
@@ -324,6 +345,42 @@ public final class PackStore {
         void visit(Hash storedHash, byte[] data) throws IOException;
     }
 
+    /**
+     * 关服 checkpoint: 尽力把内存索引连同当前 per-pack 清单落盘, 让下次启动 tryLoad 全命中
+     * 零重扫 —— 没有它, 每个写过新对象的会话都会让下次启动付一遍 (增量) 重扫. 有界 tryLock:
+     * gcAll/压实仍持写锁时直接跳过 (增量差分使代价只是下次重扫活跃 pack, 秒级), 绝不让关服
+     * 在 store 锁上无界等待 (关服卡死是本系列 mod 的历史事故线, 见 BAS shutdown-hang).
+     */
+    public void checkpointOnShutdown() {
+        if (!initialized) {
+            return;
+        }
+        boolean locked = false;
+        try {
+            locked = storeLock.writeLock().tryLock(5, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        if (!locked) {
+            BackupLog.warn(LOGGER_NAME, "[BetterBackup] shutdown index checkpoint skipped: store lock busy "
+                    + "(compaction still running); next start rescans only changed packs");
+            return;
+        }
+        try {
+            synchronized (writeLock) {
+                if (writeChannel != null) {
+                    writeChannel.force(true);
+                }
+            }
+            index.checkpoint(packSizes(listPackIds()));
+        } catch (IOException e) {
+            BackupLog.warn(LOGGER_NAME, "[BetterBackup] shutdown index checkpoint failed (non-fatal): "
+                    + "next start rescans changed packs", e);
+        } finally {
+            storeLock.writeLock().unlock();
+        }
+    }
+
     public void close() throws IOException {
         storeLock.writeLock().lock();
         try {
@@ -333,10 +390,10 @@ public final class PackStore {
                 writeChannel = null;
             }
             if (initialized) {
-                // checkpoint 索引: pack 文件此刻已最终化, 打上当前指纹, 下次 load 匹配即 mmap 命中免重扫.
-                // 未初始化的 store 绝不 checkpoint: 空索引 + 匹配指纹会让下次 load 误判 "store 为空",
+                // checkpoint 索引: pack 文件此刻已最终化, 记下当前 per-pack 清单, 下次 load 全命中免重扫.
+                // 未初始化的 store 绝不 checkpoint: 空索引 + 匹配清单会让下次 load 误判 "store 为空",
                 // 既有对象全部不可达.
-                index.checkpoint(packSetFingerprint(listPackIds()));
+                index.checkpoint(packSizes(listPackIds()));
             }
             initialized = false;
             index.close();
@@ -439,8 +496,8 @@ public final class PackStore {
                 BackupLog.info(LOGGER_NAME,
                         "[BetterBackup] pack compact: objectsRemoved={} bytesReclaimed={} packsDeleted={} packsRewritten={}",
                         objectsRemoved, bytesReclaimed, packsDeleted, packsRewritten);
-                // pack 集已变, checkpoint 索引让下次 load 指纹匹配即可 mmap 命中.
-                index.checkpoint(packSetFingerprint(listPackIds()));
+                // pack 集已变, checkpoint 索引让下次 load 清单匹配即可 mmap 命中.
+                index.checkpoint(packSizes(listPackIds()));
             }
             return new CompactResult(objectsRemoved, bytesReclaimed, packsDeleted, packsRewritten);
         } finally {
@@ -585,6 +642,11 @@ public final class PackStore {
         this.writeChannelOpener = opener;
     }
 
+    /** 测试观测点: scanPack 计数回调, 断言增量重扫只扫变化 pack. 仅测试调用. */
+    void setScanObserverForTest(IntConsumer observer) {
+        this.scanObserverForTest = observer;
+    }
+
     private FileChannel readChannel(int packId) throws IOException {
         FileChannel ch = readChannels.get(packId);
         if (ch != null && ch.isOpen()) {
@@ -604,25 +666,32 @@ public final class PackStore {
     /**
      * 扫一个 pack 文件重建索引条目. 尾部 torn 记录 (header 不全 / 数据不足) 截断到上一条完整
      * 记录边界. 只有最后写入的 pack 可能出现 torn tail, 但此处对任意 pack 都做防御性截断.
+     *
+     * <p>大缓冲流式顺序读: 逐记录 20 字节 pread 在百万记录 store 上是百万次系统调用, 机械盘上
+     * 线性放大到分钟级 (issue #3 崩溃现场卡的就是 pread); 流式读把系统调用数压到 O(size/缓冲).
      */
     private void scanPack(int packId) throws IOException {
+        IntConsumer observer = scanObserverForTest;
+        if (observer != null) {
+            observer.accept(packId);
+        }
         Path p = packPath(packId);
         long validEnd;
         long size;
         try (FileChannel ch = FileChannel.open(p, StandardOpenOption.READ)) {
             size = ch.size();
+            DataInputStream in = new DataInputStream(
+                    new BufferedInputStream(Channels.newInputStream(ch), SCAN_BUFFER_BYTES));
             long pos = 0;
             while (pos + hashLength + LEN_FIELD_BYTES <= size) {
-                ByteBuffer header = ByteBuffer.allocate(hashLength + LEN_FIELD_BYTES);
-                readFully(ch, header, pos);
-                header.flip();
                 byte[] hashBytes = new byte[hashLength];
-                header.get(hashBytes);
-                int dataLength = header.getInt();
+                in.readFully(hashBytes);
+                int dataLength = in.readInt(); // BE, 与写侧 putInt 一致
                 long dataStart = pos + hashLength + LEN_FIELD_BYTES;
                 if (dataLength < 0 || dataStart + dataLength > size) {
                     break; // torn tail: header 完整但数据越界, 停在 pos
                 }
+                in.skipNBytes(dataLength);
                 index.put(new Hash(hashBytes), new PackLocation(packId, dataStart, dataLength));
                 pos = dataStart + dataLength;
             }
