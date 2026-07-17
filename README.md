@@ -60,7 +60,7 @@ BetterBackup 的解法：
 | general.enabled | true | 总开关。改 false 后 mod 仍加载但不再备份 |
 | general.backupDirectory | "backup-store" | 备份目录，相对 server root（跟 world/ 同级）。绝对路径也支持 |
 | storage.hashAlgorithm | XXH128 | 哈希算法。XXH128 比 SHA256 快 5-10 倍，碰撞概率仍低于硬盘位翻转。完整性敏感场景可切 SHA256 |
-| storage.maxStoreSizeGB | 500 | 超过此阈值启动时自动跑全量 GC |
+| storage.maxStoreSizeGB | 500 | 软阈值，仅启动时检查一次：超过则先按 retention 策略淘汰再跑全量 GC。retention 关闭时几乎无可回收；这不是硬磁盘配额 |
 | schedule.mode | INTERVAL | 备份模式：INTERVAL（定时）/ MANUAL（仅命令） |
 | schedule.intervalMinutes | 120 | INTERVAL 模式下的备份间隔 |
 | retention.enabled | false | 滚动保留淘汰总开关。默认关闭，所有快照永久保留、不淘汰任何历史。关闭时下面四个配额被忽略。开启前建议先跑 `/betterbackup retention preview` 看清一次淘汰会删哪些快照 |
@@ -91,7 +91,7 @@ BetterBackup 的解法：
 | `/betterbackup gc` | 全量 GC：扫所有 hash 文件，删没被任何备份引用的孤儿 |
 | `/betterbackup retention preview` | dry-run 预览：按当前配额 + 三门禁算出滚动淘汰"将删 / 将留"清单，不真删。启用 retention 前先看一眼 |
 
-**自动 GC**：每次 snapshot 创建后会自动跑增量 GC，清掉本周期内 worker 写入但 manifest 没引用的中间版本 hash。store 大小稳态 ≈ 当前所有 manifest 引用的 unique hash × 平均字节，**不会随时间线性增长**。
+**自动 GC**：每次 snapshot 创建后会自动跑增量 GC，清掉本周期内 worker 写入但 manifest 没引用的中间版本 hash。store 大小稳态 ≈ 当前所有 manifest 引用的 unique hash × 平均字节——**该稳态仅在开启 `retention.enabled` 滚动淘汰后成立**。默认 retention 关闭时所有快照永久保留，每份各自钉住其引用的历史版本，store 会随时间持续增长（活跃 chunk 每次存盘都产生新版本，无跨快照去重）。
 
 ## 恢复流程
 
@@ -144,7 +144,7 @@ java -jar shinoyuki_betterbackup-0.2.0-all.jar restore --store <备份目录> --
 
 ## 性能预期
 
-实战参考（按 60 玩家中型服 + 200 万 chunk + 7 天保留 + 2 小时一备 = 84 份）：
+实战参考（按 60 玩家中型服 + 200 万 chunk + 7 天保留 + 2 小时一备 = 84 份；封顶在 84 份的前提是开启 `retention.enabled`，默认关闭时份数与占用随时间累积）：
 
 | 维度 | FTB Backups Z | BetterBackup |
 |---|---|---|

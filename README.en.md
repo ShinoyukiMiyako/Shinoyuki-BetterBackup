@@ -62,7 +62,7 @@ Drop `shinoyuki_betterbackup-0.2.0-all.jar` (the one with the `-all` suffix, whi
 | general.enabled | true | Master switch. Set false and the mod still loads but stops backing up |
 | general.backupDirectory | "backup-store" | Backup directory, relative to the server root (sibling to world/). Absolute paths also work |
 | storage.hashAlgorithm | XXH128 | Hash algorithm. XXH128 is 5-10x faster than SHA256 and its collision probability is still below a disk bit flip. Switch to SHA256 for integrity-sensitive setups |
-| storage.maxStoreSizeGB | 500 | Above this threshold a full GC runs automatically at startup |
+| storage.maxStoreSizeGB | 500 | Soft threshold, checked once at startup: prunes per the retention policy, then runs a full GC. With retention disabled there is almost nothing to reclaim; this is not a hard disk quota |
 | schedule.mode | INTERVAL | Backup mode: INTERVAL (scheduled) / MANUAL (command only) |
 | schedule.intervalMinutes | 120 | Backup interval under INTERVAL mode |
 | retention.enabled | false | Master switch for rolling retention pruning. Off by default: every snapshot is kept forever and no history is ever pruned. While off the four quotas below are ignored. Before turning it on, run `/betterbackup retention preview` to see exactly which snapshots one prune pass would delete |
@@ -93,7 +93,7 @@ Requires OP level 2.
 | `/betterbackup gc` | Full GC: scan every hash file and delete orphans no backup references |
 | `/betterbackup retention preview` | Dry-run preview: compute the rolling-retention "would delete / would keep" lists from the current quotas + the three guards, without deleting anything. Check it before enabling retention |
 
-**Automatic GC**: after each snapshot creation an incremental GC runs automatically, clearing intermediate-version hashes that workers wrote this cycle but no manifest references. Steady-state store size ~= the unique hashes referenced by all current manifests x average bytes, so it **does not grow linearly over time**.
+**Automatic GC**: after each snapshot creation an incremental GC runs automatically, clearing intermediate-version hashes that workers wrote this cycle but no manifest references. Steady-state store size ~= the unique hashes referenced by all current manifests x average bytes -- **this steady state only holds once `retention.enabled` rolling pruning is turned on**. With retention off (the default) every snapshot is kept forever, each pinning the historical versions it references, so the store keeps growing over time (active chunks produce a new version on every save, with no cross-snapshot dedup).
 
 ## Restore flow
 
@@ -146,7 +146,7 @@ java -jar shinoyuki_betterbackup-0.2.0-all.jar restore --store <backup dir> --id
 
 ## Performance expectations
 
-Real-world reference (a 60-player mid-size server + 2M chunks + 7-day retention + a backup every 2 hours = 84 backups):
+Real-world reference (a 60-player mid-size server + 2M chunks + 7-day retention + a backup every 2 hours = 84 backups; capping at 84 requires `retention.enabled`, with the default off the count and footprint accumulate over time):
 
 | Metric | FTB Backups Z | BetterBackup |
 |---|---|---|
