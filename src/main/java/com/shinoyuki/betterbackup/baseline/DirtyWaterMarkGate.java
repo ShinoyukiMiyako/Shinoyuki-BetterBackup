@@ -49,7 +49,8 @@ public final class DirtyWaterMarkGate implements BaselineScanner.BackpressureGat
 
     /** 只由扫描线程写, 诊断线程读. */
     private volatile boolean blocked;
-    private volatile long blockedMillisTotal;
+    private volatile long finishedBlockedMillis;
+    private volatile long blockedSinceNanos;
 
     private long lastWarnNanos;
     private boolean warnedOnce;
@@ -71,9 +72,16 @@ public final class DirtyWaterMarkGate implements BaselineScanner.BackpressureGat
         return blocked;
     }
 
-    /** 累计被闸住的毫秒数 (诊断用). */
+    /**
+     * 累计被闸住的毫秒数 (诊断用). 含正在进行中的那一段 —— 长时间阻塞正是这个读数唯一有用
+     * 的时刻, 只统计已结束的段会让心跳日志在整段阻塞期间打出 "blocked / 0s".
+     */
     public long blockedMillisTotal() {
-        return blockedMillisTotal;
+        long total = finishedBlockedMillis;
+        if (blocked) {
+            total += (nanoTime.getAsLong() - blockedSinceNanos) / 1_000_000L;
+        }
+        return total;
     }
 
     @Override
@@ -83,6 +91,7 @@ public final class DirtyWaterMarkGate implements BaselineScanner.BackpressureGat
         }
 
         long startNanos = nanoTime.getAsLong();
+        blockedSinceNanos = startNanos;
         blocked = true;
         try {
             maybeWarn(startNanos, dirtyLevel.getAsInt(), currentHighWaterMark());
@@ -99,14 +108,15 @@ public final class DirtyWaterMarkGate implements BaselineScanner.BackpressureGat
                 }
                 maybeWarn(nanoTime.getAsLong(), level, high);
                 if (!waiter.await(POLL_INTERVAL_MS)) {
-                    // 被中断: 不再等下去, 交回扫描线程按自己的停止检查退出.
+                    // 被中断: 只把中断位还给调用线程供上层察觉, 不再等下去. 扫描线程的停机
+                    // 语义走 requestStop 而非中断, 不会据此退出.
                     Thread.currentThread().interrupt();
                     return;
                 }
             }
         } finally {
+            finishedBlockedMillis += (nanoTime.getAsLong() - startNanos) / 1_000_000L;
             blocked = false;
-            blockedMillisTotal += (nanoTime.getAsLong() - startNanos) / 1_000_000L;
         }
     }
 
@@ -122,7 +132,9 @@ public final class DirtyWaterMarkGate implements BaselineScanner.BackpressureGat
         lastWarnNanos = now;
         LOGGER.warn("[BetterBackup] baseline sampling paused: dirty={} reached baseline.dirtyHighWaterMark={}; "
                         + "waiting for the next snapshot to drain it (resumes at {}). If this persists, check "
-                        + "schedule.mode / schedule.intervalMinutes, or run /betterbackup snapshot create once.",
+                        + "schedule.mode / schedule.intervalMinutes, check /betterbackup status for repeated "
+                        + "snapshot failures (a failed snapshot puts its entries back), or run "
+                        + "/betterbackup snapshot create once.",
                 level, high, (int) (high * RESUME_RATIO));
     }
 

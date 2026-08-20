@@ -9,8 +9,9 @@ package com.shinoyuki.betterbackup.baseline;
  * 调用无并发竞争.
  *
  * <p><b>速率每次现读</b>: 速率来自 {@code IntSupplier}, 每次 acquire 现读一次, 因此改
- * config 触发 Forge 的 reload 后下一个 slot 就按新速率走, 不必重启. 速率调小时同时把
- * 已排定的放行时刻收紧到新间隔内, 否则上一次按旧 (更长) 间隔算出的等待还会多拖一轮.
+ * config 触发 Forge 的 reload 后下一个 slot 就按新速率走, 不必重启. 速率调高 (间隔变小)
+ * 时同时把已排定的放行时刻收紧到新间隔内, 否则上一次按旧 (更长) 间隔算出的等待还会多拖
+ * 一轮. 速率调低时不需要对称处理: 已排定的那一次按旧的短间隔放行, 之后自然按新间隔走.
  *
  * <p>时钟源用 {@code nanoTimeSupplier} + {@code sleeper} 注入, 让测试用假时钟断言
  * 调用了正确次数的 sleep 而不真睡, 跑测试不引入墙钟等待.

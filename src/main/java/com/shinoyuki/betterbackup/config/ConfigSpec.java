@@ -176,7 +176,10 @@ public final class ConfigSpec {
                          "lost. If it stays paused, the server is not taking snapshots - check schedule.mode",
                          "and schedule.intervalMinutes, or run /betterbackup snapshot create once.",
                          "Roughly 230 bytes of heap per pending entry, so the default caps this path at",
-                         "about 115 MB. Changes apply without a restart.")
+                         "about 115 MB. Changes apply without a restart.",
+                         "Scope: this gates the baseline full scan only. The degraded-window backfill is not",
+                         "gated by it - it keeps no per-region progress, so pausing it would lose the regions",
+                         "it had not reached yet.")
                 .defineInRange("dirtyHighWaterMark", 500_000, 10_000, 5_000_000);
 
         BUILDER.pop();

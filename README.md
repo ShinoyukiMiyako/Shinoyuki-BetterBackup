@@ -38,10 +38,10 @@ WIP 阶段的使用建议：
 - 优先在测试服 / 可丢弃的存档上试用，先完整跑完一次 baseline 再评估
 - 生产服请保留原有的全量备份方案兜底。这一条与下面「[已知限制](#已知限制)」里"跟其他备份 mod 建议二选一"的省空间建议冲突时，以本节为准
 - 接入大存档前先确认 `baseline.scanChunksPerSecond` 没有被调高，并留出足够的可用内存余量
-- 确认 `schedule.mode` 是 `INTERVAL`：背压闸靠快照 drain 放行，`MANUAL` 模式下不手动建快照就没有 drain，baseline 会一直停在那里等
+- 确认 `schedule.mode` 是 `INTERVAL`：背压闸靠快照 drain 放行。`MANUAL` 与 `AFTER_AUTOSAVE`（当前实现等同 `MANUAL`）下不手动建快照就没有自动 drain，baseline 会停在那里等；干净关服的收尾快照也会 drain 一次，所以这两种模式下 baseline 每个会话最多推进 `dirtyHighWaterMark` 个区块，而被 kill -9 / 面板强杀打断的会话由于来不及晋升，净进度为零
 - 恢复能力请在真正需要之前先演练一次（离线 CLI 的 `verify` / `restore` 不需要服务端在跑）
 
-一条必须讲清楚的边界：背压只约束 BetterBackup 自己的内存增长，替代不了合理的 JVM 定容。用 `-Xms` 配合 `-XX:+AlwaysPreTouch` 把堆预占到接近物理内存时，任何后台任务都可能把进程推给内核 OOM killer，而 ZGC 的堆多重映射还会让 RSS 统计进一步放大；上面 #5 那台机器 BetterBackup 自身的增量只占 48 GB 堆的百分之一量级。
+两条必须讲清楚的边界。其一，背压闸只作用于 baseline 全量扫描；降级窗口补采不受 `dirtyHighWaterMark` 约束（它不持久化逐 region 进度，闸停后未扫到的区域会被 mtime 过滤再也补不回来），它运行期间上面那个内存上界不成立。其二，背压只约束 BetterBackup 自己的内存增长，替代不了合理的 JVM 定容。用 `-Xms` 配合 `-XX:+AlwaysPreTouch` 把堆预占到接近物理内存时，任何后台任务都可能把进程推给内核 OOM killer，而 ZGC 的堆多重映射还会让 RSS 统计进一步放大；上面 #5 那台机器 BetterBackup 自身的增量只占 48 GB 堆的百分之一量级。
 
 问题反馈与最新状态：[Issues](https://github.com/ShinoyukiMiyako/Shinoyuki-BetterBackup/issues)。
 

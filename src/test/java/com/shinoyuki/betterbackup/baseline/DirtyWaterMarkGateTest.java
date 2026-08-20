@@ -30,6 +30,7 @@ class DirtyWaterMarkGateTest {
 
         final List<Long> waits = new ArrayList<>();
         final AtomicLong nanos = new AtomicLong();
+        final AtomicInteger nanoReads = new AtomicInteger();
         private final IntConsumer perRound;
         private int interruptAtRound = -1;
 
@@ -53,6 +54,7 @@ class DirtyWaterMarkGateTest {
         }
 
         long nano() {
+            nanoReads.incrementAndGet();
             return nanos.get();
         }
     }
@@ -71,6 +73,9 @@ class DirtyWaterMarkGateTest {
         gate.awaitRoom(() -> false);
 
         assertTrue(waiter.waits.isEmpty(), "水位低于阈值必须走零开销快路径");
+        // 判别快路径本身: 快路径在读时钟之前就 return, 一次 nanoTime 都不该发生.
+        // 只断言 waits 为空是不够的 —— 删掉快路径后循环首轮就放行, waits 同样为空.
+        assertEquals(0, waiter.nanoReads.get(), "快路径不得进入计时段");
         assertFalse(gate.isBlocked());
         assertEquals(0L, gate.blockedMillisTotal());
     }

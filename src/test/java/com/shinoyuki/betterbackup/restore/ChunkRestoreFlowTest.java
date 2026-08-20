@@ -356,6 +356,34 @@ class ChunkRestoreFlowTest {
     }
 
     @Test
+    void jvm_level_error_aborts_the_batch_instead_of_being_filed_as_a_chunk_failure(@TempDir Path root)
+            throws IOException {
+        Path snapshotsDir = newSnapshotsDir(root);
+        ChunkStore store = newStore(root);
+        List<ChunkPos> targets = area(0, 0, 1);
+        captureAll(store, snapshotsDir, "snap-error", targets);
+
+        // 查表时抛 Error, 模拟解析过程中的 JVM 级故障 (OOM / StackOverflow).
+        Map<Long, Hash> exploding = new HashMap<>() {
+            @Override
+            public Hash get(Object key) {
+                throw new StackOverflowError("simulated JVM-level failure");
+            }
+        };
+        Map<String, Map<Long, Hash>> chunks = new HashMap<>();
+        chunks.put(DIM, exploding);
+        SnapshotManifest poisoned = new SnapshotManifest(
+                SnapshotManifest.SCHEMA_VERSION, "snap-error", 0L, 0L, chunks,
+                new HashMap<>(), new HashMap<>(), null, 0L, 0L, false, FileManifest.empty());
+
+        ChunkRestoreFlow flow = new ChunkRestoreFlow(store, snapshotsDir, p -> poisoned);
+
+        // 逐块捕获只吃 Exception: Error 必须整批中止, 而不是被记成一条"解析失败"后
+        // 让剩下的块继续交给主线程原地覆盖活 chunk.
+        assertThrows(StackOverflowError.class, () -> flow.resolveArea("snap-error", DIM, targets));
+    }
+
+    @Test
     void missing_manifest_aborts_whole_batch_before_touching_targets(@TempDir Path root) throws IOException {
         Path snapshotsDir = newSnapshotsDir(root);
         ChunkStore store = newStore(root);

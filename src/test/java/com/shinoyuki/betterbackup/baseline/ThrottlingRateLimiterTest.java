@@ -49,6 +49,21 @@ class ThrottlingRateLimiterTest {
     }
 
     @Test
+    void illegal_live_rate_falls_back_to_the_construction_time_value() {
+        FakeClock clock = new FakeClock();
+        AtomicInteger rate = new AtomicInteger(50); // 20ms 间隔
+        ThrottlingRateLimiter rl = new ThrottlingRateLimiter(rate::get, clock::nano, clock::sleep);
+
+        rl.acquire(); // prime
+        rl.acquire();
+        rate.set(0);  // 只可能是接线出错; 热路径上不得因此炸掉扫描线程
+        rl.acquire();
+
+        assertEquals(2, clock.sleeps.size());
+        assertEquals(20_000_000L, clock.sleeps.get(1), "非法速率必须退回构造期已校验的值, 而不是除零");
+    }
+
+    @Test
     void rate_change_applies_to_the_next_acquire() {
         FakeClock clock = new FakeClock();
         AtomicInteger rate = new AtomicInteger(50); // 20ms 间隔

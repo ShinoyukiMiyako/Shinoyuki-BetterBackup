@@ -788,6 +788,9 @@ public final class BetterBackupMod {
                 scanner.scan();
             } catch (IOException e) {
                 LOGGER.error("[BetterBackup] baseline scan failed (progress persisted, will resume next start)", e);
+            } finally {
+                // 扫描线程退出后闸门已无取样可闸, 摘钩让诊断读数不再报一个退休闸门的历史值.
+                BetterBackupCore.setBaselineGate(null);
             }
         }, "BetterBackup-Baseline-Scan");
         thread.setDaemon(true);

@@ -244,6 +244,57 @@ class BaselineScannerTest {
     }
 
     @Test
+    void backpressure_releases_on_stop_request_so_shutdown_never_waits_for_a_drain(@TempDir Path base)
+            throws IOException {
+        // 关服互等的防线: 水位触顶把扫描线程闸在 awaitRoom 里时, 唯一能降水位的 drain 来自
+        // 关服快照, 而关服快照排在 baselineThread.join 之后 —— 闸门必须认得 requestStop,
+        // 否则 join 必然超时, 扫描线程带着写权限跨过关服快照的 drain + 晋升。
+        Path storeRoot = base.resolve("store");
+        Path worldRoot = base.resolve("world");
+        writeRegion(worldRoot, "region", 0, 0, Map.of(
+                0, "c0".getBytes(),
+                1, "c1".getBytes(),
+                2, "c2".getBytes(),
+                3, "c3".getBytes(),
+                4, "c4".getBytes()));
+
+        CurrentSnapshotState state = new CurrentSnapshotState();
+        Set<Hash> written = ConcurrentHashMap.newKeySet();
+        BaselineProgress progress = new BaselineProgress(storeRoot);
+
+        List<Long> waits = new ArrayList<>();
+        AtomicLong fakeNanos = new AtomicLong();
+        java.util.concurrent.atomic.AtomicReference<BaselineScanner> self =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        java.util.concurrent.atomic.AtomicBoolean finishCalled = new java.util.concurrent.atomic.AtomicBoolean();
+        // 水位恒在阈值之上且永不 drain: 只有 requestStop 能把扫描线程放出来.
+        DirtyWaterMarkGate gate = new DirtyWaterMarkGate(state::size, () -> 3, fakeNanos::get, millis -> {
+            waits.add(millis);
+            fakeNanos.addAndGet(millis * 1_000_000L);
+            if (waits.size() > 100) {
+                throw new IllegalStateException("gate ignored the stop request");
+            }
+            self.get().requestStop();
+            return true;
+        });
+
+        ChunkStore store = new ChunkStore(storeRoot);
+        store.initialize();
+        BaselineScanner scanner = new BaselineScanner(store, state, new WorldPaths(worldRoot),
+                new Xxh128HashFunction(), written, progress,
+                BaselineScanner.RateLimiter.NONE, gate, () -> finishCalled.set(true));
+        self.set(scanner);
+
+        BaselineScanner.Result result = scanner.scan();
+
+        assertEquals(1, waits.size(), "收到停止请求后闸门必须当轮返回, 不得继续等 drain");
+        assertEquals(3, state.chunkCount(), "登记停在触顶那个 slot 的边界上");
+        assertFalse(result.complete(), "被停止的扫描不得报 complete");
+        assertFalse(finishCalled.get(), "被停止的扫描不得触发收尾快照");
+        assertTrue(progress.snapshotScannedKeys().isEmpty(), "半扫 region 不得被标 scanned");
+    }
+
+    @Test
     void requestStop_halts_at_slot_boundary_without_marking_partial_region(@TempDir Path base) throws IOException {
         // 关服路径: 扫描中段被 requestStop, 必须 (a) 不调收尾回调 (防与关服快照竞争),
         // (b) 半扫 region 不标 scanned (否则晋升 committed 后缺的 slot 永不重扫),

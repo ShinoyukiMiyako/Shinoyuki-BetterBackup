@@ -56,13 +56,8 @@ public final class DiagnosticLogger {
         DirtyWaterMarkGate gate = BetterBackupCore.baselineGate();
         boolean backpressured = gate != null && gate.isBlocked();
 
-        // 仅在状态有变化时 log, 避免空跑期间日志洪流. 背压期间水位与队列都不动, 但这正是
-        // 最需要看见的时刻, 故单独放行.
-        boolean changed = chunkCount != lastChunkCount
-                || entityCount != lastEntityCount
-                || savedDataCount != lastSavedDataCount
-                || queueDepth > 0
-                || backpressured;
+        boolean changed = shouldLog(chunkCount, entityCount, savedDataCount, queueDepth, backpressured,
+                lastChunkCount, lastEntityCount, lastSavedDataCount);
         if (!changed) {
             return;
         }
@@ -86,7 +81,22 @@ public final class DiagnosticLogger {
         metrics.setQueueDepth(queue.size());
     }
 
-    private static String describeBackpressure(DirtyWaterMarkGate gate) {
+    /**
+     * 是否输出本轮心跳. 仅在状态有变化时 log, 避免空跑期间日志洪流; 但背压期间水位与队列
+     * 都不动, 而那正是最需要看见的时刻, 故单独放行.
+     */
+    static boolean shouldLog(long chunkCount, long entityCount, long savedDataCount, int queueDepth,
+                             boolean backpressured,
+                             long lastChunkCount, long lastEntityCount, long lastSavedDataCount) {
+        return chunkCount != lastChunkCount
+                || entityCount != lastEntityCount
+                || savedDataCount != lastSavedDataCount
+                || queueDepth > 0
+                || backpressured;
+    }
+
+    /** 背压字段. gate 为 null 表示当前没有 baseline 扫描线程可闸, 与"闸门未触发"不是一回事. */
+    static String describeBackpressure(DirtyWaterMarkGate gate) {
         if (gate == null) {
             return "n/a";
         }
