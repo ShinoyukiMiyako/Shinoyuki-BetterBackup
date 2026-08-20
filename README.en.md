@@ -4,8 +4,13 @@
 
 An **incremental backup** mod for Minecraft 1.20.1 Forge servers. From the second backup onward it only processes changed chunks, cutting the footprint of 84 backups from the ~16.8 TB a vanilla approach would need down to roughly 150-300 GB (98% saved). Backups run on background worker threads with zero main-thread cost. It integrates deeply with [Shinoyuki-BetterAutoSave](https://github.com/ShinoyukiMiyako/Shinoyuki-BetterAutoSave) (BAS).
 
+> **Project status: WIP. Not ready for production use.**
+>
+> 0.2.0 is the only public release so far. A long-running trial on a real 26 GB world (~3.2M objects) surfaced defects that can get the whole server process killed - see [Current status and known blockers](#current-status-and-known-blockers). Do not rely on BetterBackup as your only backup, and do not deploy it on a server that has no independent full backup to fall back on.
+
 ## Contents
 
+- [Current status and known blockers](#current-status-and-known-blockers)
 - [What problem does it solve](#what-problem-does-it-solve)
 - [How it differs from existing backup mods](#how-it-differs-from-existing-backup-mods)
 - [Installation](#installation)
@@ -17,6 +22,25 @@ An **incremental backup** mod for Minecraft 1.20.1 Forge servers. From the secon
 - [Known limitations](#known-limitations)
 - [Building](#building)
 - [Credits](#credits)
+
+## Current status and known blockers
+
+The core paths (incremental backup / automatic GC / restore / offline CLI) work and are covered by unit tests, but validation against large real-world saves is still in progress. The confirmed issues below can take a server down, and until they are fixed and released this project is not suitable for production:
+
+| Issue | Impact | Status |
+|---|---|---|
+| [#5](https://github.com/ShinoyukiMiyako/Shinoyuki-BetterBackup/issues/5) The baseline scan is rate-throttled only, with no backpressure, and `scanChunksPerSecond` accepts values up to 100000 | On a large world, raising that value makes the dirty set grow without bound until the kernel OOM killer kills the whole java process - which, with a panel auto-restart, becomes a crash loop | Not fixed. Workaround: keep the default of 50, and never go above 1000 |
+| [#4](https://github.com/ShinoyukiMiyako/Shinoyuki-BetterBackup/issues/4) `restore-chunk-live` re-reads the entire manifest for every chunk it rolls back | With a 12 MB manifest, radius 3 (49 chunks) takes 8.5 s, 99% of which is redundant parse IO. The manifest grows with the world, so larger radii become unusable | Not fixed |
+| [#3](https://github.com/ShinoyukiMiyako/Shinoyuki-BetterBackup/issues/3) Store index initialization runs on the main thread | On a large store the Watchdog treats startup as a hang and kills the server, producing a startup crash loop | Fixed on `main` (async initialization + incremental index rescan + sidecar self-healing), but **not released yet** - 0.2.0 is still affected |
+
+Advice while the project is WIP:
+
+- Try it on a test server or a disposable world first, and let a full baseline finish before you judge it
+- Keep your existing full-backup solution on production servers. Where this conflicts with the "pick one" space-saving advice under [Known limitations](#known-limitations) below, this section wins
+- Before pointing it at a large world, confirm `baseline.scanChunksPerSecond` has not been raised, and leave real headroom in available memory
+- Rehearse a restore before you actually need one (the offline CLI's `verify` / `restore` do not need a running server)
+
+Reports and current status: [Issues](https://github.com/ShinoyukiMiyako/Shinoyuki-BetterBackup/issues).
 
 ## What problem does it solve
 

@@ -2,8 +2,13 @@
 
 Minecraft 1.20.1 Forge 服务端**增量备份** mod。第二次备份起只处理变化的 chunk，84 份备份占用从 vanilla 方案的 16.8 TB 降到约 150-300 GB（98% 节省）。备份在后台 worker 线程跑，主线程零开销。跟 [Shinoyuki-BetterAutoSave](https://github.com/ShinoyukiMiyako/Shinoyuki-BetterAutoSave) (BAS) 深度集成。
 
+> **项目状态：WIP（开发中），暂不具备上生产环境的条件。**
+>
+> 0.2.0 是目前唯一的公开版本。在 26 GB 存档 / 约 320 万对象的真机长跑中，它暴露出了会导致整个服务端进程被杀掉的缺陷，详见 [当前状态与已知阻塞问题](#当前状态与已知阻塞问题)。请不要把 BetterBackup 当作唯一的备份手段，也不要在没有独立全量备份兜底的服务器上部署。
+
 ## 目录
 
+- [当前状态与已知阻塞问题](#当前状态与已知阻塞问题)
 - [它解决什么问题](#它解决什么问题)
 - [跟现有备份 mod 的区别](#跟现有备份-mod-的区别)
 - [安装](#安装)
@@ -15,6 +20,25 @@ Minecraft 1.20.1 Forge 服务端**增量备份** mod。第二次备份起只处�
 - [已知限制](#已知限制)
 - [构建](#构建)
 - [致谢](#致谢)
+
+## 当前状态与已知阻塞问题
+
+核心链路（增量备份 / 自动 GC / 恢复 / 离线 CLI）已经跑通并有单元测试覆盖，但真机大存档的长跑验证还在进行中。下面这些已确认的问题足以影响服务端可用性，在它们收敛并发版之前，本项目不适合上生产环境：
+
+| 问题 | 影响 | 状态 |
+|---|---|---|
+| [#5](https://github.com/ShinoyukiMiyako/Shinoyuki-BetterBackup/issues/5) baseline 扫描只有速率节流、没有背压，`scanChunksPerSecond` 允许配到 100000 | 大存档上把该值调高会让 dirty 集合单调膨胀，最终整个 java 进程被内核 OOM killer 杀掉，配合面板自动拉起形成重启循环 | 未修复。规避：保持默认 50，最高不要超过 1000 |
+| [#4](https://github.com/ShinoyukiMiyako/Shinoyuki-BetterBackup/issues/4) `restore-chunk-live` 每回退一块就重读一次整份 manifest | 12 MB manifest 下半径 3（49 块）耗时 8.5 秒，其中 99% 是重复解析 IO。manifest 随世界增长，半径越大越不可用 | 未修复 |
+| [#3](https://github.com/ShinoyukiMiyako/Shinoyuki-BetterBackup/issues/3) 大 store 的索引初始化跑在主线程上 | 启动阶段被 Watchdog 判定卡死强杀，形成启动崩溃循环 | 已在 main 修复（初始化异步化 + 索引增量重扫 + sidecar 自愈），但**尚未发版**，0.2.0 仍然受影响 |
+
+WIP 阶段的使用建议：
+
+- 优先在测试服 / 可丢弃的存档上试用，先完整跑完一次 baseline 再评估
+- 生产服请保留原有的全量备份方案兜底。这一条与下面「[已知限制](#已知限制)」里"跟其他备份 mod 建议二选一"的省空间建议冲突时，以本节为准
+- 接入大存档前先确认 `baseline.scanChunksPerSecond` 没有被调高，并留出足够的可用内存余量
+- 恢复能力请在真正需要之前先演练一次（离线 CLI 的 `verify` / `restore` 不需要服务端在跑）
+
+问题反馈与最新状态：[Issues](https://github.com/ShinoyukiMiyako/Shinoyuki-BetterBackup/issues)。
 
 ## 它解决什么问题
 
