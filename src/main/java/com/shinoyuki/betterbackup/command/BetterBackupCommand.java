@@ -26,7 +26,6 @@ import com.shinoyuki.betterbackup.store.Hash;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.core.registries.Registries;
-import net.minecraft.nbt.CompoundTag;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.resources.ResourceLocation;
@@ -539,29 +538,26 @@ public final class BetterBackupCommand {
 
         Thread worker = new Thread(() -> {
             long tResolveStart = System.currentTimeMillis();
-            List<ResolvedTarget> resolved = new ArrayList<>();
-            int notCaptured = 0;
-            int resolveFailed = 0;
-            for (ChunkPos pos : targets) {
-                ChunkRestoreFlow.ResolvedChunk r;
-                try {
-                    r = flow.resolve(snapshotId, dimId, pos.x, pos.z);
-                } catch (Throwable t) {
-                    resolveFailed++;
-                    BetterBackupMod.LOGGER.error("[BetterBackup] restore-chunk-live resolve failed @{}", pos, t);
-                    continue;
-                }
-                if (!r.captured()) {
-                    notCaptured++;
-                    continue;
-                }
-                resolved.add(new ResolvedTarget(pos, r.tag()));
+            ChunkRestoreFlow.ResolvedArea area;
+            try {
+                area = flow.resolveArea(snapshotId, dimId, targets);
+            } catch (Throwable t) {
+                // daemon 线程最外层: 不接住就没有任何反馈到达玩家 (线程静默死掉, 下面的
+                // server.execute 永不执行). 打全栈保留现场, 再回主线程报一条明确失败.
+                BetterBackupMod.LOGGER.error(
+                        "[BetterBackup] restore-chunk-live area resolve failed: snapshot={} dim={}",
+                        snapshotId, dimId, t);
+                server.execute(() -> source.sendFailure(Component.literal(
+                        "在线回退失败: 快照 " + snapshotId + " 解析中止 (" + t + ").")));
+                return;
+            }
+            for (ChunkRestoreFlow.ResolveFailure f : area.failures()) {
+                BetterBackupMod.LOGGER.error("[BetterBackup] restore-chunk-live resolve failed @{}",
+                        f.pos(), f.cause());
             }
             long resolveMs = System.currentTimeMillis() - tResolveStart;
-            int fNotCaptured = notCaptured;
-            int fResolveFailed = resolveFailed;
             server.execute(() -> installArea(level, source, server, center, radius,
-                    targets.size(), resolved, fNotCaptured, fResolveFailed, t0, resolveMs));
+                    targets.size(), area.resolved(), area.notCaptured(), area.failures().size(), t0, resolveMs));
         }, "BetterBackup-Cmd-RestoreChunkLive");
         worker.setDaemon(true);
         worker.start();
@@ -572,7 +568,8 @@ public final class BetterBackupCommand {
      * 不确定 (BAS 可能在 load worker 完成), 故 allOf 回调内统一 server.execute marshal 回主线程.
      */
     private static void installArea(ServerLevel level, CommandSourceStack source, MinecraftServer server,
-                                    ChunkPos center, int radius, int total, List<ResolvedTarget> resolved,
+                                    ChunkPos center, int radius, int total,
+                                    List<ChunkRestoreFlow.ResolvedTarget> resolved,
                                     int notCaptured, int resolveFailed, long t0, long resolveMs) {
         if (resolved.isEmpty()) {
             source.sendFailure(Component.literal(
@@ -581,7 +578,7 @@ public final class BetterBackupCommand {
         }
         long tSubmit = System.currentTimeMillis();
         List<CompletableFuture<ChunkRestoreResult>> futures = new ArrayList<>();
-        for (ResolvedTarget t : resolved) {
+        for (ChunkRestoreFlow.ResolvedTarget t : resolved) {
             futures.add(SaveCoordination.restoreChunkLive(level, t.pos(), t.tag()));
         }
         CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
@@ -760,9 +757,6 @@ public final class BetterBackupCommand {
     }
 
     private record PendingArea(String id, String dimId, int cx, int cz, int radius, long expiryMillis) {
-    }
-
-    private record ResolvedTarget(ChunkPos pos, CompoundTag tag) {
     }
 
     /**
