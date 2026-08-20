@@ -41,6 +41,7 @@ public final class ConfigSpec {
     public static final ForgeConfigSpec.IntValue BACKUP_WORKER_THREADS;
 
     public static final ForgeConfigSpec.IntValue BASELINE_SCAN_CHUNKS_PER_SECOND;
+    public static final ForgeConfigSpec.IntValue BASELINE_DIRTY_HIGH_WATER_MARK;
 
     public static final ForgeConfigSpec.BooleanValue VERIFY_ON_STARTUP;
     public static final ForgeConfigSpec.BooleanValue VERIFY_ON_SNAPSHOT;
@@ -157,8 +158,26 @@ public final class ConfigSpec {
                          "The scan reads raw bytes off disk for every existing chunk in every dimension's",
                          "region/ and entities/ directories; the limit keeps it from saturating disk IO",
                          "while players are online. Default 50 finishes a ~1M chunk world in roughly 5.5 hours.",
-                         "Progress is checkpointed per region file, so a restart resumes where it left off.")
-                .defineInRange("scanChunksPerSecond", 50, 1, 100_000);
+                         "Progress is checkpointed per region file, so a restart resumes where it left off.",
+                         "This is a safety ceiling, not a performance dial: a limiter can only slow the scan",
+                         "down, so any value above what the disk actually delivers per slot never sleeps at",
+                         "all and is indistinguishable from no limit. Changes apply without a restart.",
+                         "The degraded-window backfill runs its own limiter with the same value, so both",
+                         "running at once reads at up to twice this rate.")
+                .defineInRange("scanChunksPerSecond", 50, 1, 2_000);
+
+        BASELINE_DIRTY_HIGH_WATER_MARK = BUILDER
+                .comment("Backpressure for the baseline full scan, in pending dirty entries.",
+                         "Scanned chunks stay registered in memory until the next snapshot drains them, so",
+                         "between two snapshots the scan accumulates whatever it produces. When the pending",
+                         "count reaches this mark the scan pauses sampling and waits; it resumes once a",
+                         "snapshot has drained the count back down to half the mark.",
+                         "A paused scan is harmless: progress is persisted per region file and nothing is",
+                         "lost. If it stays paused, the server is not taking snapshots - check schedule.mode",
+                         "and schedule.intervalMinutes, or run /betterbackup snapshot create once.",
+                         "Roughly 230 bytes of heap per pending entry, so the default caps this path at",
+                         "about 115 MB. Changes apply without a restart.")
+                .defineInRange("dirtyHighWaterMark", 500_000, 10_000, 5_000_000);
 
         BUILDER.pop();
 

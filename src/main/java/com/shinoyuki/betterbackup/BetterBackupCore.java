@@ -1,6 +1,7 @@
 package com.shinoyuki.betterbackup;
 
 import com.shinoyuki.betterbackup.baseline.BaselineProgress;
+import com.shinoyuki.betterbackup.baseline.DirtyWaterMarkGate;
 import com.shinoyuki.betterbackup.diagnostic.BetterBackupMetrics;
 import com.shinoyuki.betterbackup.diagnostic.DiagnosticLogger;
 import com.shinoyuki.betterbackup.diagnostic.PrometheusExporter;
@@ -39,6 +40,7 @@ public final class BetterBackupCore {
     private static volatile PrometheusExporter EXPORTER;
     private static volatile BaselineProgress BASELINE_PROGRESS;
     private static volatile PipelineDegradedHandler PIPELINE_DEGRADED_HANDLER;
+    private static volatile DirtyWaterMarkGate BASELINE_GATE;
     // store 后台初始化 (issue #3 异步化) 完成且 worker/scheduler 已启动后才置 true.
     // isInstalled() 只表示 "已接线, 关停需要拆"; isReady() 才表示 "store 可安全读写".
     private static volatile boolean STORE_READY;
@@ -85,6 +87,7 @@ public final class BetterBackupCore {
         EXPORTER = null;
         BASELINE_PROGRESS = null;
         PIPELINE_DEGRADED_HANDLER = null;
+        BASELINE_GATE = null;
     }
 
     public static void setExporter(PrometheusExporter exporter) {
@@ -97,6 +100,15 @@ public final class BetterBackupCore {
 
     public static PipelineDegradedHandler pipelineDegradedHandler() {
         return PIPELINE_DEGRADED_HANDLER;
+    }
+
+    /** baseline 扫描的背压闸. baseline 已完成 (不再拉起扫描线程) 时为 null. */
+    public static void setBaselineGate(DirtyWaterMarkGate gate) {
+        BASELINE_GATE = gate;
+    }
+
+    public static DirtyWaterMarkGate baselineGate() {
+        return BASELINE_GATE;
     }
 
     public static boolean isInstalled() {

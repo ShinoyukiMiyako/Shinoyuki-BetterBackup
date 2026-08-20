@@ -31,6 +31,7 @@ public final class BetterBackupConfig {
     private static volatile int backupWorkerThreads;
 
     private static volatile int baselineScanChunksPerSecond;
+    private static volatile int baselineDirtyHighWaterMark;
 
     private static volatile boolean verifyOnStartup;
     private static volatile boolean verifyOnSnapshot;
@@ -95,6 +96,10 @@ public final class BetterBackupConfig {
         return baselineScanChunksPerSecond;
     }
 
+    public static int baselineDirtyHighWaterMark() {
+        return baselineDirtyHighWaterMark;
+    }
+
     public static boolean verifyOnStartup() {
         return verifyOnStartup;
     }
@@ -142,6 +147,7 @@ public final class BetterBackupConfig {
         retentionMonthly = ConfigSpec.RETENTION_MONTHLY.get();
         backupWorkerThreads = ConfigSpec.BACKUP_WORKER_THREADS.get();
         baselineScanChunksPerSecond = ConfigSpec.BASELINE_SCAN_CHUNKS_PER_SECOND.get();
+        baselineDirtyHighWaterMark = ConfigSpec.BASELINE_DIRTY_HIGH_WATER_MARK.get();
         verifyOnStartup = ConfigSpec.VERIFY_ON_STARTUP.get();
         verifyOnSnapshot = ConfigSpec.VERIFY_ON_SNAPSHOT.get();
         prometheusEnabled = ConfigSpec.PROMETHEUS_ENABLED.get();

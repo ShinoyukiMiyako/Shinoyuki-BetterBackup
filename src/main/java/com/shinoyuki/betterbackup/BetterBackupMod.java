@@ -5,6 +5,7 @@ import com.shinoyuki.betterautosave.api.SaveListenerRegistry;
 import com.shinoyuki.betterbackup.baseline.BaselineProgress;
 import com.shinoyuki.betterbackup.baseline.BaselineScanner;
 import com.shinoyuki.betterbackup.baseline.DegradedRescan;
+import com.shinoyuki.betterbackup.baseline.DirtyWaterMarkGate;
 import com.shinoyuki.betterbackup.baseline.ThrottlingRateLimiter;
 import com.shinoyuki.betterbackup.command.BetterBackupCommand;
 import com.shinoyuki.betterbackup.config.BetterBackupConfig;
@@ -775,8 +776,13 @@ public final class BetterBackupMod {
             baselineScanFinished.set(true);
             creator.create("baseline-complete");
         };
+        DirtyWaterMarkGate gate = new DirtyWaterMarkGate(
+                state::size, BetterBackupConfig::baselineDirtyHighWaterMark);
         BaselineScanner scanner = new BaselineScanner(store, state, paths, hashFunction,
-                writtenThisWindow, baselineProgress, new ThrottlingRateLimiter(rate), onScanFinished);
+                writtenThisWindow, baselineProgress,
+                new ThrottlingRateLimiter(BetterBackupConfig::baselineScanChunksPerSecond),
+                gate, onScanFinished);
+        BetterBackupCore.setBaselineGate(gate);
         Thread thread = new Thread(() -> {
             try {
                 scanner.scan();
@@ -788,7 +794,8 @@ public final class BetterBackupMod {
         activeBaselineScanner = scanner;
         activeBaselineThread = thread;
         thread.start();
-        LOGGER.info("[BetterBackup] baseline full scan started (rate={} chunk/s)", rate);
+        LOGGER.info("[BetterBackup] baseline full scan started (rate={} chunk/s, dirtyHighWaterMark={}; "
+                + "both apply live from config)", rate, BetterBackupConfig.baselineDirtyHighWaterMark());
     }
 
     /**
@@ -819,8 +826,10 @@ public final class BetterBackupMod {
         LOGGER.warn("[BetterBackup] degraded-session flag present from a prior run; "
                 + "backfill of the degraded window starts in background");
         int rate = BetterBackupConfig.baselineScanChunksPerSecond();
+        // 只限速不加背压闸: DegradedRescan 不持久化逐 region 进度, 且下次启动的 cutoff 会
+        // 前移, 把它闸停后未扫到的 region 会被 mtime 过滤掉再也补不回来.
         DegradedRescan rescan = new DegradedRescan(store, state, paths, hashFunction, writtenThisWindow,
-                new ThrottlingRateLimiter(rate));
+                new ThrottlingRateLimiter(BetterBackupConfig::baselineScanChunksPerSecond));
         Thread thread = new Thread(() -> {
             try {
                 // cutoff 计算要 Files.list + 逐个 readFrom 全部 manifest, O(快照数) 读盘. 本方法

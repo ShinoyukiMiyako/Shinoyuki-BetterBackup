@@ -18,10 +18,14 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -55,7 +59,7 @@ class BaselineScannerTest {
         WorldPaths paths = new WorldPaths(worldRoot);
         HashFunction hashFunction = new Xxh128HashFunction();
         return new BaselineScanner(store, state, paths, hashFunction, written, progress,
-                BaselineScanner.RateLimiter.NONE, onScanFinished);
+                BaselineScanner.RateLimiter.NONE, BaselineScanner.BackpressureGate.NONE, onScanFinished);
     }
 
     /** 在 dim 的 region/ 写一个 region 文件, slot (localX,localZ) -> 明文. 返回写入的 raw payload. */
@@ -112,6 +116,53 @@ class BaselineScannerTest {
         // 扫完只记 scanned (待提交), 不立即 committed -- 提交要等快照 drain 进 manifest.
         assertEquals(0, progress.committedRegionCount(), "region only scanned, not yet committed");
         assertFalse(progress.isComplete(), "no complete marker without a committing snapshot");
+    }
+
+    @Test
+    void backpressure_pauses_sampling_until_a_drain_lowers_the_dirty_level(@TempDir Path base) throws IOException {
+        Path storeRoot = base.resolve("store");
+        Path worldRoot = base.resolve("world");
+        // 5 个非空 slot, 阈值 3: 前 3 个直接过, 第 4 个必被闸住.
+        writeRegion(worldRoot, "region", 0, 0, Map.of(
+                0, "c0".getBytes(),
+                1, "c1".getBytes(),
+                2, "c2".getBytes(),
+                3, "c3".getBytes(),
+                4, "c4".getBytes()));
+
+        CurrentSnapshotState state = new CurrentSnapshotState();
+        Set<Hash> written = ConcurrentHashMap.newKeySet();
+        BaselineProgress progress = new BaselineProgress(storeRoot);
+
+        // 水位源就是真实的 dirty map: 闸住后由假等待器代替快照 drain 掉它, 扫描应自行恢复.
+        List<Long> waits = new ArrayList<>();
+        AtomicLong fakeNanos = new AtomicLong();
+        AtomicInteger drainedChunks = new AtomicInteger();
+        DirtyWaterMarkGate gate = new DirtyWaterMarkGate(state::size, () -> 3, fakeNanos::get, millis -> {
+            waits.add(millis);
+            fakeNanos.addAndGet(millis * 1_000_000L);
+            if (waits.size() > 100) {
+                throw new IllegalStateException("gate never released");
+            }
+            drainedChunks.addAndGet(state.drainAndClear().chunks().size());
+            return true;
+        });
+
+        ChunkStore store = new ChunkStore(storeRoot);
+        store.initialize();
+        BaselineScanner scanner = new BaselineScanner(store, state, new WorldPaths(worldRoot),
+                new Xxh128HashFunction(), written, progress,
+                BaselineScanner.RateLimiter.NONE, gate, NO_FINISH);
+
+        BaselineScanner.Result result = scanner.scan();
+
+        assertEquals(1, waits.size(), "水位触顶必须真的把取样停下来等 drain");
+        assertEquals(3, drainedChunks.get(), "闸住的那一刻恰好是阈值处的 3 条登记");
+        // 5 个 slot 一个不漏: 被 drain 走的 3 条 + 恢复后继续登记的 2 条.
+        assertEquals(5, result.stored());
+        assertEquals(2, state.chunkCount(), "恢复后继续登记的 2 条留在 dirty 里");
+        assertFalse(gate.isBlocked(), "扫描结束时闸门必须已复位");
+        assertTrue(gate.blockedMillisTotal() > 0, "被闸住的时长要能被诊断读到");
     }
 
     @Test
@@ -220,7 +271,8 @@ class BaselineScannerTest {
             }
         };
         BaselineScanner scanner = new BaselineScanner(store, state, paths, new Xxh128HashFunction(),
-                written, progress, stopper, () -> finishCalled.set(true));
+                written, progress, stopper, BaselineScanner.BackpressureGate.NONE,
+                () -> finishCalled.set(true));
         self.set(scanner);
 
         BaselineScanner.Result result = scanner.scan();

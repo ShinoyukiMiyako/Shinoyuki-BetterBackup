@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -39,6 +40,28 @@ class ThrottlingRateLimiterTest {
     void rejects_non_positive_rate() {
         assertThrows(IllegalArgumentException.class, () -> new ThrottlingRateLimiter(0));
         assertThrows(IllegalArgumentException.class, () -> new ThrottlingRateLimiter(-5));
+    }
+
+    @Test
+    void rejects_non_positive_rate_from_supplier_at_construction() {
+        // 配置没加载 (值为 0) 这类接线错误必须在构造时响亮失败, 不能退化成 1 chunk/s 静默扫.
+        assertThrows(IllegalArgumentException.class, () -> new ThrottlingRateLimiter(() -> 0));
+    }
+
+    @Test
+    void rate_change_applies_to_the_next_acquire() {
+        FakeClock clock = new FakeClock();
+        AtomicInteger rate = new AtomicInteger(50); // 20ms 间隔
+        ThrottlingRateLimiter rl = new ThrottlingRateLimiter(rate::get, clock::nano, clock::sleep);
+
+        rl.acquire(); // 首次 prime, 不 sleep
+        rl.acquire(); // 按 50/s 补满 20ms
+        rate.set(200); // 200/s -> 5ms 间隔
+        rl.acquire(); // 必须立即按新速率走, 不能再按旧间隔多拖一轮
+
+        assertEquals(2, clock.sleeps.size());
+        assertEquals(20_000_000L, clock.sleeps.get(0));
+        assertEquals(5_000_000L, clock.sleeps.get(1), "改 config 后下一次 acquire 就该按新速率");
     }
 
     @Test

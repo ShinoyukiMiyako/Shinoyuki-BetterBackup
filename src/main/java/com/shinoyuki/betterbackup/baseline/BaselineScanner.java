@@ -40,6 +40,11 @@ import java.util.stream.Stream;
  *
  * <p><b>限速</b>: 每读一个 chunk slot 调一次 {@link RateLimiter}, 默认实现按
  * scanChunksPerSecond 节流, 避免全量扫描在玩家在线时打满磁盘 IO.
+ *
+ * <p><b>背压</b>: 限速只约束速率, 不看下游消化得完消化不完. 扫描登记进
+ * {@link CurrentSnapshotState} 的条目要到下一次快照 drain 才释放, 两次快照之间生产多少
+ * 就积压多少, 与扫描速率成正比. 每个待读 slot 先过一次 {@link BackpressureGate}: 水位
+ * 触顶就在读盘前暂停取样, 等 drain 把水位放下来再继续.
  */
 public final class BaselineScanner {
 
@@ -63,6 +68,7 @@ public final class BaselineScanner {
     private final Set<Hash> writtenThisWindow;
     private final BaselineProgress progress;
     private final RateLimiter rateLimiter;
+    private final BackpressureGate gate;
     private volatile boolean stopRequested;
 
     /**
@@ -81,6 +87,7 @@ public final class BaselineScanner {
                            Set<Hash> writtenThisWindow,
                            BaselineProgress progress,
                            RateLimiter rateLimiter,
+                           BackpressureGate gate,
                            Runnable onScanFinished) {
         this.store = store;
         this.state = state;
@@ -89,6 +96,7 @@ public final class BaselineScanner {
         this.writtenThisWindow = writtenThisWindow;
         this.progress = progress;
         this.rateLimiter = rateLimiter;
+        this.gate = gate;
         this.onScanFinished = onScanFinished;
     }
 
@@ -238,6 +246,14 @@ public final class BaselineScanner {
                 continue;
             }
 
+            // 背压: dirty 登记水位触顶时在此暂停取样, 等快照 drain 把水位放下来再继续.
+            // 位置在读盘之前 (等待期间不占着已读进内存的 chunk 字节), 在 alreadyCaptured
+            // 之后 (已被活跃路径采过的 slot 不抬水位, 不该被拦).
+            gate.awaitRoom(() -> stopRequested);
+            if (stopRequested) {
+                return new RegionResult(stored, deduped, skipped, false);
+            }
+
             byte[] rawBytes;
             try {
                 rawBytes = RegionFileSlotReader.readSlot(mca, localX, localZ);
@@ -302,6 +318,22 @@ public final class BaselineScanner {
 
         /** 不限速 (测试或 scanChunksPerSecond 极大时). */
         RateLimiter NONE = () -> { };
+    }
+
+    /**
+     * baseline 背压钩子. 每个待读的 slot 调一次: dirty 登记水位过高时阻塞调用线程, 直到
+     * 水位回落或 {@code abort} 为真.
+     *
+     * <p>背压只能施加在可中断、可续传、可无限延后的路径上. baseline 的进度按 region 文件
+     * 持久化, 停下来的代价只是下次启动接着扫; 而 worker 队列与 listener bridge 手上是不可
+     * 重来的活跃变更, 一条都不能停 —— 阻塞它们会让 bridge 满队丢弃已 fire 的 chunk.
+     */
+    @FunctionalInterface
+    public interface BackpressureGate {
+        void awaitRoom(java.util.function.BooleanSupplier abort);
+
+        /** 不背压 (测试或不需要水位保护时). */
+        BackpressureGate NONE = abort -> { };
     }
 
     /** 全量扫描结果. */

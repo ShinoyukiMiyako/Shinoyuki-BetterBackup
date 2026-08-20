@@ -2,6 +2,7 @@ package com.shinoyuki.betterbackup.diagnostic;
 
 import com.shinoyuki.betterbackup.BetterBackupCore;
 import com.shinoyuki.betterbackup.BetterBackupMod;
+import com.shinoyuki.betterbackup.baseline.DirtyWaterMarkGate;
 import com.shinoyuki.betterbackup.snapshot.CurrentSnapshotState;
 import com.shinoyuki.betterbackup.worker.BackupTask;
 import net.minecraftforge.event.TickEvent;
@@ -46,23 +47,49 @@ public final class DiagnosticLogger {
         if (state == null || queue == null) {
             return;
         }
+        publishGauges(state, queue, BetterBackupCore.metrics());
+
         long chunkCount = state.chunkCount();
         long entityCount = state.entityChunkCount();
         long savedDataCount = state.savedDataCount();
         int queueDepth = queue.size();
+        DirtyWaterMarkGate gate = BetterBackupCore.baselineGate();
+        boolean backpressured = gate != null && gate.isBlocked();
 
-        // 仅在状态有变化时 log, 避免空跑期间日志洪流.
+        // 仅在状态有变化时 log, 避免空跑期间日志洪流. 背压期间水位与队列都不动, 但这正是
+        // 最需要看见的时刻, 故单独放行.
         boolean changed = chunkCount != lastChunkCount
                 || entityCount != lastEntityCount
                 || savedDataCount != lastSavedDataCount
-                || queueDepth > 0;
+                || queueDepth > 0
+                || backpressured;
         if (!changed) {
             return;
         }
-        LOGGER.info("[BetterBackup] dirty: chunks={} entity={} savedData={} | queue: {}",
-                chunkCount, entityCount, savedDataCount, queueDepth);
+        LOGGER.info("[BetterBackup] dirty: chunks={} entity={} savedData={} | queue: {} | backpressure: {}",
+                chunkCount, entityCount, savedDataCount, queueDepth, describeBackpressure(gate));
         lastChunkCount = chunkCount;
         lastEntityCount = entityCount;
         lastSavedDataCount = savedDataCount;
+    }
+
+    /**
+     * 把水位与队列深度推给 metrics. Prometheus 侧的 bbb_dirty_map_size / bbb_queue_depth
+     * 靠这一步才有真实读数 —— 排查积压时那两条曲线是唯一的外部证据.
+     */
+    static void publishGauges(CurrentSnapshotState state, BlockingQueue<BackupTask> queue,
+                              BetterBackupMetrics metrics) {
+        if (metrics == null) {
+            return;
+        }
+        metrics.setDirtyMapSize(state.size());
+        metrics.setQueueDepth(queue.size());
+    }
+
+    private static String describeBackpressure(DirtyWaterMarkGate gate) {
+        if (gate == null) {
+            return "n/a";
+        }
+        return (gate.isBlocked() ? "blocked" : "off") + "(paused " + gate.blockedMillisTotal() / 1000L + "s total)";
     }
 }

@@ -116,7 +116,7 @@ class BaselineCommitTest {
                 creator.create("baseline-complete");
             };
             this.scanner = new BaselineScanner(store, state, paths, hf, written, progress,
-                    BaselineScanner.RateLimiter.NONE, onScanFinished);
+                    BaselineScanner.RateLimiter.NONE, BaselineScanner.BackpressureGate.NONE, onScanFinished);
         }
     }
 
@@ -140,7 +140,8 @@ class BaselineCommitTest {
             progress.load();
             WorldPaths paths = new WorldPaths(worldRoot);
             BaselineScanner scanner = new BaselineScanner(store, state, paths, new Xxh128HashFunction(),
-                    written, progress, BaselineScanner.RateLimiter.NONE, () -> { });
+                    written, progress, BaselineScanner.RateLimiter.NONE,
+                    BaselineScanner.BackpressureGate.NONE, () -> { });
             scanner.scan();
             // region 已 scanned 持久化, 但没有 committed, 没有 complete 标记, 没有 manifest.
             assertEquals(1, progress.completedRegionCount());
@@ -320,7 +321,7 @@ class BaselineCommitTest {
         AtomicReference<Throwable> scanError = new AtomicReference<>();
         AtomicBoolean scanDone = new AtomicBoolean(false);
         BaselineScanner scanner = new BaselineScanner(store, state, paths, hf, written, progress,
-                BaselineScanner.RateLimiter.NONE, () -> { });
+                BaselineScanner.RateLimiter.NONE, BaselineScanner.BackpressureGate.NONE, () -> { });
         Thread scanThread = new Thread(() -> {
             try {
                 scanner.scan();
