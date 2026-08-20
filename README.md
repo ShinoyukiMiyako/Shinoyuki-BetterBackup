@@ -27,16 +27,21 @@ Minecraft 1.20.1 Forge 服务端**增量备份** mod。第二次备份起只处�
 
 | 问题 | 影响 | 状态 |
 |---|---|---|
-| [#5](https://github.com/ShinoyukiMiyako/Shinoyuki-BetterBackup/issues/5) baseline 扫描只有速率节流、没有背压，`scanChunksPerSecond` 允许配到 100000 | 大存档上把该值调高会让 dirty 集合单调膨胀，最终整个 java 进程被内核 OOM killer 杀掉，配合面板自动拉起形成重启循环 | 未修复。规避：保持默认 50，最高不要超过 1000 |
-| [#4](https://github.com/ShinoyukiMiyako/Shinoyuki-BetterBackup/issues/4) `restore-chunk-live` 每回退一块就重读一次整份 manifest | 12 MB manifest 下半径 3（49 块）耗时 8.5 秒，其中 99% 是重复解析 IO。manifest 随世界增长，半径越大越不可用 | 未修复 |
+| [#5](https://github.com/ShinoyukiMiyako/Shinoyuki-BetterBackup/issues/5) baseline 扫描只有速率节流、没有背压，`scanChunksPerSecond` 允许配到 100000 | 大存档上把该值调高会让 dirty 集合单调膨胀，最终整个 java 进程被内核 OOM killer 杀掉，配合面板自动拉起形成重启循环 | 已在 main 修复（加 dirty 水位背压闸 + 上限收紧到 2000 + 水位可观测），但**尚未发版**，0.2.0 仍然受影响 |
+| [#4](https://github.com/ShinoyukiMiyako/Shinoyuki-BetterBackup/issues/4) `restore-chunk-live` 每回退一块就重读一次整份 manifest | 12 MB manifest 下半径 3（49 块）耗时 8.5 秒，其中 99% 是重复解析 IO。manifest 随世界增长，半径越大越不可用 | 已在 main 修复（整批只解析一次 manifest），但**尚未发版**，0.2.0 仍然受影响 |
 | [#3](https://github.com/ShinoyukiMiyako/Shinoyuki-BetterBackup/issues/3) 大 store 的索引初始化跑在主线程上 | 启动阶段被 Watchdog 判定卡死强杀，形成启动崩溃循环 | 已在 main 修复（初始化异步化 + 索引增量重扫 + sidecar 自愈），但**尚未发版**，0.2.0 仍然受影响 |
+
+三项都已在 main 收敛，但公开版本仍是 0.2.0，尚未发版；在打出新版本并跑完一轮真机长跑之前，本项目仍不适合上生产环境。
 
 WIP 阶段的使用建议：
 
 - 优先在测试服 / 可丢弃的存档上试用，先完整跑完一次 baseline 再评估
 - 生产服请保留原有的全量备份方案兜底。这一条与下面「[已知限制](#已知限制)」里"跟其他备份 mod 建议二选一"的省空间建议冲突时，以本节为准
 - 接入大存档前先确认 `baseline.scanChunksPerSecond` 没有被调高，并留出足够的可用内存余量
+- 确认 `schedule.mode` 是 `INTERVAL`：背压闸靠快照 drain 放行，`MANUAL` 模式下不手动建快照就没有 drain，baseline 会一直停在那里等
 - 恢复能力请在真正需要之前先演练一次（离线 CLI 的 `verify` / `restore` 不需要服务端在跑）
+
+一条必须讲清楚的边界：背压只约束 BetterBackup 自己的内存增长，替代不了合理的 JVM 定容。用 `-Xms` 配合 `-XX:+AlwaysPreTouch` 把堆预占到接近物理内存时，任何后台任务都可能把进程推给内核 OOM killer，而 ZGC 的堆多重映射还会让 RSS 统计进一步放大；上面 #5 那台机器 BetterBackup 自身的增量只占 48 GB 堆的百分之一量级。
 
 问题反馈与最新状态：[Issues](https://github.com/ShinoyukiMiyako/Shinoyuki-BetterBackup/issues)。
 

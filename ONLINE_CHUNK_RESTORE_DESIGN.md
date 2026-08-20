@@ -188,8 +188,9 @@ CompoundTag tag = NbtIo.read(new DataInputStream(in));
 
 ## 4.2 `ChunkRestoreFlow` (新, mod 侧, restore/ 包)
 
-- 输入: snapshotId, dimId, chunkX, chunkZ。
-- 读 manifest -> 取该 (dim, packedPos) 的 hash -> `store.has` 校验 -> §4.1 还原 CompoundTag。
+- 输入: snapshotId, dimId, 一批 chunk 坐标 (`resolveArea`)。
+- manifest 在整批循环之外只加载一次, 逐块只做内存查表 -> `store.has` 校验 -> §4.1 还原 CompoundTag。单块 `resolve` 吃已加载的 manifest, 拿不到 snapshotId, 按块路径不可能重新读盘 (与离线 `OfflineRestore.restorePartial` 同形)。
+- 逐块失败 (store 缺对象 / 解析失败) 收进 `failures` 不拖垮整批; manifest 级失败整批中止。
 - 主线程: `server.execute(() -> SaveCoordination.restoreChunkLive(level, pos, tag).whenComplete(...))`。
 - 据 `ChunkRestoreResult.outcome` 反馈玩家 (见 §4.4)。
 - 未采集 (manifest 无此 chunk) -> 明确报错, 不静默。
@@ -215,7 +216,8 @@ CompoundTag tag = NbtIo.read(new DataInputStream(in));
 ## 4.6 测试 (BB 侧)
 
 - §4.1 字节->CompoundTag 还原: 单测 (round-trip: 已知 chunk NBT -> 压成 slot 字节 -> 还原 -> 字段相等)。
-- ChunkRestoreFlow 的 manifest 解析 / 未采集报错 / outcome 分发: 单测 (mock SaveCoordination)。
+- ChunkRestoreFlow 的 manifest 解析 / 未采集报错: 单测 (真实 store + 真实 manifest, 不打桩)。
+- 整批只加载一次 manifest: 单测注入可计数的 manifest 加载器断言加载次数恰为 1。
 - 端到端 (装载真世界回退): 落在 BAS 的 GameTest (§3.8), BB 侧不重复造 server harness。
 
 ---

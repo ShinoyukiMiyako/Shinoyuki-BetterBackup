@@ -29,16 +29,21 @@ The core paths (incremental backup / automatic GC / restore / offline CLI) work 
 
 | Issue | Impact | Status |
 |---|---|---|
-| [#5](https://github.com/ShinoyukiMiyako/Shinoyuki-BetterBackup/issues/5) The baseline scan is rate-throttled only, with no backpressure, and `scanChunksPerSecond` accepts values up to 100000 | On a large world, raising that value makes the dirty set grow without bound until the kernel OOM killer kills the whole java process - which, with a panel auto-restart, becomes a crash loop | Not fixed. Workaround: keep the default of 50, and never go above 1000 |
-| [#4](https://github.com/ShinoyukiMiyako/Shinoyuki-BetterBackup/issues/4) `restore-chunk-live` re-reads the entire manifest for every chunk it rolls back | With a 12 MB manifest, radius 3 (49 chunks) takes 8.5 s, 99% of which is redundant parse IO. The manifest grows with the world, so larger radii become unusable | Not fixed |
+| [#5](https://github.com/ShinoyukiMiyako/Shinoyuki-BetterBackup/issues/5) The baseline scan is rate-throttled only, with no backpressure, and `scanChunksPerSecond` accepts values up to 100000 | On a large world, raising that value makes the dirty set grow without bound until the kernel OOM killer kills the whole java process - which, with a panel auto-restart, becomes a crash loop | Fixed on `main` (dirty-level backpressure gate, ceiling tightened to 2000, the level is now reported), but **not released yet** - 0.2.0 is still affected |
+| [#4](https://github.com/ShinoyukiMiyako/Shinoyuki-BetterBackup/issues/4) `restore-chunk-live` re-reads the entire manifest for every chunk it rolls back | With a 12 MB manifest, radius 3 (49 chunks) takes 8.5 s, 99% of which is redundant parse IO. The manifest grows with the world, so larger radii become unusable | Fixed on `main` (one manifest load per batch), but **not released yet** - 0.2.0 is still affected |
 | [#3](https://github.com/ShinoyukiMiyako/Shinoyuki-BetterBackup/issues/3) Store index initialization runs on the main thread | On a large store the Watchdog treats startup as a hang and kills the server, producing a startup crash loop | Fixed on `main` (async initialization + incremental index rescan + sidecar self-healing), but **not released yet** - 0.2.0 is still affected |
+
+All three are resolved on `main`, but the only public release is still 0.2.0. Until a new version is cut and has survived a real-world soak, this project is not ready for production.
 
 Advice while the project is WIP:
 
 - Try it on a test server or a disposable world first, and let a full baseline finish before you judge it
 - Keep your existing full-backup solution on production servers. Where this conflicts with the "pick one" space-saving advice under [Known limitations](#known-limitations) below, this section wins
 - Before pointing it at a large world, confirm `baseline.scanChunksPerSecond` has not been raised, and leave real headroom in available memory
+- Confirm `schedule.mode` is `INTERVAL`: the backpressure gate is released by a snapshot draining the pending set, so under `MANUAL` there is no drain unless you create one, and the baseline just waits
 - Rehearse a restore before you actually need one (the offline CLI's `verify` / `restore` do not need a running server)
+
+One boundary worth stating plainly: backpressure bounds BetterBackup's own memory growth; it is not a substitute for sizing the JVM correctly. When `-Xms` plus `-XX:+AlwaysPreTouch` commits a heap close to physical memory, any background task can push the process into the kernel OOM killer, and ZGC's heap multi-mapping inflates the RSS accounting further. On the machine in #5, BetterBackup's own growth was on the order of one percent of the 48 GB heap.
 
 Reports and current status: [Issues](https://github.com/ShinoyukiMiyako/Shinoyuki-BetterBackup/issues).
 
